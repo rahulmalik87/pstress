@@ -332,6 +332,7 @@ struct FK_table : Table {
   ForeignKeyAction getRandomForeignKeyAction(Table *table) {
     /* if a table has virtual generated column and if any of  the base column
      * colum use set DEFAULT*/
+     return ForeignKeyAction::CASCADE;
 
     for (const auto &col : *table->columns_) {
       if (col->type_ == Column::COLUMN_TYPES::GENERATED) {

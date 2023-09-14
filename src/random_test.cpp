@@ -1569,7 +1569,7 @@ void Table::CreateDefaultColumn() {
     /*  if we need to create primary column */
 
     /* First column can be primary */
-    if (i == 0 && rand_int(100) <= options->at(Option::PRIMARY_KEY)->getInt()) {
+    if (i == 0 && (rand_int(100) <= options->at(Option::PRIMARY_KEY)->getInt() && this->type != FK)) {
       type = Column::INT;
       name = "pkey";
       col = new Column{name, this, type};
@@ -1646,8 +1646,9 @@ void Table::CreateDefaultIndex() {
     return;
 
   /* if table have few column, decrease number of indexes */
-  size_t indexes = rand_int(
-      columns_->size() < max_indexes ? columns_->size() : max_indexes, 1);
+  size_t indexes = max_indexes;
+  //rand_int( columns_->size() < max_indexes ? columns_->size() : max_indexes, 1);
+
 
   /* for auto-inc columns handling, we need to add auto_inc as first column */
   for (size_t i = 0; i < columns_->size(); i++) {
@@ -2586,16 +2587,20 @@ void Table::DeleteRandomRow(Thd1 *thd) {
 
   for (size_t i = 0; i < columns_->size(); i++) {
     auto col = columns_->at(i);
+    if(col->name_ == "ifk_col") {
+        where = i;
+        break;
+      }
     if (col->type_ != Column::BOOL)
       only_bool = false;
-    if (col->primary_key)
+    if (col->primary_key) 
       pk_pos = i;
   }
 
   /* 50% time we use primary key column */
-  if (pk_pos != -1 && rand_int(100) > 50)
+  if (pk_pos != -1 && rand_int(100) >= 0) {
     where = pk_pos;
-  else {
+  } else {
     /* iterate over and over to find a valid column */
     while (where < 0) {
       auto col_pos = rand_int(columns_->size() - 1);
@@ -2641,7 +2646,7 @@ void Table::DeleteRandomRow(Thd1 *thd) {
   }
   sql += " WHERE " + columns_->at(where)->name_;
 
-  auto prob = rand_int(100);
+  auto prob = rand_int(90);
   if (prob <= 90)
     sql += " = " + columns_->at(where)->rand_value();
   else if (prob <= 92)
@@ -2792,12 +2797,15 @@ void Table::UpdateRandomROW(Thd1 *thd) {
 
   /* if tables has pkey try to use that in where clause for 50% cases */
   for (size_t i = 0; i < columns_->size(); i++) {
-    if (columns_->at(i)->primary_key && rand_int(100) <= 50) {
+    if (columns_->at(i)->primary_key && rand_int(100) <= 100) {
+      where = i;
+      break;
+    }else if  (columns_->at(i)->name_.compare("ifk_col") == 0 ) {
       where = i;
       break;
     }
   }
-  auto prob = rand_int(100);
+  auto prob = rand_int(90);
   if (prob <= 90)
     sql +=
         columns_->at(where)->name_ + " = " + columns_->at(where)->rand_value();
@@ -2916,7 +2924,8 @@ void Table::InsertRandomRow(Thd1 *thd) {
   std::string vals = "";
   std::string type = "INSERT";
 
-  type = rand_int(3) == 0 ? "INSERT" : "REPLACE";
+//  type = rand_int(3) == 0 ? "INSERT" : "REPLACE";
+type = "INSERT";
 
   std::string sql = type + " INTO " + name_ + "  ( ";
   for (auto &column : *columns_) {
