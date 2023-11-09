@@ -1740,6 +1740,11 @@ Table *Table::table_id(TABLE_TYPES type, int id) {
       options->at(Option::EXACT_INITIAL_RECORDS)->getBool()
           ? options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt()
           : rand_int(options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt());
+  // if parent has no records, child can't have records
+  if (table->type == FK) {
+    if (static_cast<FK_table *>(table)->parent->number_of_initial_records == 0)
+      table->number_of_initial_records = 0;
+  }
 
   static auto no_encryption = opt_bool(NO_ENCRYPTION);
 
