@@ -1,8 +1,11 @@
+""" Controller module for managing server instances. """
 from servers.mysql_server import MySQLServer
 from servers.duckdb_server import DuckDBServer
 
 class ServerController:
+    """Controller class for managing server instances."""
     def __init__(self):
+        """Initialize the server controller."""
         self.servers = []
 
     def start_server(self, server_type):
@@ -32,4 +35,3 @@ class ServerController:
     def get_num_servers(self):
         """Get the number of running server instances."""
         return len(self.servers)
-

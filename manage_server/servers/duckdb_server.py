@@ -1,13 +1,17 @@
+""" DuckDB server module """
+import logging
+
 class DuckDBServer:
+    """ DuckDB server class """
     def __init__(self):
-        logger.info("Initializing DuckDB server")
+        """ Initialize DuckDB server """
+        logging.info("Initializing DuckDB server")
         # Initialize DuckDB server configuration
 
     def start(self):
-        # Logic to start DuckDB server
-        pass
+        """ Start DuckDB server """
+        logging.info("Starting DuckDB server")
 
     def stop(self):
-        # Logic to stop DuckDB server
-        pass
-
+        """ Stop DuckDB server """
+        logging.info("Stopping DuckDB server")
