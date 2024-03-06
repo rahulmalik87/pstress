@@ -152,10 +152,28 @@ void add_options() {
   opt->help = "Adding Ignore clause to update delete and insert ";
   opt->setInt(10);
 
+  opt = newOption(Option::INT, Option::NUMBER_OF_UNIQUE_WORDS,
+                  "number-of-unique-words");
+  opt->help =
+      "Number of unique words generated initially for the complete load. If "
+      "you want more variation in the data, increase this number. This word "
+      "would be in memory. will increase the pstress memory size ";
+  opt->setInt(10000);
+
+  opt = newOption(Option::INT, Option::WORDS_SIZE, "words-size");
+  opt->help = "Size of words generated initially for the complete load. If you "
+              "want more variation in the data, increase this number. ";
+  opt->setInt(100);
+
   opt = newOption(Option::INT, Option::SLEEP_AFTER_CREATE_TABLE,
                   "sleep-after-create-table");
   opt->help = "Sleep after create table";
   opt->setInt(0);
+
+  opt = newOption(Option::BOOL, Option::CHINESE_CHARSET, "chinese-charset");
+  opt->help = "Use Chinese charset";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
 
   opt = newOption(Option::INT, Option::CALL_FUNCTION, "call-function-prob");
   opt->help = "Probability of calling function ";

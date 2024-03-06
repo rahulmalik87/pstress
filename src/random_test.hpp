@@ -454,7 +454,6 @@ int set_seed(Thd1 *thd);
 int sum_of_all_options(Thd1 *thd);
 int sum_of_all_server_options();
 Option::Opt pick_some_option();
-std::vector<std::string> *random_strs_generator(unsigned long int seed);
 bool load_metadata(Thd1 *thd);
 
 /* Execute SQL and update thd variables

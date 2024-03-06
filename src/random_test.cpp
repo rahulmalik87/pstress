@@ -20,10 +20,10 @@
 using namespace rapidjson;
 extern std::mt19937 rng;
 
-const std::string TABLE_PREFIX = "tt_";
-const std::string PARTITION_SUFFIX = "_p";
-const std::string FK_SUFFIX = "_fk";
-const std::string TEMP_SUFFIX = "_t";
+std::string TABLE_PREFIX = "tt_";
+std::string PARTITION_SUFFIX = "_p";
+std::string FK_SUFFIX = "_fk";
+std::string TEMP_SUFFIX = "_t";
 const int version = 2;
 /* range for random number int, integers, floats and double.
  more the value, less randomness.
@@ -434,6 +434,13 @@ int sum_of_all_options(Thd1 *thd) {
     opt_int_set(ALTER_INSTANCE_RELOAD_KEYRING, 0);
   }
 
+  if (options->at(Option::CHINESE_CHARSET)->getBool()) {
+    TABLE_PREFIX = "中文";
+    PARTITION_SUFFIX = "_中文";
+    FK_SUFFIX = "_中文";
+    TEMP_SUFFIX = "_中文";
+  }
+
   if (mysql_read_single_value("select @@innodb_temp_tablespace_encrypt", thd) ==
       "1")
     encrypted_temp_tables = true;
@@ -594,31 +601,44 @@ int set_seed(Thd1 *thd) {
 }
 
 /* generate random strings of size N_STR */
-std::vector<std::string> *random_strs_generator(unsigned long int seed) {
-  static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz"
-                                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                                 "0123456789";
+static std::vector<std::string> random_strs_generator() {
+  std::vector<std::string> alphabet;
+  for (char c = 'a'; c <= 'z'; c++) {
+    std::string s;
+    s.push_back(c);
+    alphabet.push_back(s);
+  }
+  for (char c = 'A'; c <= 'Z'; c++) {
+    std::string s;
+    s.push_back(c);
+    alphabet.push_back(s);
+  }
+  for (int i = 0; i < 10; i++) {
+    alphabet.push_back(std::to_string(i));
+  }
 
-  static const size_t N_STRS = 10000;
+  if (options->at(Option::CHINESE_CHARSET)->getBool()) {
+    alphabet = {"中"};
+  }
 
-  std::default_random_engine rng(seed);
-  std::uniform_int_distribution<> dist(0, sizeof(alphabet) / sizeof(*alphabet) -
-                                              2);
+  std::vector<std::string> strs;
 
-  std::vector<std::string> *strs = new std::vector<std::string>;
-  strs->reserve(N_STRS);
-  std::generate_n(std::back_inserter(*strs), strs->capacity(), [&] {
+  for (int i = 0; i < options->at(Option::NUMBER_OF_UNIQUE_WORDS)->getInt();
+       i++) {
     std::string str;
-    str.reserve(MAX_RANDOM_STRING_SIZE);
-    std::generate_n(std::back_inserter(str), MAX_RANDOM_STRING_SIZE,
-                    [&]() { return alphabet[dist(rng)]; });
+    str.reserve(options->at(Option::WORDS_SIZE)->getInt());
+    for (int j = 0; j < options->at(Option::WORDS_SIZE)->getInt(); j++) {
+      str += alphabet[rand_int(alphabet.size() - 1)];
+    }
+    strs.push_back(str);
+  }
 
-    return str;
-  });
+  for (auto &str : strs) {
+    std::cout << str << std::endl;
+  }
+
   return strs;
 }
-
-std::vector<std::string> *random_strs;
 
 int rand_int(int upper, int lower) {
   assert(upper >= lower);
@@ -649,17 +669,20 @@ std::string rand_double(double upper, double lower) {
 /* return random string in range of upper and lower */
 std::string rand_string(int upper, int lower) {
   std::string rs = ""; /*random_string*/
+  static std::vector<std::string> random_strs = random_strs_generator();
+
   assert(upper >= 2);
   assert(upper >= lower);
   auto size = rand_int(upper, lower);
 
   while (size > 0) {
-    auto str = random_strs->at(rand_int(random_strs->size() - 1));
-    if (size > MAX_RANDOM_STRING_SIZE)
+    auto str = random_strs.at(rand_int(random_strs.size() - 1));
+    if (size > options->at(Option::WORDS_SIZE)->getInt())
       rs += str;
     else
+      // extract random string from the word
       rs += str.substr(0, size);
-    size -= MAX_RANDOM_STRING_SIZE;
+    size -= options->at(Option::WORDS_SIZE)->getInt();
   }
   return rs;
 }
@@ -1447,8 +1470,9 @@ void Table::Optimize(Thd1 *thd) {
     execute_sql("ALTER TABLE " + name_ + " OPTIMIZE PARTITION p" +
                     std::to_string(partition),
                 thd);
-  } else
+  } else {
     execute_sql("OPTIMIZE TABLE " + name_, thd);
+  }
 }
 
 void Table::Check(Thd1 *thd) {
@@ -3707,12 +3731,11 @@ static std::string load_metadata_from_file() {
   return file;
 }
 
-/* clean tables from memory,random_strs */
+/* clean tables from memory */
 void clean_up_at_end() {
   for (auto &table : *all_tables)
     delete table;
   delete all_tables;
-  delete random_strs;
 }
 
 /* create new database and tablespace */
@@ -3812,10 +3835,6 @@ static bool check_tables_partitions_preload(Table *table, Thd1 *thd) {
 /* load metadata */
 bool Thd1::load_metadata() {
   sum_of_all_opts = sum_of_all_options(this);
-
-  auto seed = opt_int(INITIAL_SEED);
-  seed += options->at(Option::STEP)->getInt();
-  random_strs = random_strs_generator(seed);
 
   /*set seed for current step*/
   auto initial_seed = opt_int(INITIAL_SEED);

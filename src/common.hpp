@@ -164,6 +164,9 @@ struct Option {
     COMPARE_RESULT,
     SECONDARY_ENGINE,
     SLEEP_AFTER_CREATE_TABLE,
+    CHINESE_CHARSET,
+    NUMBER_OF_UNIQUE_WORDS,
+    WORDS_SIZE,
     MAX
   } option;
   Option(Type t, Opt o, std::string n)
