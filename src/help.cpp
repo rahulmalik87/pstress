@@ -152,17 +152,12 @@ void add_options() {
   opt->help = "Adding Ignore clause to update delete and insert ";
   opt->setInt(10);
 
-  opt = newOption(Option::INT, Option::NUMBER_OF_UNIQUE_WORDS,
-                  "number-of-unique-words");
+  opt = newOption(Option::INT, Option::UNIQUNESS_FACTOR, "uniqueness-factor");
   opt->help =
-      "Number of unique words generated initially for the complete load. If "
-      "you want more variation in the data, increase this number. This word "
-      "would be in memory. will increase the pstress memory size ";
-  opt->setInt(10000);
-
-  opt = newOption(Option::INT, Option::WORDS_SIZE, "words-size");
-  opt->help = "Size of words generated initially for the complete load. If you "
-              "want more variation in the data, increase this number. ";
+      "Uniqueness factor for the test. If it 1 then tests would mostly "
+      "uses the same data as it is inserted, so update and delete "
+      "would be higly successful. It is 100. It would only 1% of data "
+      "is already inserted. It influence the int, varchar,float, double";
   opt->setInt(100);
 
   opt = newOption(Option::INT, Option::SLEEP_AFTER_CREATE_TABLE,

@@ -25,12 +25,6 @@ std::string PARTITION_SUFFIX = "_p";
 std::string FK_SUFFIX = "_fk";
 std::string TEMP_SUFFIX = "_t";
 const int version = 2;
-/* range for random number int, integers, floats and double.
- more the value, less randomness.
- for example if it is 1. then there is very high chance of executing
- successful DML.
-todo allow this option to be configured by user */
-const int g_integer_range = 100;
 
 static bool encrypted_temp_tables = false;
 static bool encrypted_sys_tablelspaces = false;
@@ -177,8 +171,8 @@ static std::vector<int> generateUniqueRandomNumbers(int number_of_records) {
 
   std::unordered_set<int> unique_keys_set(number_of_records);
 
-  int max_size =
-      g_integer_range * options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt();
+  int max_size = options->at(Option::UNIQUNESS_FACTOR)->getInt() *
+                 options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt();
 
   while (unique_keys_set.size() < static_cast<size_t>(number_of_records)) {
     unique_keys_set.insert(rand_int(max_size, 1));
@@ -627,23 +621,19 @@ std::string rand_double(double upper, double lower) {
   return out.str();
 }
 static wchar_t random_wchar() {
-  auto function_to_pick = []() {
-    std::vector<wchar_t> charset = {
-        'a', 'b', 'c',  'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',  'n',
-        'o', 'p', 'q',  'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A',  'B',
-        'C', 'D', 'E',  'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',  'P',
-        'Q', 'R', 'S',  'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '0', '1', '2',  '3',
-        '4', '5', '6',  '7', '8', '9', ' ', '!', '@', '#', '$', '%', '^',  '&',
-        '*', '(', ')',  '-', '_', '+', '=', '{', '}', '[', ']', '|', '\\', ':',
-        ';', '"', '\'', '<', '>', ',', '.', '?', '/', '`', '~'};
+  auto distinct_charset = []() {
+    // The number of distinct character depends on the initial records in the
+    // table and the uniqueness factor
 
+    std::vector<wchar_t> charset;
     if (options->at(Option::CHINESE_CHARSET)->getBool()) {
       charset.push_back(L'中');
     }
+    charset.push_back(L'0');
     return charset;
   };
 
-  auto static charset = function_to_pick();
+  auto static charset = distinct_charset();
   return charset[rand_int(charset.size() - 1)];
 }
 
@@ -755,6 +745,7 @@ static std::string rand_timestamp() {
 
 static std::string rand_value_universal(Column::COLUMN_TYPES type_,
                                         int length) {
+  auto g_integer_range = options->at(Option::UNIQUNESS_FACTOR)->getInt();
   switch (type_) {
   case (Column::COLUMN_TYPES::INTEGER):
     return std::to_string(
@@ -1360,8 +1351,9 @@ Partition::Partition(std::string n) : Table(n) {
     auto number_of_records =
         options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt();
     for (int i = 0; i < number_of_part; i++) {
-      positions.emplace_back("p",
-                             rand_int(g_integer_range * number_of_records));
+      positions.emplace_back(
+          "p", rand_int(options->at(Option::UNIQUNESS_FACTOR)->getInt() *
+                        number_of_records));
     }
     std::sort(positions.begin(), positions.end(), Partition::compareRange);
     for (int i = 0; i < number_of_part; i++) {
@@ -3126,7 +3118,7 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   prepare_sql += "INTO " + name_ + " (";
 
   assert(number_of_initial_records <=
-         (g_integer_range *
+         (options->at(Option::UNIQUNESS_FACTOR)->getInt() *
           options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt()));
 
   for (const auto &column : *columns_) {
