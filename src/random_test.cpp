@@ -600,45 +600,6 @@ int set_seed(Thd1 *thd) {
   return thd->seed;
 }
 
-/* generate random strings of size N_STR */
-static std::vector<std::string> random_strs_generator() {
-  std::vector<std::string> alphabet;
-  for (char c = 'a'; c <= 'z'; c++) {
-    std::string s;
-    s.push_back(c);
-    alphabet.push_back(s);
-  }
-  for (char c = 'A'; c <= 'Z'; c++) {
-    std::string s;
-    s.push_back(c);
-    alphabet.push_back(s);
-  }
-  for (int i = 0; i < 10; i++) {
-    alphabet.push_back(std::to_string(i));
-  }
-
-  if (options->at(Option::CHINESE_CHARSET)->getBool()) {
-    alphabet = {"中"};
-  }
-
-  std::vector<std::string> strs;
-
-  for (int i = 0; i < options->at(Option::NUMBER_OF_UNIQUE_WORDS)->getInt();
-       i++) {
-    std::string str;
-    str.reserve(options->at(Option::WORDS_SIZE)->getInt());
-    for (int j = 0; j < options->at(Option::WORDS_SIZE)->getInt(); j++) {
-      str += alphabet[rand_int(alphabet.size() - 1)];
-    }
-    strs.push_back(str);
-  }
-
-  for (auto &str : strs) {
-    std::cout << str << std::endl;
-  }
-
-  return strs;
-}
 
 int rand_int(int upper, int lower) {
   assert(upper >= lower);
@@ -665,24 +626,35 @@ std::string rand_double(double upper, double lower) {
   out << std::setprecision(5) << (double)(dis(rng));
   return out.str();
 }
+static wchar_t random_wchar() {
+  auto function_to_pick = []() {
+    std::vector<wchar_t> charset = {
+        'a', 'b', 'c',  'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',  'n',
+        'o', 'p', 'q',  'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A',  'B',
+        'C', 'D', 'E',  'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',  'P',
+        'Q', 'R', 'S',  'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '0', '1', '2',  '3',
+        '4', '5', '6',  '7', '8', '9', ' ', '!', '@', '#', '$', '%', '^',  '&',
+        '*', '(', ')',  '-', '_', '+', '=', '{', '}', '[', ']', '|', '\\', ':',
+        ';', '"', '\'', '<', '>', ',', '.', '?', '/', '`', '~'};
+
+    if (options->at(Option::CHINESE_CHARSET)->getBool()) {
+      charset.push_back(L'中');
+    }
+    return charset;
+  };
+
+  auto static charset = function_to_pick();
+  return charset[rand_int(charset.size() - 1)];
+}
 
 /* return random string in range of upper and lower */
 std::string rand_string(int upper, int lower) {
-  std::string rs = ""; /*random_string*/
-  static std::vector<std::string> random_strs = random_strs_generator();
-
+  std::string rs = "";
   assert(upper >= 2);
   assert(upper >= lower);
-  auto size = rand_int(upper, lower);
-
-  while (size > 0) {
-    auto str = random_strs.at(rand_int(random_strs.size() - 1));
-    if (size > options->at(Option::WORDS_SIZE)->getInt())
-      rs += str;
-    else
-      // extract random string from the word
-      rs += str.substr(0, size);
-    size -= options->at(Option::WORDS_SIZE)->getInt();
+  size_t size = rand_int(upper, lower);
+  while (rs.size() < size) {
+    rs += random_wchar();
   }
   return rs;
 }
