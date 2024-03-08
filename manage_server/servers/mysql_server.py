@@ -1,5 +1,7 @@
 """ MySQLSever class is used to start and stop the MySQL server. """
 import logging
+import subprocess
+import threading
 class MySQLServer:
     """ MySQLServer class is used to start and stop the MySQL server. """
     def __init__(self):
@@ -13,3 +15,12 @@ class MySQLServer:
     def stop(self):
         """ Method to stop the MySQL server. """
         logging.info("MySQLServer stop called")
+
+
+    def initialize(self):
+        """ Method to initialize the MySQL server. """
+        subprocess.run(["mysqld", "--initialize-insecure", "--user=mysql"]
+                       , stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for line in out.splitlines():
+            logging.info(line)
+

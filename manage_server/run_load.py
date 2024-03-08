@@ -7,7 +7,8 @@
 import logging
 from utils.common_args import CommonArgs
 from utils.logger import setup_logger
-from utils.factory import create_server_instance, create_load_generator_instance
+from utils.factory import create_load_generator_instance
+from servers.controller import ServerController
 
 
 class RunLoadTest(CommonArgs):

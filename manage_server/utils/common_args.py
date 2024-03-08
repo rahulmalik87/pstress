@@ -17,6 +17,8 @@ class CommonArgs(argparse.ArgumentParser):
 
         group.add_argument("--workdir", default="./workdir",
                            help="Working directory")
+        group.add_argument("--basedir", required=True, nargs="+",
+                           help="Base directory of the server installation")
         group.add_argument("--log-level", default="INFO",
                            help="Log level (e.g., INFO, DEBUG, WARNING, ERROR, CRITICAL)",
                            choices=["INFO", "DEBUG", "WARNING", "ERROR", "CRITICAL"])

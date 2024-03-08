@@ -4,7 +4,7 @@ from servers.duckdb_server import DuckDBServer
 
 class ServerController:
     """Controller class for managing server instances."""
-    def __init__(self):
+    def __init__(self, basedir):
         """Initialize the server controller."""
         self.servers = []
 
