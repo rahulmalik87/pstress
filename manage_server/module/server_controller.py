@@ -1,19 +1,17 @@
 """ Controller module for managing server instances. """
-from servers.mysql_server import MySQLServer
-from servers.duckdb_server import DuckDBServer
+from .mysql_server import MySQLServer
 
 class ServerController:
     """Controller class for managing server instances."""
-    def __init__(self, basedir):
+    def __init__(self, args ):
         """Initialize the server controller."""
         self.servers = []
+        self.args = args
 
-    def start_server(self, server_type):
+    def start_server(self,server_type : str):
         """Start a server instance."""
         if server_type.lower() == "mysql":
-            server = MySQLServer()
-        elif server_type.lower() == "duckdb":
-            server = DuckDBServer()
+            server = MySQLServer(self.args)
         else:
             raise ValueError("Unsupported server type")
 

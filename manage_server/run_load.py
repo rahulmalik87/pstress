@@ -5,10 +5,10 @@
     """
 
 import logging
-from utils.common_args import CommonArgs
-from utils.logger import setup_logger
-from utils.factory import create_load_generator_instance
-from servers.controller import ServerController
+from module.common_args import CommonArgs
+from module.logger import setup_logger
+from module.load_generator_controller import create_load_generator_instance
+from module.server_controller import ServerController
 
 
 class RunLoadTest(CommonArgs):
@@ -19,25 +19,22 @@ class RunLoadTest(CommonArgs):
         run_load_group = self.add_argument_group("RunLoadTest")
         run_load_group.add_argument("--time", default=60, type=int,
                                     help="Time to run the load")
+        self.args = None
+        self.parse_args()
+        setup_logger("run_load.py", self.args)
 
-    def run_load(self, load_generator_type, server_type):
+    def parse_args(self):
+        """ Parse the arguments """
+        self.args = super().parse_args()
+        return self.args
+
+    def run_load(self):
         """ This method is used to run the load test """
-        server = create_server_instance(server_type)
-        load_generator = create_load_generator_instance(load_generator_type)
-        # Start the server
-        server.start()
-
-        # Start load generation
-        load_generator.start_load()
-
-        # Stop load generation and server
-        load_generator.stop_load()
-        server.stop()
+        controller = ServerController(self.args)
+        instance = server.start_server(self.args.server)
 
 
 if __name__ == "__main__":
     test = RunLoadTest()
-    args = test.parse_args()
-    setup_logger("run_load.py", args)
     logging.info("Starting run")
-    test.run_load(args.load_generator, args.server)
+    test.run_load()
