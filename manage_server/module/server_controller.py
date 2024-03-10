@@ -12,6 +12,7 @@ class ServerController:
         """Start a server instance."""
         if server_type.lower() == "mysql":
             server = MySQLServer(self.args)
+            server.initialize()
         else:
             raise ValueError("Unsupported server type")
 

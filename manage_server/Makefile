@@ -5,4 +5,4 @@ mypy:
 	python3 -m mypy *py
 
 pylint:
-	PYTHONPATH=module python3 -m pylint --rcfile=pylintrc module/*py
+	PYTHONPATH=module python3 -m pylint --rcfile=lint.rc module/*py
