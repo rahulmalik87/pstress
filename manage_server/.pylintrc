@@ -1,0 +1,5 @@
+[MASTER]
+
+[MESSAGES CONTROL]
+disable=consider-using-with, logging-fstring-interpolation, logging-not-lazy, f-string-without-interpolation
+

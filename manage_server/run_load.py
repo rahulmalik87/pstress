@@ -6,7 +6,6 @@
 
 import logging
 from module.common_args import CommonArgs
-from module.load_generator_controller import create_load_generator_instance
 from module.server_controller import ServerController
 from module.utils import initial_setup
 
@@ -24,7 +23,8 @@ if __name__ == "__main__":
     initial_setup(args, "RunLoadTest")
     controller = ServerController(args)
     instance = controller.start_server(args.server)
+    logging.info("Server started")
     instance.run_query("CREATE DATABASE test")
-    
-   
+    number_of_database = instance.run_query_return("SHOW DATABASES")
+    print(number_of_database)
     instance.stop()

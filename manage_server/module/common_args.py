@@ -1,5 +1,6 @@
 """ Common arguments for all the scripts """
 import argparse
+import os
 from .sysbench_load_generator import sysbench_init_args
 
 
@@ -16,10 +17,10 @@ class CommonArgs(argparse.ArgumentParser):
 
         group.add_argument("-s", "--server", choices=["mysql", "duckdb"], default="mysql",
                            help="Type of server (e.g., mysql or duckdb)")
+        group.add_argument("--workdir", default = os.path.join(os.getcwd(),
+                                                               "workdir"), help="Working directory")
 
-        group.add_argument("--workdir", default="./workdir",
-                           help="Working directory")
-        group.add_argument("-b", "basedir",
+        group.add_argument("-b", "--basedir",
                            help="path of binares. Multiple path are seprated by : similar to PATH")
         group.add_argument("--port-base", default=3306, type=int,
                            help="Base port number")

@@ -3,7 +3,7 @@ import logging
 import os
 import shutil
 import subprocess
-
+from typing import List
 
 def find_executable(executable, path=None):
     """Tries to find 'executable' in the directories listed in 'path' (a
@@ -17,7 +17,7 @@ def find_executable(executable, path=None):
         path = path.split(os.pathsep)
     for inpath in path:
         if os.path.exists(os.path.join(inpath, executable)):
-            logging.debug(f"Found executable {executable} in {inpath}")
+            logging.debug("Found %s in %s", executable, inpath)
             return os.path.join(inpath, executable)
     raise FileNotFoundError(f"Could not find {executable} in {path}")
 
@@ -54,7 +54,6 @@ def initial_setup(args, test_name: str):
         args.basedir = os.environ.get("BASEDIR")
     if args.basedir is None:
         raise ValueError("Basedir not set")
-
     __clean_vardir(os.path.join(args.workdir, "var"))
 
 
@@ -77,5 +76,20 @@ def check_call(*args):
     Args:
         args (list): List of command line arguments.
     """
-    logging.debug("".join(*args))
+    logging.debug(" ".join(*args))
     subprocess.check_call(*args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def run_in_background(args : List[str]):
+    """
+    Run a command in the background.
+
+    Args:
+        args (list): List of command line arguments.
+    Returns:
+        subprocess.Popen: Process object.
+    """
+    logging.debug(" ".join(args))
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    logging.debug("Started process %d", process.pid)
+    return process
