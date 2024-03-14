@@ -21,10 +21,10 @@ def argument_for_test():
 if __name__ == "__main__":
     args = argument_for_test()
     initial_setup(args, "RunLoadTest")
+    logging.info("Starting the test to know the number of databases")
     controller = ServerController(args)
     instance = controller.start_server(args.server)
-    logging.info("Server started")
     instance.run_query("CREATE DATABASE test")
-    number_of_database = instance.run_query_return("SHOW DATABASES")
+    number_of_database = instance.run_query("SHOW DATABASES")
     print(number_of_database)
     instance.stop()
