@@ -1427,6 +1427,9 @@ Partition::Partition(std::string n) : Table(n) {
 }
 
 void Table::DropCreate(Thd1 *thd) {
+  if (type != TABLE_TYPES::FK) {
+    return;
+  }
   int nbo_prob = options->at(Option::DROP_WITH_NBO)->getInt();
   bool set_session_nbo = false;
   if (rand_int(100) < nbo_prob) {
@@ -1437,7 +1440,7 @@ void Table::DropCreate(Thd1 *thd) {
   if (set_session_nbo) {
     execute_sql("SET SESSION wsrep_osu_method=DEFAULT ", thd);
   }
-  std::string def = definition();
+  std::string def = definition(true, true);
   if (!execute_sql(def, thd) && tablespace.size() > 0) {
     std::string tbs = " TABLESPACE=" + tablespace + "_rename";
 
@@ -2033,11 +2036,16 @@ bool Table::has_pk() const {
 }
 
 /* prepare table definition */
-std::string Table::definition(bool with_index) {
+std::string Table::definition(bool with_index, bool new_table) {
   std::string def = "CREATE";
   if (type == TEMPORARY)
     def += " TEMPORARY";
-  def += " TABLE " + name_ + " (";
+  if (new_table) {
+    static int number = 0;
+    def += " TABLE " + name_ + std::to_string(number++) + " (";
+  } else {
+    def += " TABLE " + name_ + " (";
+  }
 
   if (columns_->size() == 0)
     throw std::runtime_error("no column in table " + name_);
