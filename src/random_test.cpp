@@ -1341,9 +1341,12 @@ bool Table::load_secondary_indexes(Thd1 *thd) {
   return true;
 }
 
-bool FK_table::load_fk_constrain(Thd1 *thd) {
+bool FK_table::load_fk_constrain(Thd1 *thd, int number) {
 
   std::string constraint = name_ + "_" + parent->name_;
+  if (number != 0) {
+    constraint += std::to_string(number);
+  }
   std::string pk;
   for (const auto &col : *parent->columns_) {
     if (col->primary_key == true) {
@@ -1352,10 +1355,13 @@ bool FK_table::load_fk_constrain(Thd1 *thd) {
     }
   }
   assert(pk.size() > 0);
+  std::string sql = "ALTER TABLE " + name_;
+  if (number != 0) {
+    sql += std::to_string(number);
+  }
+  sql += " ADD CONSTRAINT " + constraint +
+         " FOREIGN KEY (ifk_col) REFERENCES " + parent->name_ + " (" + pk + ")";
 
-  std::string sql = "ALTER TABLE " + name_ + " ADD CONSTRAINT " + constraint +
-                    " FOREIGN KEY (ifk_col) REFERENCES " + parent->name_ +
-                    " (" + pk + ")";
   sql += " ON UPDATE " + enumToString(on_update);
   sql += " ON DELETE  " + enumToString(on_delete);
 
@@ -1436,11 +1442,12 @@ void Table::DropCreate(Thd1 *thd) {
     execute_sql("SET SESSION wsrep_osu_method=NBO ", thd);
     set_session_nbo = true;
   }
-  execute_sql("DROP TABLE " + name_, thd);
+  // execute_sql("DROP TABLE " + name_, thd);
   if (set_session_nbo) {
     execute_sql("SET SESSION wsrep_osu_method=DEFAULT ", thd);
   }
-  std::string def = definition(true, true);
+  static std::atomic<int> number = 1;
+  std::string def = definition(true, ++number);
   if (!execute_sql(def, thd) && tablespace.size() > 0) {
     std::string tbs = " TABLESPACE=" + tablespace + "_rename";
 
@@ -1459,6 +1466,9 @@ void Table::DropCreate(Thd1 *thd) {
           encryption = 'Y';
         table_mutex.unlock();
       }
+  }
+  if (!static_cast<FK_table *>(this)->load_fk_constrain(thd, number)) {
+    std::cout << "Failed to add fk constain" << std::endl;
   }
 }
 
@@ -2036,13 +2046,12 @@ bool Table::has_pk() const {
 }
 
 /* prepare table definition */
-std::string Table::definition(bool with_index, bool new_table) {
+std::string Table::definition(bool with_index, int number) {
   std::string def = "CREATE";
   if (type == TEMPORARY)
     def += " TEMPORARY";
-  if (new_table) {
-    static int number = 0;
-    def += " TABLE " + name_ + std::to_string(number++) + " (";
+  if (number != 0) {
+    def += " TABLE " + name_ + std::to_string(number) + " (";
   } else {
     def += " TABLE " + name_ + " (";
   }

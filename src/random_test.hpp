@@ -204,7 +204,7 @@ struct Table {
 
   Table(std::string n);
   static Table *table_id(TABLE_TYPES choice, int id);
-  std::string definition(bool with_index = true, bool new_table = false);
+  std::string definition(bool with_index = true, int number = 0);
   /* add secondary indexes */
   bool load_secondary_indexes(Thd1 *thd);
   /* execute table definition, Bulk data and then secondary index */
@@ -309,7 +309,7 @@ struct FK_table : Table {
   /* current only used for step 1. So we do not store in metadata.
    Used to get distince keys of pkey table */
   Table* parent;
-  bool load_fk_constrain(Thd1 *thd);
+  bool load_fk_constrain(Thd1 *thd, int number = 0);
 
   void pickRefrence(Table *table) {
     on_delete = getRandomForeignKeyAction(table);
