@@ -1,4 +1,4 @@
-/*
+/p/*
  =========================================================
  #       Created by Rahul Malik, Percona LLC             #
  =========================================================
@@ -63,9 +63,16 @@ std::vector<Partition::PART_TYPE> Partition::supported;
 const int maximum_records_in_each_parititon_list = 100;
 
 static void print_and_log(std::string &&str, Thd1 *thd) {
-  std::lock_guard<std::mutex> lock(ddl_logs_write);
-  std::cout << str << std::endl;
-  thd->thread_log << str << std::endl;
+    const int max_print = 300;
+    static std::atomic<int> print_so_far = 0;
+    print_so_far++;
+    std::lock_guard<std::mutex> lock(ddl_logs_write);
+    std::cout << str << std::endl;
+    if (print_so_far > max_print) {
+      std::cout << "more than " << max_print << " error on console Exiting"
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
 }
 static MYSQL_ROW mysql_fetch_row_safe(Thd1 *thd) {
   if (!thd->result) {
