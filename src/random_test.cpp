@@ -62,11 +62,27 @@ typedef std::vector<std::vector<std::string>> query_result;
 std::vector<Partition::PART_TYPE> Partition::supported;
 const int maximum_records_in_each_parititon_list = 100;
 
-static void print_and_log(std::string &&str, Thd1 *thd) {
-  std::lock_guard<std::mutex> lock(ddl_logs_write);
-  std::cout << str << std::endl;
-  thd->thread_log << str << std::endl;
+template <typename T> static T try_negative(T val) {
+  if (rand_int(100) > options->at(Option::POSITIVE_INT_PROB)->getInt()) {
+    return val * (-1);
+  }
+  return val;
 }
+
+static void print_and_log(std::string &&str, Thd1 *thd) {
+    const int max_print = 300;
+    static std::atomic<int> print_so_far = 0;
+    print_so_far++;
+    std::lock_guard<std::mutex> lock(ddl_logs_write);
+    std::cout << str << std::endl;
+    if (print_so_far > max_print) {
+      std::cout << "more than " << max_print << " error on console Exiti  ng"
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    thd->thread_log << str << std::endl;
+  }
+
 static MYSQL_ROW mysql_fetch_row_safe(Thd1 *thd) {
   if (!thd->result) {
     thd->thread_log << "mysql_fetch_row called with nullptr arg!";
@@ -145,7 +161,10 @@ static query_result get_query_result(Thd1 *thd) {
   while (auto row = mysql_fetch_row_safe(thd)) {
     std::vector<std::string> r;
     for (unsigned int i = 0; i < total_fields; i++) {
-      r.push_back(row[i]);
+       std::string value;
+        if (row[i] != NULL)
+          value = row[i];
+        r.push_back(value);
     }
     result.push_back(r);
   }
@@ -169,7 +188,6 @@ static Table *pick_table(Table::TABLE_TYPES type, int id) {
   return nullptr;
 }
 
-
 /* generate random numbers to populate in primary and fk
 @param[in] number_of_records
 @param[out] vector containing unique elements */
@@ -181,7 +199,7 @@ static std::vector<int> generateUniqueRandomNumbers(int number_of_records) {
       g_integer_range * options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt();
 
   while (unique_keys_set.size() < static_cast<size_t>(number_of_records)) {
-    unique_keys_set.insert(rand_int(max_size, 1));
+    unique_keys_set.insert(try_negative(rand_int(max_size, 1)));
   }
 
   std::vector<int> unique_keys(unique_keys_set.begin(), unique_keys_set.end());
@@ -386,16 +404,29 @@ int sum_of_all_options(Thd1 *thd) {
   if (options->at(Option::ONLY_PARTITION)->getBool())
     options->at(Option::NO_TEMPORARY)->setBool("true");
 
-  /* if select is set as zero, disable all type of selects */
-  if (options->at(Option::NO_SELECT)->getBool()) {
-    options->at(Option::SELECT_ALL_ROW)->setInt(0);
-    options->at(Option::SELECT_ROW_USING_PKEY)->setInt(0);
-  }
+  if (options->at(Option::ONLY_SELECT)->getBool()) {
+      options->at(Option::NO_UPDATE)->setBool(true);
+      options->at(Option::NO_DELETE)->setBool(true);
+      options->at(Option::NO_INSERT)->setBool(true);
+    } else if (options->at(Option::NO_SELECT)->getBool()) {
+      /* if select is set as zero, disable all type of selects */
+      options->at(Option::SELECT_ALL_ROW)->setInt(0);
+      options->at(Option::SELECT_ROW_USING_PKEY)->setInt(0);
+      options->at(Option::GRAMMAR_SQL)->setInt(0);
+    }
+  
   /* if delete is set as zero, disable all type of deletes */
   if (options->at(Option::NO_DELETE)->getBool()) {
     options->at(Option::DELETE_ALL_ROW)->setInt(0);
     options->at(Option::DELETE_ROW_USING_PKEY)->setInt(0);
   }
+
+  /* disable call  function if no insert update and delete */
+    if (options->at(Option::NO_UPDATE)->getBool() &&
+        options->at(Option::NO_DELETE)->getBool() &&
+        options->at(Option::NO_INSERT)->getBool()) {
+      options->at(Option::CALL_FUNCTION)->setInt(0);
+    }
   /* If update is disable, set all update probability to zero */
   if (options->at(Option::NO_UPDATE)->getBool()) {
     options->at(Option::UPDATE_ROW_USING_PKEY)->setInt(0);
@@ -595,7 +626,7 @@ int set_seed(Thd1 *thd) {
 
 /* generate random strings of size N_STR */
 std::vector<std::string> *random_strs_generator(unsigned long int seed) {
-  static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz"
+  static const char alphabet[] = " abcdefghijklmnopqrstuvwxyz"
                                  "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                                  "0123456789";
 
@@ -633,7 +664,7 @@ std::string rand_float(float upper, float lower) {
   static std::uniform_real_distribution<> dis(lower, upper);
   std::ostringstream out;
   out << std::fixed;
-  out << std::setprecision(2) << (float)(dis(rng));
+  out << std::setprecision(2) << try_negative(dis(rng));
   return out.str();
 }
 
