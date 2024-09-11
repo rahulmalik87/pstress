@@ -209,6 +209,7 @@ struct Option {
     SELECT_FOR_UPDATE,
     SELECT_FOR_UPDATE_BULK,
     PK_COLUMN_AUTOINC,
+    UNIQUE_RANGE,
     MAX
   } option;
   Option(Type t, Opt o, std::string n)
