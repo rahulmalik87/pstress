@@ -62,6 +62,7 @@ public:
     VARCHAR,
     TEXT,
     GENERATED,
+    JSON,
     COLUMN_MAX // should be last
   } type_;
   /* used to create new table/alter table add column*/
@@ -115,6 +116,15 @@ public:
            type_ == COLUMN_TYPES::FLOAT || type_ == COLUMN_TYPES::DOUBLE ||
            type_ == COLUMN_TYPES::DATE || type_ == COLUMN_TYPES::DATETIME ||
            type_ == COLUMN_TYPES::TIMESTAMP;
+  }
+  /* return the number in name_ */
+  int get_id() const {
+    size_t start_pos = name_.find_first_of("0123456789");
+    if (start_pos == std::string::npos) {
+      throw std::runtime_error("Invalid format: No number found in name.");
+    }
+    std::string token = name_.substr(start_pos);
+    return std::stoi(token);
   }
 };
 
@@ -335,6 +345,17 @@ struct Table {
     else if (s.compare("FK") == 0)
       type = FK;
   };
+
+  int get_table_id() const {
+    size_t start_pos = name_.find('_');
+    if (start_pos == std::string::npos) {
+      throw std::runtime_error("Invalid format: No underscore found in name.");
+    }
+    start_pos += 1; // Move past the first underscore
+    size_t end_pos = name_.find('_', start_pos);
+    std::string token = name_.substr(start_pos, end_pos - start_pos);
+    return std::stoi(token);
+  }
 };
 
 /* Fk table */
@@ -539,6 +560,7 @@ struct grammar_table {
     TIMESTAMP,
     FLOAT,
     TEXT,
+    JSON,
     MAX
   };
   static sql_col_types get_col_type(std::string type) {
@@ -558,6 +580,8 @@ struct grammar_table {
       return FLOAT;
     if (type == "TEXT")
       return TEXT;
+    if (type == "JSON")
+      return JSON;
     return MAX;
   }
   static std::string get_col_type(sql_col_types type) {
@@ -578,6 +602,8 @@ struct grammar_table {
       return "FLOAT";
     case TEXT:
       return "TEXT";
+    case JSON:
+      return "JSON";
     case MAX:
       break;
     }
@@ -617,4 +643,6 @@ struct grammar_tables {
   std::string sql;
   std::vector<grammar_table> tables;
 };
+void print_and_log(std::string &&str, Thd1 *thd = nullptr,
+                   bool print_error = false);
 #endif

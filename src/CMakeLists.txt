@@ -7,12 +7,17 @@ IF (MYSQL_FOUND)
   ELSE()
     INCLUDE_DIRECTORIES( ${MYSQL_INCLUDE_DIR} )
   ENDIF(MARIADB)
-  ADD_EXECUTABLE(${BINARY_NAME}-${PSTRESS_EXT} pstress.cpp help.cpp node.cpp thread.cpp random_test.cpp)
+  ADD_EXECUTABLE(${BINARY_NAME}-${PSTRESS_EXT} pstress.cpp help.cpp node.cpp thread.cpp random_test.cpp json.cpp)
   TARGET_LINK_LIBRARIES( ${BINARY_NAME}-${PSTRESS_EXT} ${MYSQL_LIBRARY} ${OTHER_LIBS} inih++)
-  FILE(COPY
-         grammar.sql
-         DESTINATION .)
-  INSTALL(FILES grammar.sql DESTINATION bin)
+
+ # Copy all .sql files
+  FILE(GLOB SQL_FILES "*.sql")
+  FILE(COPY ${SQL_FILES} DESTINATION .)
+
+  # Install all .sql files to the bin directory
+  INSTALL(FILES ${SQL_FILES} DESTINATION bin)
+
   INSTALL(TARGETS ${BINARY_NAME}-${PSTRESS_EXT} DESTINATION bin)
+
 ENDIF(MYSQL_FOUND)
 SET( CMAKE_EXPORT_COMPILE_COMMANDS ON )
