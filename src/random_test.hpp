@@ -11,7 +11,15 @@
 #include <iostream>
 #include <memory> //shared_ptr
 #include <mutex>
+#include <deque>
+#ifdef USE_MYSQL
 #include <mysql.h>
+#endif
+
+#ifdef USE_DUCKDB
+#include "duckdb.hpp"
+#endif
+
 #include <prettywriter.h>
 #include <random>
 #include <shared_mutex>
@@ -41,6 +49,7 @@ int rand_int(long int upper, long int lower = 0);
 std::string rand_float(float upper, float lower = 0);
 std::string rand_double(double upper, double lower = 0);
 std::string rand_string(int upper, int lower = 2);
+
 
 struct Table;
 class Column {
@@ -186,13 +195,26 @@ struct Index {
 
 struct Thd1 {
   Thd1(int id, std::ofstream &tl, std::ofstream &ddl_l, std::ofstream &client_l,
-       MYSQL *c, std::atomic<unsigned long long> &p,
-       std::atomic<unsigned long long> &f)
+#ifdef USE_MYSQL
+       MYSQL *mysql_conn,  // Renamed to mysql_conn for clarity
+#endif
+#ifdef USE_DUCKDB
+       duckdb::Connection *duckdb_conn,  // Renamed for consistency
+#endif
+       std::atomic<unsigned long long> &p,
+       std::atomic<unsigned long long> &f, int log_N_count)
       : thread_id(id), thread_log(tl), ddl_logs(ddl_l), client_log(client_l),
-        conn(c), performed_queries_total(p), failed_queries_total(f){};
+#ifdef USE_MYSQL
+        conn(mysql_conn),  // Initialize MySQL connection
+#endif
+#ifdef USE_DUCKDB
+        duckdb_conn(duckdb_conn),  // Initialize DuckDB connection
+#endif
+        performed_queries_total(p), failed_queries_total(f), max_recent_queries(log_N_count) {}
 
-  bool run_some_query(); // create default tables and run random queries
-  bool load_metadata();  // load metada of tool in memory
+  bool run_some_query(); // Create default tables and run random queries
+  bool load_metadata();  // Load metadata of the tool in memory
+  bool tryreconnect();
 
   int thread_id;
   long int seed;
@@ -200,25 +222,55 @@ struct Thd1 {
   std::ofstream &thread_log;
   std::ofstream &ddl_logs;
   std::ofstream &client_log;
-  MYSQL *conn;
+
+#ifdef USE_MYSQL
+  MYSQL *conn; // MySQL connection
+  std::shared_ptr<MYSQL_RES> result; // Result set of SQL for MySQL
+#endif
+
+#ifdef USE_DUCKDB
+  bool db_initialized = false;
+  duckdb::Connection *duckdb_conn; // DuckDB connection
+  std::unique_ptr<duckdb::MaterializedQueryResult> result; // Result set for DuckDB
+#endif
+
   std::atomic<unsigned long long> &performed_queries_total;
   std::atomic<unsigned long long> &failed_queries_total;
-  std::shared_ptr<MYSQL_RES> result; // result set of sql
-  bool ddl_query = false;            // is the query ddl
-  bool success = false;              // if the sql is successfully executed
-  int max_con_fail_count = 0;        // consecutive failed queries
 
-  /* for loading Bulkdata, Primary key of current table is stored in this vector
-   * which  is used for the FK tables  */
+  bool ddl_query = false;            // Is the query DDL
+  bool success = false;              // If the SQL is successfully executed
+  int max_con_fail_count = 0;        // Consecutive failed queries
+
+  // For storing recent queries
+  std::deque<std::string> recent_queries;
+  size_t max_recent_queries;
+
+  // For loading bulk data, primary key of current table is stored in this vector
   std::vector<int> unique_keys;
   int query_number = 0;
+
   std::string get_xid() {
     std::string xid = "\'xid" + std::to_string(thread_id) + "\'";
     return xid;
   }
+
   struct workerParams *myParam;
   bool tryreconnet();
+
+  // Add a query to the deque
+  void add_query(const std::string &query) {
+    recent_queries.push_back(query);
+    if (recent_queries.size() > max_recent_queries) {
+      recent_queries.pop_front(); // Keep only the last N queries
+    }
+  }
+
+  // Retrieve recent queries (for logging or debugging)
+  const std::deque<std::string>& get_recent_queries() const {
+    return recent_queries;
+  }
 };
+
 
 /* Table basic properties */
 struct Table {
