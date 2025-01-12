@@ -193,6 +193,7 @@ static query_result get_query_result(Thd1 *thd) {
   return result;
 }
 
+#ifdef USE_MYSQL
 static void kill_query(Thd1 *thd) {
 
   auto on_exit = std::shared_ptr<void>(nullptr, [&](...) {
@@ -225,6 +226,7 @@ static void kill_query(Thd1 *thd) {
   }
   return;
 }
+#endif
 
 /* return table pointer of matching table. This is only done during the
  * first step or during the prepare, so you would have only tables that are not
@@ -2695,10 +2697,18 @@ bool execute_sql(const std::string &sql, Thd1 *thd) {
     }
 
 #ifdef DUCKDB
+    if (!thd->db_initialized) {
+        try {
+            // Create DuckDB connection
+            duckdb::DuckDB db(nullptr);  // In-memory database
+            thd->db_connection = std::make_shared<duckdb::Connection>(db);
+            thd->db_initialized = true;
+        } catch (const std::exception &e) {
+            thd->thread_log << "Error initializing DuckDB: " << e.what() << std::endl;
+            return 0;
+        }
+    }
     try {
-        // Create DuckDB connection
-        duckdb::DuckDB db(nullptr);  // In-memory database
-        duckdb::Connection con(db);
         auto result = con.Query(sql);
 
         if (log_query_duration) {
@@ -2777,6 +2787,14 @@ bool execute_sql(const std::string &sql, Thd1 *thd) {
 
 #else
     // MySQL Logic
+    if (!thd->conn_initialized) {
+        thd->conn = mysql_init(nullptr);
+        if (!thd->conn) {
+            thd->thread_log << "Error initializing MySQL connection" << std::endl;
+            return 0;
+        }
+        thd->conn_initialized = true;
+    }
     auto res = mysql_real_query(thd->conn, query, strlen(query));
 
     if (log_query_duration) {
@@ -2887,6 +2905,7 @@ bool execute_sql(const std::string &sql, Thd1 *thd) {
     return (res == 0 ? 1 : 0);
 #endif
 }
+
 
 const std::vector<uint32_t> row_group_sizes = {2,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
 

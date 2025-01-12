@@ -9,7 +9,7 @@
 std::atomic_flag lock_metadata = ATOMIC_FLAG_INIT;
 std::atomic<bool> metadata_loaded(false);
 
-
+#ifdef USE_MYSQL
 // Get the number of affected rows safely
 inline unsigned long long Node::getAffectedRows(MYSQL *connection) {
   if (mysql_affected_rows(connection) == ~(unsigned long long)0) {
@@ -17,6 +17,8 @@ inline unsigned long long Node::getAffectedRows(MYSQL *connection) {
   }
   return mysql_affected_rows(connection);
 }
+#endif
+
 
 void Node::workerThread(int number) {
 
@@ -63,6 +65,7 @@ void Node::workerThread(int number) {
     std::cout << std::fixed;
   }
 
+  #ifdef USE_MYSQL
   MYSQL *conn;
 
   conn = mysql_init(NULL);
@@ -77,13 +80,7 @@ void Node::workerThread(int number) {
                 << std::endl;
     return;
   }
-  /*
-#ifdef MAXPACKET
-  if (myParams.maxpacket != MAX_PACKET_DEFAULT) {
-    mysql_options(conn, MYSQL_OPT_MAX_ALLOWED_PACKET, &myParams.maxpacket);
-  }
-#endif
-*/
+
   if (mysql_real_connect(conn, myParams.address.c_str(),
                          myParams.username.c_str(), myParams.password.c_str(),
                          myParams.database.c_str(), myParams.port,
@@ -98,10 +95,27 @@ void Node::workerThread(int number) {
     mysql_thread_end();
     return;
   }
+#endif
+
+#ifdef USE_DUCKDB
+  duckdb::DuckDB db(myParams.database);
+  duckdb::Connection conn(db);
+#endif
+
+Thd1 *thd = nullptr;
 
   static auto log_N_count = options->at(Option::LOG_N_QUERIES)->getInt();
-  Thd1 *thd = new Thd1(number, thread_log, general_log, client_log, conn,
-                       performed_queries_total, failed_queries_total,log_N_count);
+  #ifdef USE_MYSQL
+  thd = new Thd1(number, thread_log, general_log, client_log, conn,
+                 performed_queries_total, failed_queries_total,
+                 log_N_count);
+#endif
+
+#ifdef USE_DUCKDB
+  thd = new Thd1(number, thread_log, general_log, client_log, &conn, // Passing address for DuckDB
+                 performed_queries_total, failed_queries_total,
+                 log_N_count);
+#endif
 
   thd->myParam = &myParams;
 
@@ -194,11 +208,10 @@ void Node::workerThread(int number) {
   #endif
 }
 
-bool Thd1::tryreconnect() {
+#ifdef USE_MYSQL
+bool Thd1::tryreconnet() {
   MYSQL *conn;
   auto myParams = *this->myParam;
-
-#ifdef USE_MYSQL
   conn = mysql_init(NULL);
   if (mysql_real_connect(conn, myParams.address.c_str(),
                          myParams.username.c_str(), myParams.password.c_str(),
@@ -206,21 +219,12 @@ bool Thd1::tryreconnect() {
                          myParams.socket.c_str(), 0) == NULL) {
     thread_log << "Error Failed to reconnect " << mysql_errno(conn);
     mysql_close(conn);
+
     return false;
   }
   MYSQL *old_conn = this->conn;
   mysql_close(old_conn);
   this->conn = conn;
   return true;
-#elif defined(USE_DUCKDB)
-  duckdb::DuckDB *conn = new duckdb::DuckDB(myParams.database);
-  if (conn == nullptr) {
-    thread_log << "Error: Failed to reconnect to DuckDB database." << std::endl;
-    return false;
-  }
-  duckdb::DuckDB *old_conn = this->conn;
-  delete old_conn;
-  this->conn = conn;
-  return true;
-#endif
 }
+#endif
