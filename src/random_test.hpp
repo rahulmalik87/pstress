@@ -2,6 +2,7 @@
 #define __RANDOM_HPP__
 
 #include "common.hpp"
+#include "ring_buffer.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -41,6 +42,7 @@ int rand_int(long int upper, long int lower = 0);
 std::string rand_float(float upper, float lower = 0);
 std::string rand_double(double upper, double lower = 0);
 std::string rand_string(int upper, int lower = 2);
+struct Thd1;
 
 struct Table;
 class Column {
@@ -197,9 +199,10 @@ struct Index {
 struct Thd1 {
   Thd1(int id, std::ofstream &tl, std::ofstream &ddl_l, std::ofstream &client_l,
        MYSQL *c, std::atomic<unsigned long long> &p,
-       std::atomic<unsigned long long> &f)
+       std::atomic<unsigned long long> &f, size_t buffer_size)
       : thread_id(id), thread_log(tl), ddl_logs(ddl_l), client_log(client_l),
-        conn(c), performed_queries_total(p), failed_queries_total(f){};
+        conn(c), performed_queries_total(p), failed_queries_total(f),
+        query_buffer(buffer_size){};
 
   bool run_some_query(); // create default tables and run random queries
   bool load_metadata();  // load metada of tool in memory
@@ -217,6 +220,12 @@ struct Thd1 {
   bool ddl_query = false;            // is the query ddl
   bool success = false;              // if the sql is successfully executed
   int max_con_fail_count = 0;        // consecutive failed queries
+  RingBuffer<std::string> query_buffer;
+  void change_buffer_size(size_t new_size) {
+    query_buffer.resize(new_size); // Resize the ring buffer
+    std::cout << "Ring buffer size changed to " << new_size << " queries."
+              << std::endl;
+  }
 
   /* for loading Bulkdata, Primary key of current table is stored in this vector
    * which  is used for the FK tables  */
@@ -226,6 +235,7 @@ struct Thd1 {
     std::string xid = "\'xid" + std::to_string(thread_id) + "\'";
     return xid;
   }
+
   struct workerParams *myParam;
   bool tryreconnet();
 };
@@ -260,6 +270,7 @@ struct Table {
   void SetTableCompression(Thd1 *thd);
   void ModifyColumn(Thd1 *thd);
   void InsertRandomRow(Thd1 *thd);
+  void InsertRandomRowBulk(Thd1 *thd);
   void Compare_between_engine(const std::string &sql, Thd1 *thd);
   void InsertClause();
   bool InsertBulkRecord(Thd1 *thd);
@@ -279,7 +290,7 @@ struct Table {
   Column *GetRandomColumn();
   std::string GetWherePrecise();
   std::string GetWhereBulk();
-  std::string ColumnValues();
+  std::string ColumnValues(int value_count = 1);
   std::string SelectColumn();
   std::string SetClause();
   void DeleteAllRows(Thd1 *thd);
@@ -296,7 +307,7 @@ struct Table {
   std::string compression;
   std::string encryption = "N";
   int key_block_size = 0;
-  int number_of_initial_records;
+  unsigned int number_of_initial_records;
   size_t auto_inc_index;
   // std::string data_directory; todo add corressponding code
   std::vector<Column *> *columns_;
@@ -333,7 +344,7 @@ struct Table {
     }
     return "FAIL";
   };
-  bool has_pk() const;
+  bool has_int_pk() const;
 
   void set_type(std::string s) {
     if (s.compare("PARTITION") == 0)
@@ -527,7 +538,8 @@ bool load_metadata(Thd1 *thd);
 param[in] sql	 	query that we want to execute
 param[in/out] thd	Thd used to execute sql
 */
-bool execute_sql(const std::string &sql, Thd1 *thd);
+bool execute_sql(const std::string &sql, Thd1 *thd,
+                 bool log_result_client = false);
 
 void save_metadata_to_file();
 void clean_up_at_end();

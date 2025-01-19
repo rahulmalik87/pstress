@@ -1,13 +1,14 @@
 #include "common.hpp"
 #include "node.hpp"
 #include "random_test.hpp"
+#include "ring_buffer.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <random>
 #include <sstream>
-std::atomic_flag lock_metadata = ATOMIC_FLAG_INIT;
 std::atomic<bool> metadata_loaded(false);
+std::atomic<int> thread_started(0);
 
 inline unsigned long long Node::getAffectedRows(MYSQL *connection) {
   if (mysql_affected_rows(connection) == ~(unsigned long long)0) {
@@ -78,9 +79,10 @@ void Node::workerThread(int number) {
                          myParams.username.c_str(), myParams.password.c_str(),
                          myParams.database.c_str(), myParams.port,
                          myParams.socket.c_str(), 0) == NULL) {
-    thread_log << "Error " << mysql_errno(conn) << ": " << mysql_error(conn)
-               << std::endl;
+    std::cout << "Error " << mysql_errno(conn) << ": " << mysql_error(conn)
+              << std::endl;
     mysql_close(conn);
+    exit(EXIT_FAILURE);
 
     if (thread_log.is_open()) {
       thread_log.close();
@@ -90,16 +92,18 @@ void Node::workerThread(int number) {
   }
 
   Thd1 *thd = new Thd1(number, thread_log, general_log, client_log, conn,
-                       performed_queries_total, failed_queries_total);
+                       performed_queries_total, failed_queries_total,
+                       options->at(Option::N_LAST_QUERIES)->getInt());
 
   thd->myParam = &myParams;
+  thread_started++;
 
   /* run pstress in with dynamic generator or infile */
   if (options->at(Option::PQUERY)->getBool() == false) {
     static bool success = false;
 
     /* load metadata */
-    if (!lock_metadata.test_and_set()) {
+    if (thread_started == options->at(Option::THREADS)->getInt()) {
       success = thd->load_metadata();
       metadata_loaded = true;
     }
@@ -115,7 +119,15 @@ void Node::workerThread(int number) {
       thread_log << " initial setup failed, check logs for details "
                  << std::endl;
     else {
-      if (!thd->run_some_query()) {
+      auto result = thd->run_some_query();
+      if (thd->query_buffer.size() > 0) {
+        thread_log << "last N SQL executed by thread " << std::endl;
+        for (const auto &sql : thd->query_buffer.get_all()) {
+          thread_log << sql << std::endl;
+        }
+      }
+
+      if (!result) {
         std::ostringstream errmsg;
         errmsg << "Thread with id " << thd->thread_id
                << " failed, check logs  in " << myParams.logdir << "/*sql";
@@ -178,8 +190,9 @@ bool Thd1::tryreconnet() {
                          myParams.username.c_str(), myParams.password.c_str(),
                          myParams.database.c_str(), myParams.port,
                          myParams.socket.c_str(), 0) == NULL) {
-    thread_log << "Error Failed to reconnect " << mysql_errno(conn);
+    std::cout << "Error Failed to reconnect " << mysql_errno(conn) << std::endl;
     mysql_close(conn);
+    exit(EXIT_FAILURE);
 
     return false;
   }

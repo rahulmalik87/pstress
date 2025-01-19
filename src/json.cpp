@@ -72,12 +72,14 @@ std::string json_set(const Column *col) {
 }
 std::string json_rand_doc(const Column *col) {
   Document d;
-  auto max_key = rand_int(MAX_KEYS);
   if (col->get_id() % 2 == 0) {
     d.SetObject();
     auto &allocator = d.GetAllocator();
-    for (int i = 0; i < max_key; i++) {
-      std::string key = "key" + std::to_string(rand_int(MAX_KEYS));
+    for (int i = 0; i < MAX_KEYS; i++) {
+      if (rand_int(4) == 1) {
+        continue;
+      }
+      std::string key = "key" + std::to_string(i);
       std::string value = std::to_string(rand_int(MAX_VALUE));
       d.AddMember(Value(key.c_str(), allocator).Move(),
                   Value(value.c_str(), allocator).Move(), allocator);
@@ -85,6 +87,7 @@ std::string json_rand_doc(const Column *col) {
   } else {
     d.SetArray();
     auto &allocator = d.GetAllocator();
+    auto max_key = rand_int(MAX_KEYS, 1);
     for (int i = 0; i < max_key; i++) {
       std::string value = std::to_string(rand_int(MAX_VALUE));
       d.PushBack(Value(value.c_str(), allocator).Move(), allocator);

@@ -47,7 +47,7 @@ struct Option {
     NO_DDL,
     ONLY_CL_DDL,
     ONLY_CL_SQL,
-    NO_ENCRYPTION,
+    USE_ENCRYPTION,
     ENCRYPTION_TYPE,
     NO_COLUMN_COMPRESSION,
     NO_TABLE_COMPRESSION,
@@ -145,7 +145,7 @@ struct Option {
     ANALYZE,
     TRUNCATE,
     DROP_CREATE,
-    EXACT_INITIAL_RECORDS,
+    RANDOM_INITIAL_RECORDS,
     PREPARE,
     NO_TEMPORARY,
     NO_PARTITION,
@@ -198,10 +198,10 @@ struct Option {
     DELAY_IN_SECONDARY,
     SECONDARY_GC,
     SELECT_IN_SECONDARY,
-    EXACT_COLUMNS,
+    RANDOM_COLUMNS,
     ADD_NEW_TABLE,
     SINGLE_THREAD_DDL,
-    EXACT_INDEXES,
+    RANDOM_INDEXES,
     POSITIVE_INT_PROB,
     PLAIN_REWRITE,
     USING_PK_PROB,
@@ -217,11 +217,18 @@ struct Option {
     NO_JSON,
     RANDOM_TIMEZONE,
     NO_PKEY_IN_SET,
+    LOG_PK_BULK_INSERT,
+    BULK_INSERT_WIDTH,
+    N_LAST_QUERIES,
+    PRINT_TRANSACTION_RATE,
+    INSERT_BULK,
+    INSERT_BULK_COUNT,
+    NON_INT_PK,
     MAX
   } option;
   Option(Type t, Opt o, std::string n)
       : type(t), option(o), name(n), sql(false), ddl(false), total_queries(0),
-        success_queries(0){};
+        success_queries(0), query_in_timespan(0){};
   ~Option();
 
   void print_pretty();
@@ -255,6 +262,7 @@ struct Option {
 
   std::string name;
   std::string help;
+  std::string short_help;
   std::string default_value = "";
   long int default_int = 0;       // if default value is integer
   bool default_bool = false;      // if default value is bool
@@ -264,6 +272,7 @@ struct Option {
   short args = required_argument; // default is required argument
   std::atomic<unsigned long int> total_queries;   // totatl times executed
   std::atomic<unsigned long int> success_queries; // successful count
+  std::atomic<unsigned long int> query_in_timespan;
 };
 
 struct Server_Option { // Server_options
