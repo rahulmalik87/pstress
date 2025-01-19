@@ -5,15 +5,18 @@
 */
 #include "random_test.hpp"
 #include "common.hpp"
+#include "json.hpp"
 #include "node.hpp"
 #include <array>
 #include <document.h>
+#include <filesystem>
 #include <iomanip>
 #include <libgen.h>
+#include <limits.h> //
 #include <regex>
 #include <sstream>
-#include <thread>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 #define CR_SERVER_GONE_ERROR 2006
@@ -71,6 +74,18 @@ template <typename T> static T try_negative(T val) {
   return val;
 }
 
+static void random_timezone(Thd1 *thd) {
+  std::string time_zone;
+  std::string time_zone_list[] = {
+      "-12:00", "-11:00", "-10:00", "-09:00", "-08:00", "-07:00", "-06:00",
+      "-05:00", "-04:00", "-03:00", "-02:00", "-01:00", "+00:00", "+01:00",
+      "+02:00", "+03:00", "+04:00", "+05:00", "+06:00", "+07:00", "+08:00",
+      "+09:00", "+10:00", "+11:00", "+12:00"};
+  time_zone = time_zone_list[rand_int(9)];
+  std::string sql = "SET time_zone='" + time_zone + "'";
+  execute_sql(sql, thd);
+}
+
 static std::string lower_case_secondary() {
   static auto secondary = []() {
     std::string secondary = options->at(Option::SECONDARY_ENGINE)->getString();
@@ -82,8 +97,7 @@ static std::string lower_case_secondary() {
 }
 
 /* print_error print mysql error to console */
-static void print_and_log(std::string &&str, Thd1 *thd = nullptr,
-                          bool print_error = false) {
+void print_and_log(std::string &&str, Thd1 *thd, bool print_error) {
   const int max_print = 300;
   static std::atomic<int> print_so_far = 0;
   print_so_far++;
@@ -173,10 +187,10 @@ static bool compare_query_result(const query_result &r1, const query_result &r2,
 }
 
 /* return the string of the option */
-static query_result get_query_result(Thd1 *thd) {
+static query_result get_query_result(Thd1 *thd, const std::string &query) {
   std::vector<std::vector<std::string>> result;
   if (thd->result == nullptr) {
-    print_and_log("Result set is null", thd);
+    print_and_log("Result set is null" + query, thd);
     return result;
   }
   auto total_fields = mysql_num_fields(thd->result.get());
@@ -214,7 +228,7 @@ static void kill_query(Thd1 *thd) {
   if (!execute_sql(query, thd)) {
     return;
   }
-  auto result = get_query_result(thd);
+  auto result = get_query_result(thd, query);
   if (result.empty()) {
     return;
   }
@@ -370,7 +384,7 @@ int sum_of_all_options(Thd1 *thd) {
         column_types.end())
       options->at(Option::NO_FLOAT)->setBool(true);
 
-    if (std::find(column_types.begin(), column_types.end(), "DOUBE") ==
+    if (std::find(column_types.begin(), column_types.end(), "DOUBLE") ==
         column_types.end())
       options->at(Option::NO_DOUBLE)->setBool(true);
 
@@ -398,6 +412,10 @@ int sum_of_all_options(Thd1 *thd) {
         column_types.end())
       options->at(Option::NO_BLOB)->setBool(true);
 
+    if (std::find(column_types.begin(), column_types.end(), "JSON") ==
+        column_types.end())
+      options->at(Option::NO_JSON)->setBool(true);
+
     if (std::find(column_types.begin(), column_types.end(), "CHAR") ==
         column_types.end())
       options->at(Option::NO_CHAR)->setBool(true);
@@ -415,7 +433,25 @@ int sum_of_all_options(Thd1 *thd) {
       options->at(Option::NO_VIRTUAL_COLUMNS)->setBool(true);
 
   }
-
+  /* abort if all the column are set to false */
+  if (options->at(Option::NO_INTEGER)->getBool() &&
+      options->at(Option::NO_INT)->getBool() &&
+      options->at(Option::NO_FLOAT)->getBool() &&
+      options->at(Option::NO_DOUBLE)->getBool() &&
+      options->at(Option::NO_BOOL)->getBool() &&
+      options->at(Option::NO_DATE)->getBool() &&
+      options->at(Option::NO_DATETIME)->getBool() &&
+      options->at(Option::NO_TIMESTAMP)->getBool() &&
+      options->at(Option::NO_BIT)->getBool() &&
+      options->at(Option::NO_BLOB)->getBool() &&
+      options->at(Option::NO_JSON)->getBool() &&
+      options->at(Option::NO_CHAR)->getBool() &&
+      options->at(Option::NO_VARCHAR)->getBool() &&
+      options->at(Option::NO_TEXT)->getBool() &&
+      options->at(Option::NO_VIRTUAL_COLUMNS)->getBool()) {
+    print_and_log("No column type selected", thd);
+    exit(EXIT_FAILURE);
+  }
 
   /*check which all partition type supported */
   auto part_supp = opt_string(PARTITION_SUPPORTED);
@@ -552,6 +588,7 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::NO_TEMPORARY)->setBool(true);
     options->at(Option::NO_TABLESPACE)->setBool(true);
     options->at(Option::XA_TRANSACTION)->setInt(0);
+    options->at(Option::COMMIT_PROB)->setInt(100);
     if (options->at(Option::PRIMARY_KEY)->getInt() < 100)
       options->at(Option::NO_AUTO_INC)->setBool(true);
     opt_int_set(UNDO_SQL, 0);
@@ -905,6 +942,8 @@ Column::COLUMN_TYPES Column::col_type(std::string type) {
     return GENERATED;
   else if (type.compare("BLOB") == 0)
     return BLOB;
+  else if (type.compare("JSON") == 0)
+    return JSON;
   else if (type.compare("FLOAT") == 0)
     return FLOAT;
   else if (type.compare("DOUBLE") == 0)
@@ -945,6 +984,8 @@ const std::string Column::col_type_to_string(COLUMN_TYPES type) {
     return "BOOL";
   case BLOB:
     return "BLOB";
+  case JSON:
+    return "JSON";
   case GENERATED:
     return "GENERATED";
   case DATE:
@@ -1028,6 +1069,8 @@ std::string Column::rand_value_universal() {
     return "\'" + rand_string(length) + "\'";
   case Column::COLUMN_TYPES::BLOB:
     return "_binary\'" + rand_string(length) + "\'";
+  case Column::COLUMN_TYPES::JSON:
+    return "\'" + json_rand_doc(this) + "\'";
   case Column::COLUMN_TYPES::BIT:
     return rand_bit(length);
     break;
@@ -1042,11 +1085,10 @@ std::string Column::rand_value_universal() {
     return "\'" + rand_timestamp() + "\'";
     break;
   case Column::COLUMN_TYPES::GENERATED:
-  case Column::COLUMN_TYPES::COLUMN_MAX: {
+  case Column::COLUMN_TYPES::COLUMN_MAX:
     print_and_log("unhandled " + Column::col_type_to_string(type_) +
                   " at line " + std::to_string(__LINE__));
     exit(EXIT_FAILURE);
-  }
   }
   return "";
 }
@@ -1105,6 +1147,9 @@ Column::Column(std::string name, Table *table, COLUMN_TYPES type)
     break;
   case TIMESTAMP:
     name_ = "ts" + name;
+    break;
+  case JSON:
+    name_ = "j" + name;
     break;
   case BIT:
     name_ = "bt" + name;
@@ -1208,6 +1253,7 @@ Generated_Column::Generated_Column(std::string name, Table *table)
   name_ = "g" + name;
   g_type = COLUMN_MAX;
   /* Generated columns are 4:2:2:1 (INT:VARCHAR:CHAR:BLOB) */
+  // todojson, add if a table has index
   while (g_type == COLUMN_MAX) {
     auto x = rand_int(9, 1);
     if (x <= 4 && !options->at(Option::NO_INT)->getBool())
@@ -1245,20 +1291,27 @@ Generated_Column::Generated_Column(std::string name, Table *table)
     for (auto pos : col_pos) {
       auto col = table->columns_->at(pos);
       if (col->type_ == VARCHAR || col->type_ == CHAR || col->type_ == BLOB ||
-          col->type_ == TEXT || col->type_ == BIT)
-        str += " LENGTH(" + col->name_ + ")+";
-      else if (col->type_ == INT || col->type_ == INTEGER ||
-               col->type_ == BOOL || col->type_ == FLOAT ||
-               col->type_ == DOUBLE) {
+          col->type_ == TEXT || col->type_ == BIT) {
+        if (rand_int(2) == 1) {
+          str += " CHAR_LENGTH(" + col->name_ + ")+";
+        } else {
+          str += " LENGTH(REPLACE(" + col->name_ + ",'A',''))+";
+        }
+      } else if (col->type_ == INT || col->type_ == INTEGER ||
+                 col->type_ == BOOL || col->type_ == FLOAT ||
+                 col->type_ == DOUBLE) {
         if (rand_int(2) == 1) {
           str += " (" + col->name_ + "-" + "100)" + "+";
         } else {
           str += " " + col->name_ + "+";
         }
       } else if (col->type_ == DATE || col->type_ == DATETIME ||
-                 col->type_ == TIMESTAMP)
+                 col->type_ == TIMESTAMP) {
         str += " DATEDIFF('" + rand_date() + "'," + col->name_ + ")+";
-      else {
+      } else if (col->type_ == JSON) {
+        // todojson, better approach
+        str += " JSON_LENGTH(" + col->name_ + ")+";
+      } else {
         print_and_log("unhandled " + col_type_to_string(col->type_) +
                       " at line " + std::to_string(__LINE__));
         exit(EXIT_FAILURE);
@@ -1290,7 +1343,7 @@ Generated_Column::Generated_Column(std::string name, Table *table)
       case INTEGER:
       case FLOAT:
       case DOUBLE:
-        column_size = 10; // max size of int
+        column_size = 15; // max size of int
         break;
       case DATE:
       case DATETIME:
@@ -1299,6 +1352,10 @@ Generated_Column::Generated_Column(std::string name, Table *table)
         break;
       case BOOL:
         column_size = 2;
+        break;
+      case JSON:
+        // todojson
+        column_size = 30;
         break;
       case VARCHAR:
       case CHAR:
@@ -1323,6 +1380,10 @@ Generated_Column::Generated_Column(std::string name, Table *table)
                     std::to_string(column_size) + " - " +
                     std::to_string(current_size) + "))," +
                     std::to_string(current_size) + ",'0'),";
+        } else if (col->type_ == JSON) {
+          // todojson decide on table type document etc
+          gen_sql = "JSON_EXTRACT(" + col->name_ + ",'$." +
+                    std::to_string(current_size) + "'),";
         } else {
           gen_sql += "SUBSTRING(" + col->name_ + ",1," +
                      std::to_string(current_size) + "),";
@@ -1333,6 +1394,11 @@ Generated_Column::Generated_Column(std::string name, Table *table)
         if (col->type_ == BIT) {
           gen_sql = "lpad(bin(" + col->name_ + ")," +
                     std::to_string(column_size) + ",'0'),";
+        } else if (col->type_ == JSON) {
+          // todojson fix a better way
+          gen_sql = "JSON_EXTRACT(" + col->name_ + ",'$." +
+                    std::to_string(column_size) + "'),";
+
         } else {
           gen_sql += col->name_ + ",";
         }
@@ -1555,6 +1621,7 @@ std::string Index::definition() {
   def += "INDEX " + name_ + "(";
   for (auto idc : *columns_) {
     def += idc->column->name_;
+    /* if column is json create dummy index. todojson */
 
     /* blob columns should have prefix length */
     if (idc->column->type_ == Column::BLOB ||
@@ -2143,7 +2210,7 @@ void Table::CreateDefaultColumn() {
       /* loop untill we select some column */
       while (col_type == Column::COLUMN_MAX) {
 
-        auto prob = rand_int(23);
+        auto prob = rand_int(24);
 
         /* intial columns can't be generated columns. also 50% of tables last
          * columns are virtuals */
@@ -2176,6 +2243,8 @@ void Table::CreateDefaultColumn() {
           col_type = Column::TIMESTAMP;
         else if (prob == 23 && !options->at(Option::NO_BIT)->getBool())
           col_type = Column::BIT;
+        else if (prob == 24 && !options->at(Option::NO_JSON)->getBool())
+          col_type = Column::JSON;
       }
 
       if (col_type == Column::GENERATED)
@@ -2208,100 +2277,110 @@ void Table::CreateDefaultColumn() {
 
 /* create default indexes */
 void Table::CreateDefaultIndex() {
-
-  int auto_inc_pos = -1; // auto_inc_column_position
-
-  static size_t max_indexes = opt_int(INDEXES);
-
-  if (max_indexes == 0)
-    return;
-
-  /* if table have few column, decrease number of indexes */
-  size_t indexes = rand_int(
-      columns_->size() < max_indexes ? columns_->size() : max_indexes, 1);
-
-  if (options->at(Option::EXACT_INDEXES)->getBool()) {
-    indexes = max_indexes;
-  }
-
-  /* for auto-inc columns handling, we need to add auto_inc as first column */
-  for (size_t i = 0; i < columns_->size(); i++) {
-    if (columns_->at(i)->auto_increment) {
-      auto_inc_pos = i;
-    }
-  }
-
-  /*which column will have auto_inc */
-  auto_inc_index = rand_int(indexes - 1, 0);
-
-  for (size_t i = 0; i < indexes; i++) {
-    Index *id = new Index(name_ + "i" + std::to_string(i));
-
-    static size_t max_columns = opt_int(INDEX_COLUMNS);
-
     int number_of_compressed = 0;
+    int number_of_json_columns = 0;
 
-    for (auto column : *columns_)
+    for (auto column : *columns_) {
       if (column->compressed)
         number_of_compressed++;
+      if (column->type_ == Column::JSON)
+        number_of_json_columns++;
+    }
 
-    size_t number_of_columns = columns_->size() - number_of_compressed;
+    /* create a todojson index */
+    size_t number_of_valid_columns =
+        columns_->size() - number_of_compressed - number_of_json_columns;
 
-    /* only compressed columns */
-    if (number_of_columns == 0)
+    /* if no number of columns = 0 return */
+    if (number_of_valid_columns == 0)
       return;
 
-    number_of_columns = rand_int(
-        (max_columns < number_of_columns ? max_columns : number_of_columns), 1);
+    int auto_inc_pos = -1; // auto_inc_column_position
 
-    std::vector<int> col_pos; // position of columns
+    static size_t max_indexes = opt_int(INDEXES);
 
-    /* pick some columns */
-    while (col_pos.size() < number_of_columns) {
-      int current = rand_int(columns_->size() - 1);
-      if (columns_->at(current)->compressed)
-        continue;
-      /* auto-inc column should be first column in auto_inc_index */
-      if (auto_inc_pos != -1 && i == auto_inc_index && col_pos.size() == 0)
-        col_pos.push_back(auto_inc_pos);
-      else {
-        bool already_added = false;
-        for (auto id : col_pos) {
-          if (id == current)
-            already_added = true;
+    if (max_indexes == 0)
+      return;
+
+    /* if table have few column, decrease number of indexes */
+    size_t indexes =
+        rand_int(number_of_valid_columns < max_indexes ? number_of_valid_columns
+                                                       : max_indexes,
+                 1);
+
+    if (options->at(Option::EXACT_INDEXES)->getBool()) {
+      indexes = max_indexes;
+    }
+
+    /* for auto-inc columns handling, we need to add auto_inc as first column */
+    for (size_t i = 0; i < columns_->size(); i++) {
+      if (columns_->at(i)->auto_increment) {
+        auto_inc_pos = i;
+      }
+    }
+
+    /*which column will have auto_inc */
+    auto_inc_index = rand_int(indexes - 1, 0);
+
+    for (size_t i = 0; i < indexes; i++) {
+      Index *id = new Index(name_ + "i" + std::to_string(i));
+
+      static size_t max_columns = opt_int(INDEX_COLUMNS);
+
+      size_t number_of_columns = rand_int((max_columns < number_of_valid_columns
+                                               ? max_columns
+                                               : number_of_valid_columns),
+                                          1);
+
+      std::vector<int> col_pos; // position of columns
+
+      /* pick some columns */
+      while (col_pos.size() < number_of_columns) {
+        int current = rand_int(columns_->size() - 1);
+        if (columns_->at(current)->compressed ||
+            columns_->at(current)->type_ == Column::JSON)
+          continue;
+        /* auto-inc column should be first column in auto_inc_index */
+        if (auto_inc_pos != -1 && i == auto_inc_index && col_pos.size() == 0)
+          col_pos.push_back(auto_inc_pos);
+        else {
+          bool already_added = false;
+          for (auto id : col_pos) {
+            if (id == current)
+              already_added = true;
+          }
+          if (!already_added)
+            col_pos.push_back(current);
         }
-        if (!already_added)
-          col_pos.push_back(current);
-      }
-    } // while
+      } // while
 
-    auto index_has_int_col = [&col_pos, this]() {
+      auto index_has_int_col = [&col_pos, this]() {
+        for (auto pos : col_pos) {
+          if (columns_->at(pos)->type_ == Column::INT)
+            return true;
+        }
+        return false;
+      };
+
+      if (index_has_int_col() &&
+          rand_int(1000) < options->at(Option::UNIQUE_INDEX_PROB_K)->getInt()) {
+        id->unique = true;
+      }
+
       for (auto pos : col_pos) {
-        if (columns_->at(pos)->type_ == Column::INT)
-          return true;
+        auto col = columns_->at(pos);
+        static bool no_desc_support = opt_bool(NO_DESC_INDEX);
+        bool column_desc = false;
+        if (!no_desc_support) {
+          column_desc = rand_int(100) < DESC_INDEXES_IN_COLUMN
+                            ? true
+                            : false; // 33 % are desc //
+        }
+        id->AddInternalColumn(
+            new Ind_col(col, column_desc)); // desc is set as true
       }
-      return false;
-    };
-
-    if (index_has_int_col() &&
-        rand_int(1000) < options->at(Option::UNIQUE_INDEX_PROB_K)->getInt()) {
-      id->unique = true;
+      AddInternalIndex(id);
     }
-
-    for (auto pos : col_pos) {
-      auto col = columns_->at(pos);
-      static bool no_desc_support = opt_bool(NO_DESC_INDEX);
-      bool column_desc = false;
-      if (!no_desc_support) {
-        column_desc = rand_int(100) < DESC_INDEXES_IN_COLUMN
-                          ? true
-                          : false; // 33 % are desc //
-      }
-      id->AddInternalColumn(
-          new Ind_col(col, column_desc)); // desc is set as true
-    }
-    AddInternalIndex(id);
-  }
 }
 
 /* Create new table and pick some attributes */
@@ -2641,7 +2720,7 @@ void Table::Compare_between_engine(const std::string &sql, Thd1 *thd) {
     unlock();
     return set_default();
   }
-  auto res_without_forced = get_query_result(thd);
+  auto res_without_forced = get_query_result(thd, sql);
 
   if (options->at(Option::SECONDARY_ENGINE)->getString() != "")
     execute_sql("SET @@SESSION.USE_SECONDARY_ENGINE=FORCED ", thd);
@@ -2669,7 +2748,7 @@ void Table::Compare_between_engine(const std::string &sql, Thd1 *thd) {
     return set_default();
   }
 
-  auto res_with_forced = get_query_result(thd);
+  auto res_with_forced = get_query_result(thd, sql);
 
   if (!compare_query_result(res_with_forced, res_without_forced, thd)) {
     print_and_log("result set mismatch for " + sql, thd);
@@ -3000,8 +3079,9 @@ void Table::ModifyColumn(Thd1 *thd) {
       compressed = col->compressed;
       col->mutex.lock(); // lock column so no one can modify it //
       break;
-      /* todo no support for BOOL  far */
+    /* nothing can be done for json and bool */
     case Column::BOOL:
+    case Column::JSON:
     case Column::COLUMN_MAX:
       break;
     }
@@ -3124,7 +3204,7 @@ void Table::AddColumn(Thd1 *thd) {
     use_virtual = false;
   }
   while (col_type == Column::COLUMN_MAX) {
-    auto prob = rand_int(23);
+    auto prob = rand_int(24);
 
     if (use_virtual && prob == 1)
       col_type = Column::GENERATED;
@@ -3154,6 +3234,8 @@ void Table::AddColumn(Thd1 *thd) {
       col_type = Column::TIMESTAMP;
     else if (prob == 23 && !options->at(Option::NO_BIT)->getBool())
       col_type = Column::BIT;
+    else if (prob == 24 && !options->at(Option::NO_JSON)->getBool())
+      col_type = Column::JSON;
   }
 
   Column *tc;
@@ -3335,14 +3417,18 @@ void Table::AddIndex(Thd1 *thd) {
 std::string Table::SelectColumn() {
   /* Table is already locked no need to take lock */
   std::string select;
-  select = columns_->at(rand_int(columns_->size() - 1))->name_;
+  auto col = columns_->at(rand_int(columns_->size() - 1));
+  select = (col->type_ == Column::JSON ? json_select(col) : col->name_);
+
+  /*todojson enable multiple select. previous value was 20 */
   if (rand_int(100) < 20) {
-    for (const auto &col : *columns_) {
+    for (const auto &col1 : *columns_) {
       /* we do not select non_secondary as select can be in secondary engine */
-      if (col->not_secondary)
+      if (col1->not_secondary)
         continue;
       if (rand_int(100) < 50)
-        select += ", " + col->name_;
+        select += ", " + (col1->type_ == Column::JSON ? json_select(col1)
+                                                      : col1->name_);
     }
   }
   return select;
@@ -3470,6 +3556,7 @@ Column *Table::GetRandomColumn() {
     case Column::TIMESTAMP:
     case Column::TEXT:
     case Column::BIT:
+    case Column::JSON:
       col = columns_->at(col_pos);
       break;
     case Column::INTEGER:
@@ -3529,9 +3616,19 @@ std::string Table::GetRandomPartition() {
 std::string Table::GetWherePrecise() {
   auto col = GetRandomColumn();
   std::string randPartition = GetRandomPartition();
-  std::string where = randPartition + " WHERE " + col->name_;
+  std::string where = randPartition + " WHERE ";
+  std::string rand_value;
+  std::string second_rand_value;
 
-  std::string rand_value = col->rand_value();
+  if (col->type_ == Column::JSON) {
+    where += json_where(col);
+    rand_value = json_value(col);
+    second_rand_value = json_value(col);
+  } else {
+    where += col->name_;
+    rand_value = col->rand_value();
+    second_rand_value = col->rand_value();
+  }
 
   if (rand_value == "NULL") {
     return where + " IS " + (rand_int(1000) == 1 ? "NOT NULL" : "NULL");
@@ -3546,7 +3643,6 @@ std::string Table::GetWherePrecise() {
            rand_string(10, 3) + "%\')";
   }
 
-  std::string second_rand_value = col->rand_value();
 
   if (second_rand_value == "NULL") {
     if (rand_int(100) > 3) {
@@ -3778,22 +3874,34 @@ void Table::SelectAllRow(Thd1 *thd, bool select_for_update) {
 }
 
 std::string Table::SetClause() {
-  std::string set_clause;
   Column *col = nullptr;
 
   while (col == nullptr) {
     int set = rand_int(columns_->size() - 1);
-    if (columns_->at(set)->type_ != Column::GENERATED)
+    if (columns_->at(set)->type_ != Column::GENERATED) {
+      /* if there is just one column we have to pick that */
+      if (columns_->at(set)->name_ == "ipkey" &&
+          options->at(Option::NO_PKEY_IN_SET)->getBool() &&
+          columns_->size() > 1)
+        continue;
       col = columns_->at(set);
+    }
   }
-
-  set_clause = col->name_ + " = " + col->rand_value();
+  std::string set_clause = col->name_ + " = ";
+  set_clause +=
+      (col->type_ == Column::JSON ? json_set(col) : col->rand_value());
 
   if (rand_int(100) < 10) {
     for (const auto &column : *columns_) {
       if (column->type_ != Column::GENERATED && column->name_ != col->name_ &&
           rand_int(100) > 50) {
+        if (column->name_ == "ipkey" &&
+            options->at(Option::NO_PKEY_IN_SET)->getBool())
+          continue;
         set_clause += ", " + column->name_ + " = " + column->rand_value();
+        set_clause += "," + column->name_ + " = " +
+                      (column->type_ == Column::JSON ? json_set(column)
+                                                     : column->rand_value());
       }
     }
   }
@@ -4096,16 +4204,34 @@ void alter_tablespace_rename(Thd1 *thd) {
     execute_sql(sql, thd);
   }
 }
+static std::string getExecutablePath() {
+  char buffer[PATH_MAX];
+#ifdef _WIN32
+  GetModuleFileNameA(NULL, buffer, PATH_MAX);
+#else
+  ssize_t len = readlink("/proc/self/exe", buffer, PATH_MAX);
+  if (len == -1) {
+    throw std::runtime_error("Unable to get executable path");
+  }
+  buffer[len] = '\0';
+#endif
+  return std::string(buffer);
+}
 
 /* load special sql from a file and return*/
 static std::vector<grammar_tables> load_grammar_sql_from(Thd1 *thd) {
   std::vector<std::string> statments;
   std::vector<grammar_tables> tables;
-  auto file = opt_string(GRAMMAR_FILE);
+  auto grammarFileName = opt_string(GRAMMAR_FILE);
+  auto exePath = getExecutablePath();
+  std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
 
-  std::ifstream myfile(file);
+  // Construct the full path to grammar.sql in the same directory
+  std::filesystem::path grammarFilePath = exeDir / grammarFileName;
+
+  std::ifstream myfile(grammarFilePath);
   if (!myfile.is_open()) {
-    print_and_log("Unable to find grammar file " + file, thd);
+    print_and_log("Unable to find grammar file " + grammarFileName, thd);
     return tables;
   }
 
@@ -4174,7 +4300,8 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
   auto currrent_table =
       all_tables_from_grammar.at(rand_int(all_tables_from_grammar.size() - 1));
 
-  if (options->at(Option::COMPARE_RESULT)->getBool()) {
+  if (options->at(Option::COMPARE_RESULT)->getBool() ||
+      options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
     execute_sql("COMMIT", thd);
   }
   auto sql = currrent_table.sql;
@@ -4263,8 +4390,14 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
                              table.found_name + " " + table.name + "$1");
   }
   /* replace RAND_INT */
+  for (int i = 0; i < 10; i++) {
+    std::string randString = "RAND_INT_" + std::to_string(i);
+    sql = std::regex_replace(sql, std::regex(randString),
+                             std::to_string(rand_int(100)));
+  }
   sql = std::regex_replace(sql, std::regex("RAND_INT"),
                            std::to_string(rand_int(100)));
+
   if (options->at(Option::COMPARE_RESULT)->getBool()) {
     enforce_table->Compare_between_engine(sql, thd);
   } else {
@@ -4475,9 +4608,9 @@ static std::string load_metadata_from_file() {
       Column *a;
       std::string type = col["type"].GetString();
 
-      const std::array<std::string, 11> column_types{{
-          "INT",     "CHAR", "VARCHAR",  "BOOL",      "FLOAT", "DOUBLE",
-          "INTEGER", "DATE", "DATETIME", "TIMESTAMP", "BIT"}};
+      const std::array<std::string, 12> column_types{
+          {"INT", "CHAR", "VARCHAR", "BOOL", "FLOAT", "DOUBLE", "INTEGER",
+           "DATE", "DATETIME", "TIMESTAMP", "BIT", "JSON"}};
       auto isValidType =
           std::find(column_types.begin(), column_types.end(), type);
 
@@ -4579,11 +4712,11 @@ void create_database_tablespace(Thd1 *thd) {
   if (options->at(Option::SECONDARY_ENGINE)->getString() != "") {
     ensure_no_table_in_secondary(thd);
     execute_sql("CREATE TABLE " + options->at(Option::DATABASE)->getString() +
-                    ".t1(i int  primary key) SECONDARY_ENGINE=" +
+                    ".dummy(i int  primary key) SECONDARY_ENGINE=" +
                     options->at(Option::SECONDARY_ENGINE)->getString(),
                 thd);
     execute_sql("insert into " + options->at(Option::DATABASE)->getString() +
-                    ".t1 values(1)",
+                    ".dummy values(1)",
                 thd);
   }
 
@@ -4703,6 +4836,38 @@ bool Thd1::load_metadata() {
   initial_tables = all_tables->size();
 
   return 1;
+}
+
+static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
+  auto thread_id = thd->thread_id;
+  auto ddl_query = thd->ddl_query;
+
+  if (options->at(Option::THREAD_DOING_ONLY_SELECT)->getInt() != 0) {
+    if (options->at(Option::SINGLE_THREAD_DDL)->getBool() && thread_id == 1 &&
+        ddl_query) {
+      // do not block ddl query if user want single thread ddl
+    } else if (option != Option::SELECT_ALL_ROW &&
+               option != Option::SELECT_ROW_USING_PKEY &&
+               option != Option::SELECT_FOR_UPDATE &&
+               option != Option::SELECT_FOR_UPDATE_BULK &&
+               option != Option::COMPARE_RESULT) {
+      if (thread_id < options->at(Option::THREAD_DOING_ONLY_SELECT)->getInt()) {
+        return true;
+      }
+    } else if (thread_id >=
+               options->at(Option::THREAD_DOING_ONLY_SELECT)->getInt()) {
+      // Only select queries: skip threads exceeding the allowed range
+      return true;
+    }
+  }
+
+  ddl_query = options->at(option)->ddl == true ? true : false;
+
+  if (thread_id != 1 && options->at(Option::SINGLE_THREAD_DDL)->getBool() &&
+      ddl_query == true)
+    return true;
+
+  return false;
 }
 
 /* return true if successful or error out in case of fail */
@@ -4835,73 +5000,73 @@ bool Thd1::run_some_query() {
 
   int pick_table_id = 0;
   while (std::chrono::system_clock::now() < end) {
-      auto option = pick_some_option();
-      ddl_query = options->at(option)->ddl == true ? true : false;
+    auto option = pick_some_option();
 
-      if (thread_id != 1 && options->at(Option::SINGLE_THREAD_DDL)->getBool() &&
-          ddl_query == true)
-        continue;
+    if (is_query_blocked(this, option)) {
+      continue;
+    }
 
-      /* check if we need to make sql as part of existing or new trx */
-      if (trx_left > 0) {
+    /* check if we need to make sql as part of existing or new trx */
+    if (trx_left > 0) {
 
-        trx_left--;
+      trx_left--;
 
-        if (trx_left == 0 || ddl_query == true) {
-          if (trx == NON_XA) {
-            if (rand_int(100, 1) >
-                options->at(Option::COMMMIT_PROB)->getInt()) {
-              execute_sql("ROLLBACK", this);
-            } else {
-              execute_sql("COMMIT", this);
-            }
-            current_save_point = 0;
+      if (trx_left == 0 || ddl_query == true) {
+        if (trx == NON_XA) {
+          if (rand_int(100, 1) > options->at(Option::COMMIT_PROB)->getInt()) {
+            execute_sql("ROLLBACK", this);
           } else {
-            execute_sql("XA END " + get_xid(), this);
-            execute_sql("XA PREPARE " + get_xid(), this);
-            if (rand_int(100, 1) >
-                options->at(Option::COMMMIT_PROB)->getInt()) {
-              execute_sql("XA ROLLBACK " + get_xid(), this);
-            } else {
-              execute_sql("XA COMMIT " + get_xid(), this);
-            }
+            execute_sql("COMMIT", this);
           }
-        } else if (trx == NON_XA) {
-          if (rand_int(1000) < savepoint_prob) {
-            current_save_point++;
-            execute_sql("SAVEPOINT SAVE" + std::to_string(current_save_point),
-                        this);
-          }
-
-          /* 10% chances of rollbacking to savepoint */
-          if (current_save_point > 0 && rand_int(10) == 1) {
-            auto sv = rand_int(current_save_point, 1);
-            execute_sql("ROLLBACK TO SAVEPOINT SAVE" + std::to_string(sv),
-                        this);
-            current_save_point = sv - 1;
+          current_save_point = 0;
+        } else {
+          execute_sql("XA END " + get_xid(), this);
+          execute_sql("XA PREPARE " + get_xid(), this);
+          if (rand_int(100, 1) > options->at(Option::COMMIT_PROB)->getInt()) {
+            execute_sql("XA ROLLBACK " + get_xid(), this);
+          } else {
+            execute_sql("XA COMMIT " + get_xid(), this);
           }
         }
-      }
+      } else if (trx == NON_XA) {
+        if (rand_int(1000) < savepoint_prob &&
+            options->at(Option::COMMIT_PROB)->getInt() < 100) {
+          current_save_point++;
+          execute_sql("SAVEPOINT SAVE" + std::to_string(current_save_point),
+                      this);
+        }
 
-      if (trx_left == 0) {
-        if (rand_int(1000) < options->at(Option::TRANSATION_PRB_K)->getInt()) {
-          execute_sql("START TRANSACTION", this);
-          trx_left =
-              rand_int(options->at(Option::TRANSACTIONS_SIZE)->getInt(), 1);
-          trx = NON_XA;
-        } else if (rand_int(1000) <
-                   options->at(Option::XA_TRANSACTION)->getInt()) {
-          execute_sql("XA START " + get_xid(), this);
-          trx_left =
-              rand_int(options->at(Option::TRANSACTIONS_SIZE)->getInt(), 1);
-          trx = XA;
+        /* 10% chances of rollbacking to savepoint */
+        if (current_save_point > 0 && rand_int(10) == 1 &&
+            options->at(Option::COMMIT_PROB)->getInt() < 100) {
+          auto sv = rand_int(current_save_point, 1);
+          execute_sql("ROLLBACK TO SAVEPOINT SAVE" + std::to_string(sv), this);
+          current_save_point = sv - 1;
         }
       }
+    }
+
+    if (trx_left == 0) {
+      if (rand_int(1000) < options->at(Option::TRANSATION_PRB_K)->getInt()) {
+        execute_sql("START TRANSACTION", this);
+        trx_left =
+            rand_int(options->at(Option::TRANSACTIONS_SIZE)->getInt(), 1);
+        trx = NON_XA;
+      } else if (rand_int(1000) <
+                 options->at(Option::XA_TRANSACTION)->getInt()) {
+        execute_sql("XA START " + get_xid(), this);
+        trx_left =
+            rand_int(options->at(Option::TRANSACTIONS_SIZE)->getInt(), 1);
+        trx = XA;
+      }
+    }
 
     std::unique_lock<std::mutex> lock(all_table_mutex);
     if (options->at(Option::THREAD_PER_TABLE)->getBool()) {
-      /*todo ensure that all tables are used */
       pick_table_id = thread_id;
+      if (pick_table_id >= (int)all_tables->size()) {
+        pick_table_id = rand_int(all_tables->size() - 1);
+      }
     } else {
       pick_table_id = rand_int(all_tables->size() - 1);
     }
@@ -5055,6 +5220,9 @@ bool Thd1::run_some_query() {
       break;
     case Option::KILL_TRANSACTION:
       kill_query(this);
+      break;
+    case Option::RANDOM_TIMEZONE:
+      random_timezone(this);
       break;
     default:
       print_and_log("Unhandled option " + options->at(option)->help, this);

@@ -54,6 +54,7 @@ void create_worker(struct workerParams *Params) {
   newNode.end_node();
 }
 
+
 int main(int argc, char *argv[]) {
 
   std::vector<std::thread> nodes;

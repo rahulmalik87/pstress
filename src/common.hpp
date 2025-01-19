@@ -124,7 +124,7 @@ struct Option {
     MYSQLD_SERVER_OPTION = 'z',
     TRANSATION_PRB_K,
     TRANSACTIONS_SIZE,
-    COMMMIT_PROB,
+    COMMIT_PROB,
     SAVEPOINT_PRB_K,
     CHECK_TABLE,
     CHECK_TABLE_PRELOAD,
@@ -213,6 +213,10 @@ struct Option {
     ALTER_DATABASE_COLLATION,
     XA_TRANSACTION,
     KILL_TRANSACTION,
+    THREAD_DOING_ONLY_SELECT,
+    NO_JSON,
+    RANDOM_TIMEZONE,
+    NO_PKEY_IN_SET,
     MAX
   } option;
   Option(Type t, Opt o, std::string n)

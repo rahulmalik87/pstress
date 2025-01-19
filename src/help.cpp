@@ -223,6 +223,11 @@ void add_options() {
   opt->setBool(false);
   opt->setArgs(no_argument);
 
+  opt = newOption(Option::INT, Option::THREAD_DOING_ONLY_SELECT,
+                  "select-threads");
+  opt->help = "Number of threads doing only select. ";
+  opt->setInt(0);
+
   /* disable virtual columns*/
   opt = newOption(Option::BOOL, Option::NO_VIRTUAL_COLUMNS, "no-virtual");
   opt->help = "Disable virtual columns";
@@ -237,11 +242,23 @@ void add_options() {
   opt->setBool(false);
   opt->setArgs(no_argument);
 
-  /* disable blob,text columns*/
+  /* disable blob columns*/
   opt = newOption(Option::BOOL, Option::NO_BLOB, "no-blob");
   opt->help = "Disable blob columns";
   opt->setBool(false);
   opt->setArgs(no_argument);
+
+  /* disable json columns */
+  opt = newOption(Option::BOOL, Option::NO_JSON, "no-json");
+  opt->help = "Disable json columns";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  /* use session random timezone */
+  opt = newOption(Option::INT, Option::RANDOM_TIMEZONE, "timezone-session");
+  opt->help = "Use random timezone for each session";
+  opt->setInt(1);
+  opt->setSQL();
 
   /* disable all type of encrytion */
   opt = newOption(Option::BOOL, Option::NO_TABLESPACE, "no-tbs");
@@ -550,11 +567,16 @@ void add_options() {
   opt->setDDL();
 
   /* probability of modifying columns with/without NOT SECONDARY clause" */
-  opt = newOption(Option::INT, Option::USING_PK_PROB, "pk-col-in-where");
+  opt = newOption(Option::INT, Option::USING_PK_PROB, "using-pkey");
   opt->help = "Probability of using pk column in where clause. if table does "
               "not pk column then first column of index. and if it does not "
               "have index then any random column";
   opt->setInt(50);
+
+  opt = newOption(Option::BOOL, Option::NO_PKEY_IN_SET, "no-pk-in-set");
+  opt->help = "Do not use ipkey column in update tt_N set col=";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
 
   /* disable char columns*/
   opt = newOption(Option::BOOL, Option::NO_CHAR, "no-char");
@@ -1106,7 +1128,7 @@ void add_options() {
   opt->setInt(10);
 
   /* probability of executing commit */
-  opt = newOption(Option::INT, Option::COMMMIT_PROB, "commit-prob");
+  opt = newOption(Option::INT, Option::COMMIT_PROB, "commit-prob");
   opt->help = "probability of executing commit after a transaction. Else it "
               "would be rollback ";
   opt->setInt(95);
