@@ -148,8 +148,8 @@ void add_options() {
   opt->setArgs(no_argument);
 
   /* disable all type of encrytion */
-  opt = newOption(Option::BOOL, Option::NO_ENCRYPTION, "no-encryption");
-  opt->help = "Disable All type of encrytion";
+  opt = newOption(Option::BOOL, Option::USE_ENCRYPTION, "use-encryption");
+  opt->help = "Enable encryption of table, tablespace";
   opt->setBool(false);
   opt->setArgs(no_argument);
 
@@ -164,6 +164,7 @@ void add_options() {
       "--function-contains-dml=update,delete,insert. Even order matters. for "
       "example if it insert,update then it would first insert and then update "
       "or";
+  opt->short_help = "functions";
   opt->setString("insert,update");
 
   opt = newOption(Option::INT, Option::IGNORE_DML_CLAUSE,
@@ -176,13 +177,13 @@ void add_options() {
   opt->setBool(0);
   opt->setArgs(no_argument);
 
-  opt = newOption(Option::BOOL, Option::EXACT_COLUMNS, "exact-columns");
-  opt->help = "Exact number of columns in a table";
+  opt = newOption(Option::BOOL, Option::RANDOM_COLUMNS, "random-columns");
+  opt->help = "use random number of column for table";
   opt->setBool(false);
   opt->setArgs(no_argument);
 
-  opt = newOption(Option::BOOL, Option::EXACT_INDEXES, "exact-indexes");
-  opt->help = "Exact number of indexes in a table";
+  opt = newOption(Option::BOOL, Option::RANDOM_INDEXES, "random-indexes");
+  opt->help = "Use random number of indexes for each table ";
   opt->setBool(false);
   opt->setArgs(no_argument);
 
@@ -195,6 +196,7 @@ void add_options() {
   opt->help = "Probability of calling function ";
   opt->setInt(10);
   opt->setSQL();
+  opt->short_help = "Function";
   opt->setDDL();
 
   /* todo set default to all */
@@ -209,6 +211,7 @@ void add_options() {
   opt->help = "Assign probability of running create/alter/drop undo tablespace";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "UndoTablespace";
   opt->setDDL();
 
   /* Add new table */
@@ -216,6 +219,7 @@ void add_options() {
   opt->help = "Add new table";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AddTable";
   opt->setDDL();
 
   opt = newOption(Option::BOOL, Option::SINGLE_THREAD_DDL, "single-thread-ddl");
@@ -258,6 +262,7 @@ void add_options() {
   opt = newOption(Option::INT, Option::RANDOM_TIMEZONE, "timezone-session");
   opt->help = "Use random timezone for each session";
   opt->setInt(1);
+  opt->short_help = "Timezone";
   opt->setSQL();
 
   /* disable all type of encrytion */
@@ -420,11 +425,13 @@ void add_options() {
   opt->setInt(10);
 
   /* Initial Records in table */
-  opt = newOption(Option::INT, Option::INITIAL_RECORDS_IN_TABLE, "records");
+  opt = newOption(Option::STRING, Option::INITIAL_RECORDS_IN_TABLE, "records");
   opt->help =
       "Number of initial records (N) in each table. The table will have random "
-      "records in range of 0 to N. Also check --exact-initial-records ";
-  opt->setInt(1000);
+      "records in range of 0 to N. Also check --random-initial-records. You "
+      "can "
+      "also pass 10K, 1M  ";
+  opt->setString("1K");
 
   /* plain rewrite */
   opt = newOption(Option::BOOL, Option::PLAIN_REWRITE, "plain-rewrite");
@@ -432,11 +439,17 @@ void add_options() {
   opt->setBool(false);
   opt->setArgs(no_argument);
 
+  opt =
+      newOption(Option::BOOL, Option::LOG_PK_BULK_INSERT, "log-bulk-insert-pk");
+  opt->help = "Log primary key of table used during bulk insert";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
   /* Initial Records in table */
-  opt = newOption(Option::BOOL, Option::EXACT_INITIAL_RECORDS,
-                  "exact-initial-records");
+  opt = newOption(Option::BOOL, Option::RANDOM_INITIAL_RECORDS,
+                  "random-initial-records");
   opt->help = " When passed with --records (N) option "
-              "inserts exact number of  N records in tables.";
+              " rand(N) records are inserted";
   opt->setBool(false);
   opt->setArgs(no_argument);
 
@@ -444,6 +457,12 @@ void add_options() {
   opt = newOption(Option::INT, Option::NUMBER_OF_SECONDS_WORKLOAD, "seconds");
   opt->help = "Number of seconds to execute workload";
   opt->setInt(1000);
+
+  /* number of queries N last queries */
+  opt = newOption(Option::INT, Option::N_LAST_QUERIES, "log-last-queries");
+  opt->help = "Number of N queries logged in logdir /*sql last queries. F "
+              "means query was FAIL and S mean it was success";
+  opt->setInt(10);
 
   /* primary key probability */
   opt = newOption(Option::INT, Option::PRIMARY_KEY, "pk-prob");
@@ -456,7 +475,13 @@ void add_options() {
   opt->help = "Alter table set Encryption";
   opt->setInt(10);
   opt->setSQL();
+  opt->short_help = "AlterEncrypt";
   opt->setDDL();
+
+  opt = newOption(Option::INT, Option::BULK_INSERT_WIDTH, "bulk-insert-width");
+  opt->help = "The maximum width of each insert in bulk insert default is " +
+              std::to_string(1024 * 1024);
+  opt->setInt(1024 * 1024);
 
   /* ENFORCE REWRITE  */
   opt = newOption(Option::INT, Option::ENFORCE_MERGE, "enforce-merge-prob");
@@ -464,6 +489,7 @@ void add_options() {
               "rewrite with partial merge";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "Rewrite";
   opt->setDDL();
 
   opt = newOption(Option::INT, Option::REWRITE_ROW_GROUP_MIN_ROWS,
@@ -533,6 +559,7 @@ void add_options() {
   opt->help = "Execute garbage collect in secondary";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "GC";
   opt->setDDL();
 
   /* probability of null value in a column */
@@ -557,13 +584,14 @@ void add_options() {
   /* probability of creating not-secondary columns out of hundred */
   opt = newOption(Option::INT, Option::NOT_SECONDARY, "column-skip-to-secondary");
   opt->help = "Probability of creating not secondary columns";
-  opt->setInt(20);
+  opt->setInt(0);
 
   /* probability of modifying columns with/without NOT SECONDARY clause" */
   opt = newOption(Option::INT, Option::MODIFY_COLUMN_SECONDARY_ENGINE, "alter-column-secondary-engine");
   opt->help = "Probability of modifying existing column with NOT SECONDARY clause";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AlterColumnSecondary";
   opt->setDDL();
 
   /* probability of modifying columns with/without NOT SECONDARY clause" */
@@ -625,6 +653,7 @@ void add_options() {
   opt->help = "Alter table column modify";
   opt->setInt(10);
   opt->setSQL();
+  opt->short_help = "ModifyColumn";
   opt->setDDL();
 
   /*compress table */
@@ -633,6 +662,7 @@ void add_options() {
   opt->help = "Alter table compression";
   opt->setInt(10);
   opt->setSQL();
+  opt->short_help = "AlterCompress";
   opt->setDDL();
 
   /* Row Format */
@@ -668,6 +698,7 @@ void add_options() {
   opt->help = "set mysqld variable during the load.(session|global)";
   opt->setInt(3);
   opt->setSQL();
+  opt->short_help = "SetVariable";
   opt->setDDL();
 
   /* alter instance disable/enable redo logging */
@@ -675,6 +706,7 @@ void add_options() {
   opt->help = "Alter instance enable/disable redo log";
   opt->setInt(0);
   opt->setSQL();
+  opt->short_help = "AlterRedo";
   opt->setDDL();
 
   /* alter instance rotate innodb master key */
@@ -682,6 +714,7 @@ void add_options() {
   opt->help = "Alter instance rotate innodb master key";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "RotateMaster";
   opt->setDDL();
 
   opt = newOption(Option::INT, Option::ALTER_SECONDARY_ENGINE,
@@ -689,6 +722,7 @@ void add_options() {
   opt->help = "run secondary-engine sql";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AlterSecondary";
   opt->setDDL();
 
   /* alter instance rotate innodb system key */
@@ -697,6 +731,7 @@ void add_options() {
   opt->help = "Alter instance rotate innodb system key X";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AlterInstanceSystemKey";
   opt->setDDL();
 
   /* alter instance rotate gcache master key */
@@ -705,6 +740,7 @@ void add_options() {
   opt->help = "Alter instance rotate gcache master key";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AlterInstanceGcache";
   opt->setDDL();
 
   /* Reload keyring component configuration */
@@ -713,6 +749,7 @@ void add_options() {
   opt->help = "Alter instance reload keyring";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AlterInstanceReloadKey";
   opt->setDDL();
 
   /* rotate redo log key */
@@ -720,6 +757,7 @@ void add_options() {
                   "rotate-redo-log-key");
   opt->help = "Rotate redo log key";
   opt->setInt(1);
+  opt->short_help = "RotateRedoLog";
   opt->setSQL();
   opt->setDDL();
 
@@ -729,6 +767,7 @@ void add_options() {
   opt->help = "Alter tablespace set Encryption including the mysql tablespace";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AlterTablespaceEncrypt";
   opt->setDDL();
 
   /*Discard tablespace */
@@ -737,6 +776,7 @@ void add_options() {
   opt->help = "Alter table to discard file-per-tablespace";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AlterDiscardTablespace";
   opt->setDDL();
 
   /*Database Encryption */
@@ -744,6 +784,7 @@ void add_options() {
   opt->help = "Alter Database Encryption mode to Y/N";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AlterDatabaseEncrypt";
   opt->setDDL();
 
   /*Database collation */
@@ -751,6 +792,7 @@ void add_options() {
   opt->help = "Alter Database collation probability";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AlterDatabaseCollation";
   opt->setDDL();
 
   /* Tablespace Rename */
@@ -759,6 +801,7 @@ void add_options() {
   opt->help = "Alter tablespace rename";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AlterTablespaceRename";
   opt->setDDL();
 
   /* SELECT */
@@ -799,6 +842,7 @@ void add_options() {
 
   opt = newOption(Option::INT, Option::SELECT_ROW_USING_PKEY, "select-precise");
   opt->help = "Select table using single row";
+  opt->short_help = "SP";
   opt->setInt(800);
   opt->setSQL();
 
@@ -806,10 +850,10 @@ void add_options() {
   opt->help = "slowing the thread";
   opt->setInt(0);
   opt->setSQL();
-
   opt = newOption(Option::INT, Option::SELECT_FOR_UPDATE,
                   "select-precise-update");
   opt->help = "Select table using single for update";
+  opt->short_help = "SPU";
   opt->setInt(8);
   opt->setSQL();
 
@@ -817,6 +861,7 @@ void add_options() {
   opt->help = "select all table data and in case of partition randomly pick "
               "some partition";
   opt->setInt(8);
+  opt->short_help = "SB";
   opt->setSQL();
 
   opt = newOption(Option::BOOL, Option::ONLY_SELECT, "only-select");
@@ -828,38 +873,58 @@ void add_options() {
                   "select-bulk-update");
   opt->help = "SELECT bulk for update ";
   opt->setInt(20);
+  opt->short_help = "SBU";
   opt->setSQL();
+
+  opt = newOption(Option::INT, Option::NON_INT_PK, "non-int-pk-prob");
+  opt->help = "Probability of primary key column being non integer";
+  opt->setInt(25);
 
   opt = newOption(Option::INT, Option::PK_COLUMN_AUTOINC, "pk-auto-inc-prob");
   opt->help = "Probability of primary key column being auto increment";
   opt->setInt(75);
 
+  opt = newOption(Option::INT, Option::INSERT_BULK_COUNT, "insert-bulk-count");
+  opt->help = "Number of rows to insert in a single insert statement";
+  opt->setInt(10);
+
+  opt = newOption(Option::INT, Option::INSERT_BULK, "insert-bulk");
+  opt->help = "insert random row";
+  opt->setInt(1);
+  opt->short_help = "IB";
+  opt->setSQL();
+
   opt = newOption(Option::INT, Option::INSERT_RANDOM_ROW, "insert");
   opt->help = "insert random row";
   opt->setInt(600);
+  opt->short_help = "I";
   opt->setSQL();
 
   /* Update row using pkey */
   opt = newOption(Option::INT, Option::UPDATE_ROW_USING_PKEY, "update-precise");
   opt->help = "Update using where clause";
   opt->setInt(200);
+  opt->short_help = "UP";
   opt->setSQL();
 
   opt = newOption(Option::INT, Option::UPDATE_ALL_ROWS, "update-bulk");
   opt->help = "Update bulk of a table";
   opt->setInt(10);
+  opt->short_help = "UB";
   opt->setSQL();
 
   /* Delete row using pkey */
   opt = newOption(Option::INT, Option::DELETE_ROW_USING_PKEY, "delete-precise");
   opt->help = "delete where condition";
   opt->setInt(100);
+  opt->short_help = "DP";
   opt->setSQL();
 
   /* Delete all rows */
   opt = newOption(Option::INT, Option::DELETE_ALL_ROW, "delete-bulk");
   opt->help = "delete bulk rows of table";
   opt->setInt(8);
+  opt->short_help = "DB";
   opt->setSQL();
 
   /* Drop column */
@@ -867,6 +932,7 @@ void add_options() {
   opt->help = "alter table drop some random column";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "DropColumn";
   opt->setDDL();
 
   /* Add column */
@@ -874,6 +940,7 @@ void add_options() {
   opt->help = "alter table add some random column";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "AddColumn";
   opt->setDDL();
 
   /* Drop index */
@@ -881,12 +948,14 @@ void add_options() {
   opt->help = "alter table drop random index";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "DropIndex";
   opt->setDDL();
 
   /* Add column */
   opt = newOption(Option::INT, Option::ADD_INDEX, "add-index");
   opt->help = "alter table add random index";
   opt->setInt(1);
+  opt->short_help = "AddIndex";
   opt->setSQL();
   opt->setDDL();
 
@@ -895,6 +964,7 @@ void add_options() {
   opt->help = "alter table rename index";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "RenameIndex";
   opt->setDDL();
 
   /* Rename Column */
@@ -902,6 +972,7 @@ void add_options() {
   opt->help = "alter table rename column";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "RenameColumn";
   opt->setDDL();
 
   /* Analyze Table */
@@ -910,6 +981,7 @@ void add_options() {
               "partition or full table";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "Analyze";
   opt->setDDL();
 
   /* Check Table */
@@ -918,6 +990,7 @@ void add_options() {
               "partition or full table";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "Check";
   opt->setDDL();
 
   /* Check Table Pre-load */
@@ -933,6 +1006,7 @@ void add_options() {
   opt->help = "randomly add drop new partitions";
   opt->setInt(3);
   opt->setSQL();
+  opt->short_help = "AddDropPartition";
   opt->setDDL();
 
   /* maximum number Partition */
@@ -955,6 +1029,7 @@ void add_options() {
               "partition or full table ";
   opt->setInt(3);
   opt->setSQL();
+  opt->short_help = "Optimize";
   opt->setDDL();
 
   /* Truncate table */
@@ -962,6 +1037,7 @@ void add_options() {
   opt->help = "truncate table or in case of partition truncate partition";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "Truncate";
   opt->setDDL();
 
   /* Drop and recreate table */
@@ -969,6 +1045,7 @@ void add_options() {
   opt->help = "drop and recreate table";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "RecreateTable";
   opt->setDDL();
 
   /* DATABASE */
@@ -1104,6 +1181,10 @@ void add_options() {
   opt->setBool(false);
   opt->setArgs(no_argument);
 
+  opt = newOption(Option::INT, Option::PRINT_TRANSACTION_RATE, "print-rate");
+  opt->help = "Print transaction rate per N second";
+  opt->setInt(0);
+
   /* transaction probability */
   opt = newOption(Option::INT, Option::TRANSATION_PRB_K, "trx-prob-k");
   opt->help = "probability(out of 1000) of combining sql as single trx";
@@ -1113,13 +1194,14 @@ void add_options() {
   opt = newOption(Option::INT, Option::XA_TRANSACTION, "xa-trx-prob-k");
   opt->help = "Probablity of running XA transaction. Trx size option control "
               "the size of XA transaction";
-  opt->setInt(1);
+  opt->setInt(0);
 
   /* Probablity of killing running transaction */
   opt = newOption(Option::INT, Option::KILL_TRANSACTION, "kill-trx-prob-k");
   opt->help = "Probablity of killing running transaction";
   opt->setInt(1);
   opt->setSQL();
+  opt->short_help = "KillQuery";
   opt->setDDL();
 
   /* tranasaction size */
@@ -1152,6 +1234,7 @@ void add_options() {
   opt = newOption(Option::INT, Option::GRAMMAR_SQL, "grammar-sql");
   opt->help = "grammar sql";
   opt->setInt(10);
+  opt->short_help = "Grammar";
   opt->setSQL();
 
   /* file name of special sql */

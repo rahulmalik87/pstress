@@ -23,7 +23,7 @@
 #include <thread>
 
 extern std::atomic<bool> run_query_failed;
-std::mt19937 rng;
+thread_local std::mt19937 rng;
 
 void read_section_settings(struct workerParams *wParams, std::string secName,
                            std::string confFile) {
@@ -161,7 +161,7 @@ int main(int argc, char *argv[]) {
   if (confFile.empty() && ports.size() == 1) {
     /*single node and command line */
     workerParams *wParams = new workerParams(ports[0]);
-    wParams->myName = "node." + std::to_string(ports[0]);
+    wParams->myName = "node";
     create_worker(wParams);
     delete wParams;
   } else if (confFile.empty() && ports.size() > 1) {
@@ -198,7 +198,15 @@ int main(int argc, char *argv[]) {
 
   save_metadata_to_file();
   clean_up_at_end();
+
   mysql_library_end();
+  /* print option with total_queries */
+  for (auto op : *options) {
+    if (op != nullptr && op->sql && op->total_queries > 0) {
+      std::cout << op->short_help << ", total=>" << op->total_queries
+                << ", success=>" << op->success_queries << std::endl;
+    }
+  }
   delete_options();
   std::cout << "COMPLETED" << std::endl;
   if (run_query_failed)

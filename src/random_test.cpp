@@ -24,19 +24,19 @@
 #define CR_WSREP_NOT_PREPARED 1047
 #define CR_SECONDARY_NOT_READY 6000
 using namespace rapidjson;
-extern std::mt19937 rng;
+extern thread_local std::mt19937 rng;
 
 const std::string TABLE_PREFIX = "tt_";
 const std::string PARTITION_SUFFIX = "_p";
 const std::string FK_SUFFIX = "_fk";
 const std::string TEMP_SUFFIX = "_t";
 const int version = 2;
+static size_t number_of_records;
 
 bool encrypted_temp_tables = false;
 bool encrypted_sys_tablelspaces = false;
 bool keyring_comp_status = false;
 std::vector<Table *> *all_tables = new std::vector<Table *>;
-size_t initial_tables = 0;
 std::vector<std::string> g_undo_tablespace;
 std::vector<std::string> g_encryption;
 std::vector<std::string> g_compression = {"none", "zlib", "lz4"};
@@ -54,11 +54,7 @@ std::mutex all_table_mutex;
 std::chrono::system_clock::time_point start_time =
     std::chrono::system_clock::now();
 
-std::atomic<size_t> table_started(0);
-
 std::map<int, Option *> opt_range_map;
-std::atomic<size_t> table_completed(0);
-std::atomic<size_t> check_failures(0);
 std::atomic_flag lock_stream = ATOMIC_FLAG_INIT;
 std::atomic<bool> run_query_failed(false);
 typedef std::vector<std::vector<std::string>> query_result;
@@ -108,8 +104,7 @@ void print_and_log(std::string &&str, Thd1 *thd, bool print_error) {
   }
   std::lock_guard<std::mutex> lock(ddl_logs_write);
   std::cout << ss.str() << std::endl;
-  if (print_so_far > max_print &&
-      options->at(Option::KILL_TRANSACTION)->getInt() == 0) {
+  if (print_so_far > max_print) {
     std::cout << "more than " << max_print << " error on console Exiting"
               << std::endl;
     exit(EXIT_FAILURE);
@@ -258,6 +253,26 @@ static Table *pick_table(Table::TABLE_TYPES type, int id) {
   return nullptr;
 }
 
+static size_t convert_to_number(const std::string &str) {
+  size_t number = std::stoi(str);
+  char unit = '\0';
+
+  // Find the first non-digit character for the unit
+  for (char c : str) {
+    if (!std::isdigit(c)) {
+      unit = c;
+      break;
+    }
+  }
+
+  // Adjust number based on unit
+  if (unit == 'k' || unit == 'K')
+    number *= 1000;
+  else if (unit == 'm' || unit == 'M')
+    number *= 1000000;
+
+  return number;
+}
 /* generate random numbers to populate in primary and fk
 @param[in] number_of_records
 @param[out] vector containing unique elements */
@@ -265,8 +280,8 @@ static std::vector<int> generateUniqueRandomNumbers(int number_of_records) {
 
   std::unordered_set<int> unique_keys_set(number_of_records);
 
-  int max_size = options->at(Option::UNIQUE_RANGE)->getInt() *
-                 options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt();
+  int max_size =
+      options->at(Option::UNIQUE_RANGE)->getInt() * number_of_records;
 
   /* return a range */
   if (rand_int(100) < 10 ||
@@ -297,6 +312,14 @@ static bool get_check_result(const std::string &sql, Thd1 *thd) {
   }
 
   return true;
+}
+static std::string checksum(const std::string &table, Thd1 *thd) {
+  std::string sql = "CHECKSUM TABLE " + table;
+  execute_sql(sql, thd);
+  auto row = mysql_fetch_row_safe(thd);
+  if (row && mysql_num_fields_safe(thd, 2))
+    return row[1];
+  return "";
 }
 
 static std::string mysql_read_single_value(const std::string &sql, Thd1 *thd) {
@@ -354,6 +377,8 @@ static std::string add_ignore_clause() {
 /* return probabality of all options and disable some feature based on user
  * request/ branch/ fork */
 int sum_of_all_options(Thd1 *thd) {
+  number_of_records = convert_to_number(
+      options->at(Option::INITIAL_RECORDS_IN_TABLE)->getString());
 
   /* find out innodb page_size */
   if (options->at(Option::ENGINE)->getString().compare("INNODB") == 0) {
@@ -431,7 +456,6 @@ int sum_of_all_options(Thd1 *thd) {
     if (std::find(column_types.begin(), column_types.end(), "GENERATED") ==
         column_types.end())
       options->at(Option::NO_VIRTUAL_COLUMNS)->setBool(true);
-
   }
   /* abort if all the column are set to false */
   if (options->at(Option::NO_INTEGER)->getBool() &&
@@ -583,12 +607,16 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::NOT_SECONDARY)->setInt(0);
   } else {
     /* disable some of options for secondary engine */
-    options->at(Option::NO_ENCRYPTION)->setBool(true);
     options->at(Option::NO_PARTITION)->setBool(true);
     options->at(Option::NO_TEMPORARY)->setBool(true);
     options->at(Option::NO_TABLESPACE)->setBool(true);
     options->at(Option::XA_TRANSACTION)->setInt(0);
     options->at(Option::COMMIT_PROB)->setInt(100);
+    options->at(Option::SELECT_FOR_UPDATE)->setInt(0);
+    options->at(Option::SELECT_FOR_UPDATE_BULK)->setInt(0);
+    /* if default disable index */
+    if (options->at(Option::INDEXES)->getInt() == 7)
+      options->at(Option::INDEXES)->setInt(0);
     if (options->at(Option::PRIMARY_KEY)->getInt() < 100)
       options->at(Option::NO_AUTO_INC)->setBool(true);
     opt_int_set(UNDO_SQL, 0);
@@ -622,6 +650,7 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::NO_UPDATE)->setBool(true);
     options->at(Option::NO_DELETE)->setBool(true);
     options->at(Option::NO_INSERT)->setBool(true);
+    options->at(Option::NO_DDL)->setBool(true);
   } else if (options->at(Option::NO_SELECT)->getBool()) {
     /* if select is set as zero, disable all type of selects */
     options->at(Option::SELECT_ALL_ROW)->setInt(0);
@@ -644,6 +673,7 @@ int sum_of_all_options(Thd1 *thd) {
   /* if insert is disable, set all insert probability to zero */
   if (options->at(Option::NO_INSERT)->getBool()) {
     opt_int_set(INSERT_RANDOM_ROW, 0);
+    opt_int_set(INSERT_BULK, 0);
   }
 
   /* disable call  function if no insert update and delete */
@@ -665,13 +695,12 @@ int sum_of_all_options(Thd1 *thd) {
   if (engine.compare("ROCKSDB") == 0) {
     options->at(Option::NO_TEMPORARY)->setBool("true");
     options->at(Option::NO_COLUMN_COMPRESSION)->setBool("true");
-    options->at(Option::NO_ENCRYPTION)->setBool(true);
     options->at(Option::NO_DESC_INDEX)->setBool(true);
     options->at(Option::NO_TABLE_COMPRESSION)->setBool(true);
   }
 
   /* If no-encryption is set, disable all encryption options */
-  if (options->at(Option::NO_ENCRYPTION)->getBool()) {
+  if (!options->at(Option::USE_ENCRYPTION)->getBool()) {
     opt_int_set(ALTER_TABLE_ENCRYPTION, 0);
     opt_int_set(ALTER_TABLESPACE_ENCRYPTION, 0);
     opt_int_set(ALTER_MASTER_KEY, 0);
@@ -732,8 +761,7 @@ int sum_of_all_options(Thd1 *thd) {
   }
 
   if (only_cl_ddl && no_ddl) {
-    print_and_log("noddl && only-cl-ddl can't be passed together", thd);
-    exit(EXIT_FAILURE);
+    print_and_log("noddl && only-cl-ddl are passed together", thd);
   }
 
   /* if no ddl is set disable all ddl */
@@ -750,6 +778,7 @@ int sum_of_all_options(Thd1 *thd) {
   }
 
   int total = 0;
+  bool is_ddl = false;
   for (auto &opt : *options) {
     if (opt == nullptr)
       continue;
@@ -759,8 +788,14 @@ int sum_of_all_options(Thd1 *thd) {
       thd->thread_log << opt->getName() << "=>" << opt->getBool() << std::endl;
     if (!opt->sql || opt->getInt() == 0)
       continue;
+    if (opt->ddl) {
+      is_ddl = true;
+    }
     total += opt->getInt();
     opt_range_map[total] = opt;
+  }
+  if (!is_ddl) {
+    options->at(Option::NO_DDL)->setBool(true);
   }
 
   if (total == 0) {
@@ -833,17 +868,8 @@ pick_algorithm_lock(std::string *const algo = nullptr,
 
 /* set seed of current thread */
 int set_seed(Thd1 *thd) {
-
-  auto initial_seed = opt_int(INITIAL_SEED);
-  initial_seed += options->at(Option::STEP)->getInt();
-
-  rng = std::mt19937(initial_seed);
-  thd->thread_log << "Initial seed " << initial_seed << std::endl;
-  for (int i = 0; i < thd->thread_id; i++)
-    rand_int(MAX_SEED_SIZE, MIN_SEED_SIZE);
-  thd->seed = rand_int(MAX_SEED_SIZE, MIN_SEED_SIZE);
-  thd->thread_log << "CURRENT SEED IS " << thd->seed << std::endl;
-  return thd->seed;
+  return options->at(Option::INITIAL_SEED)->getInt() + thd->thread_id * 1000 +
+         options->at(Option::STEP)->getInt();
 }
 
 /* generate random strings of size N_STR */
@@ -1050,19 +1076,23 @@ std::string Column::rand_value_universal() {
   if (current_type == Column::COLUMN_TYPES::GENERATED) {
     current_type = static_cast<const Generated_Column *>(this)->generate_type();
   }
+  /* if primary key we varchar */
+  if (primary_key == true) {
+    return std::to_string(try_negative(rand_int(
+        options->at(Option::UNIQUE_RANGE)->getInt() * number_of_records)));
+  }
+
   switch (current_type) {
   case (Column::COLUMN_TYPES::INTEGER):
-    return std::to_string(try_negative(
-        rand_int(options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt())));
+    return std::to_string(try_negative(rand_int(number_of_records)));
   case (Column::COLUMN_TYPES::INT):
-    return std::to_string(try_negative(
-        rand_int(options->at(Option::UNIQUE_RANGE)->getInt() *
-                 options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt())));
+    return std::to_string(try_negative(rand_int(
+        options->at(Option::UNIQUE_RANGE)->getInt() * number_of_records)));
   case (Column::COLUMN_TYPES::FLOAT):
-    return rand_float(options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt());
+    return rand_float(number_of_records);
   case (Column::COLUMN_TYPES::DOUBLE):
     return rand_double(1.0 / options->at(Option::UNIQUE_RANGE)->getInt() *
-                       options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt());
+                       number_of_records);
   case Column::COLUMN_TYPES::CHAR:
   case Column::COLUMN_TYPES::VARCHAR:
   case Column::COLUMN_TYPES::TEXT:
@@ -1287,7 +1317,13 @@ Generated_Column::Generated_Column(std::string name, Table *table)
   }
 
   if (g_type == INT || g_type == INTEGER) {
-    str = " " + col_type_to_string(g_type) + " GENERATED ALWAYS AS (";
+    auto sql_g_type = col_type_to_string(g_type);
+    /* some expression fails */
+    if (sql_g_type == "INT") {
+      sql_g_type = "BIGINT";
+    }
+
+    str = " " + sql_g_type + " GENERATED ALWAYS AS (";
     for (auto pos : col_pos) {
       auto col = table->columns_->at(pos);
       if (col->type_ == VARCHAR || col->type_ == CHAR || col->type_ == BLOB ||
@@ -1382,8 +1418,8 @@ Generated_Column::Generated_Column(std::string name, Table *table)
                     std::to_string(current_size) + ",'0'),";
         } else if (col->type_ == JSON) {
           // todojson decide on table type document etc
-          gen_sql = "JSON_EXTRACT(" + col->name_ + ",'$." +
-                    std::to_string(current_size) + "'),";
+          gen_sql += "SUBSTRING(CAST(" + col->name_ + " AS CHAR),1," +
+                     std::to_string(current_size) + "),";
         } else {
           gen_sql += "SUBSTRING(" + col->name_ + ",1," +
                      std::to_string(current_size) + "),";
@@ -1396,8 +1432,8 @@ Generated_Column::Generated_Column(std::string name, Table *table)
                     std::to_string(column_size) + ",'0'),";
         } else if (col->type_ == JSON) {
           // todojson fix a better way
-          gen_sql = "JSON_EXTRACT(" + col->name_ + ",'$." +
-                    std::to_string(column_size) + "'),";
+          gen_sql += "SUBSTRING(CAST(" + col->name_ + " AS CHAR),1," +
+                     std::to_string(column_size) + "),";
 
         } else {
           gen_sql += col->name_ + ",";
@@ -1641,7 +1677,6 @@ std::string Index::definition() {
   return def;
 }
 
-
 static void wait_till_sync(const std::string &name, Thd1 *thd) {
 
   if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
@@ -1724,12 +1759,6 @@ bool Table::load(Thd1 *thd, bool bulk_insert,
     }
   }
 
-  if (run_query_failed) {
-    thd->thread_log << "some other thread failed, Exiting. Please check logs "
-                    << std::endl;
-    return false;
-  }
-
   return true;
 }
 
@@ -1763,23 +1792,19 @@ static void AddTable(Thd1 *thd) {
   Table *table = nullptr;
   std::unique_lock<std::mutex> lock(all_table_mutex);
   int table_id = rand_int(options->at(Option::TABLES)->getInt(), 1);
-  table = Table::table_id(Table::FK, table_id, true);
-
-  /*
   if (!options->at(Option::NO_FK)->getBool() &&
       options->at(Option::FK_PROB)->getInt() > rand_int(100)) {
     table = Table::table_id(Table::FK, table_id, true);
   } else {
     table = Table::table_id(Table::NORMAL, table_id, true);
   }
-  */
   lock.unlock();
   if (!execute_sql(table->definition(true, true), thd)) {
     return;
   }
-  // lock.lock();
-  // all_tables->push_back(table);
-  // lock.unlock();
+  lock.lock();
+  all_tables->push_back(table);
+  lock.unlock();
 }
 
 bool FK_table::load_fk_constrain(Thd1 *thd, bool set_run_query_failed) {
@@ -1811,8 +1836,6 @@ Partition::Partition(std::string n) : Table(n) {
 
   /* randomly pick ranges for partition */
   if (part_type == RANGE) {
-    auto number_of_records =
-        options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt();
     for (int i = 0; i < number_of_part; i++) {
       positions.emplace_back(
           "p", rand_int(options->at(Option::UNIQUE_RANGE)->getInt() *
@@ -1885,13 +1908,13 @@ void Table::DropCreate(Thd1 *thd) {
   if (!execute_sql(def, thd) && tablespace.size() > 0) {
     std::string tbs = " TABLESPACE=" + tablespace + "_rename";
 
-    auto no_encryption = opt_bool(NO_ENCRYPTION);
+    auto use_encryption = opt_bool(USE_ENCRYPTION);
 
     std::string encrypt_sql = " ENCRYPTION = " + encryption;
 
     /* If tablespace is rename or encrypted, or tablespace rename/encrypted */
     if (!execute_sql(def + tbs, thd))
-      if (!no_encryption && (execute_sql(def + encrypt_sql, thd) ||
+      if (use_encryption && (execute_sql(def + encrypt_sql, thd) ||
                              execute_sql(def + encrypt_sql + tbs, thd))) {
         lock_table_mutex(thd->ddl_query);
         if (encryption.compare("Y") == 0)
@@ -2097,7 +2120,7 @@ void Partition::AddDrop(Thd1 *thd) {
     } else {
       /* add partition */
       size_t number_of_records_in_partition =
-          rand_int(options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt()) /
+          rand_int(number_of_records) /
           rand_int(options->at(Option::MAX_PARTITIONS)->getInt(), 1);
 
       if (number_of_records_in_partition == 0)
@@ -2181,9 +2204,9 @@ void Table::CreateDefaultColumn() {
     AddInternalColumn(col);
   }
 
-  int max_columns = options->at(Option::EXACT_COLUMNS)->getBool()
-                        ? options->at(Option::COLUMNS)->getInt()
-                        : rand_int(options->at(Option::COLUMNS)->getInt(), 1);
+  int max_columns = options->at(Option::RANDOM_COLUMNS)->getBool()
+                        ? rand_int(options->at(Option::COLUMNS)->getInt(), 1)
+                        : options->at(Option::COLUMNS)->getInt();
 
   for (int i = 0; i < max_columns; i++) {
     std::string name;
@@ -2194,11 +2217,17 @@ void Table::CreateDefaultColumn() {
     /* First column can be primary */
     if (i == 0 &&
         rand_int(100, 1) <= options->at(Option::PRIMARY_KEY)->getInt()) {
-      type = Column::INT;
+      if (rand_int(100) < options->at(Option::NON_INT_PK)->getInt() &&
+          !options->at(Option::NO_VARCHAR)->getBool()) {
+        type = Column::VARCHAR;
+      } else {
+        type = Column::INT;
+      }
       name = "pkey";
       col = new Column{name, this, type};
       col->primary_key = true;
-      if (rand_int(100) < options->at(Option::PK_COLUMN_AUTOINC)->getInt()) {
+      if (type == Column::INT and
+          rand_int(100) < options->at(Option::PK_COLUMN_AUTOINC)->getInt()) {
         col->auto_increment = true;
         has_auto_increment = true;
       }
@@ -2277,110 +2306,106 @@ void Table::CreateDefaultColumn() {
 
 /* create default indexes */
 void Table::CreateDefaultIndex() {
-    int number_of_compressed = 0;
-    int number_of_json_columns = 0;
+  int number_of_compressed = 0;
+  int number_of_json_columns = 0;
 
-    for (auto column : *columns_) {
-      if (column->compressed)
-        number_of_compressed++;
-      if (column->type_ == Column::JSON)
-        number_of_json_columns++;
+  for (auto column : *columns_) {
+    if (column->compressed)
+      number_of_compressed++;
+    if (column->type_ == Column::JSON)
+      number_of_json_columns++;
+  }
+
+  /* create a todojson index */
+  size_t number_of_valid_columns =
+      columns_->size() - number_of_compressed - number_of_json_columns;
+
+  /* if no number of columns = 0 return */
+  if (number_of_valid_columns == 0)
+    return;
+
+  int auto_inc_pos = -1; // auto_inc_column_position
+
+  static size_t max_indexes = opt_int(INDEXES);
+
+  if (max_indexes == 0)
+    return;
+
+  /* if table have few column, decrease number of indexes */
+  size_t indexes =
+      rand_int(number_of_valid_columns < max_indexes ? number_of_valid_columns
+                                                     : max_indexes,
+               1);
+
+  /* for auto-inc columns handling, we need to add auto_inc as first column */
+  for (size_t i = 0; i < columns_->size(); i++) {
+    if (columns_->at(i)->auto_increment) {
+      auto_inc_pos = i;
     }
+  }
 
-    /* create a todojson index */
-    size_t number_of_valid_columns =
-        columns_->size() - number_of_compressed - number_of_json_columns;
+  /*which column will have auto_inc */
+  auto_inc_index = rand_int(indexes - 1, 0);
 
-    /* if no number of columns = 0 return */
-    if (number_of_valid_columns == 0)
-      return;
+  for (size_t i = 0; i < indexes; i++) {
+    Index *id = new Index(name_ + "i" + std::to_string(i));
 
-    int auto_inc_pos = -1; // auto_inc_column_position
+    static size_t max_columns = opt_int(INDEX_COLUMNS);
 
-    static size_t max_indexes = opt_int(INDEXES);
+    size_t number_of_columns = rand_int((max_columns < number_of_valid_columns
+                                             ? max_columns
+                                             : number_of_valid_columns),
+                                        1);
 
-    if (max_indexes == 0)
-      return;
+    std::vector<int> col_pos; // position of columns
 
-    /* if table have few column, decrease number of indexes */
-    size_t indexes =
-        rand_int(number_of_valid_columns < max_indexes ? number_of_valid_columns
-                                                       : max_indexes,
-                 1);
-
-    if (options->at(Option::EXACT_INDEXES)->getBool()) {
-      indexes = max_indexes;
-    }
-
-    /* for auto-inc columns handling, we need to add auto_inc as first column */
-    for (size_t i = 0; i < columns_->size(); i++) {
-      if (columns_->at(i)->auto_increment) {
-        auto_inc_pos = i;
-      }
-    }
-
-    /*which column will have auto_inc */
-    auto_inc_index = rand_int(indexes - 1, 0);
-
-    for (size_t i = 0; i < indexes; i++) {
-      Index *id = new Index(name_ + "i" + std::to_string(i));
-
-      static size_t max_columns = opt_int(INDEX_COLUMNS);
-
-      size_t number_of_columns = rand_int((max_columns < number_of_valid_columns
-                                               ? max_columns
-                                               : number_of_valid_columns),
-                                          1);
-
-      std::vector<int> col_pos; // position of columns
-
-      /* pick some columns */
-      while (col_pos.size() < number_of_columns) {
-        int current = rand_int(columns_->size() - 1);
-        if (columns_->at(current)->compressed ||
-            columns_->at(current)->type_ == Column::JSON)
-          continue;
-        /* auto-inc column should be first column in auto_inc_index */
-        if (auto_inc_pos != -1 && i == auto_inc_index && col_pos.size() == 0)
-          col_pos.push_back(auto_inc_pos);
-        else {
-          bool already_added = false;
-          for (auto id : col_pos) {
-            if (id == current)
-              already_added = true;
-          }
-          if (!already_added)
-            col_pos.push_back(current);
+    /* pick some columns */
+    while (col_pos.size() < number_of_columns) {
+      int current = rand_int(columns_->size() - 1);
+      if (columns_->at(current)->compressed ||
+          columns_->at(current)->type_ == Column::JSON)
+        continue;
+      /* auto-inc column should be first column in auto_inc_index */
+      if (auto_inc_pos != -1 && i == auto_inc_index && col_pos.size() == 0)
+        col_pos.push_back(auto_inc_pos);
+      else {
+        bool already_added = false;
+        for (auto id : col_pos) {
+          if (id == current)
+            already_added = true;
         }
-      } // while
-
-      auto index_has_int_col = [&col_pos, this]() {
-        for (auto pos : col_pos) {
-          if (columns_->at(pos)->type_ == Column::INT)
-            return true;
-        }
-        return false;
-      };
-
-      if (index_has_int_col() &&
-          rand_int(1000) < options->at(Option::UNIQUE_INDEX_PROB_K)->getInt()) {
-        id->unique = true;
+        if (!already_added)
+          col_pos.push_back(current);
       }
+    } // while
 
+    auto index_has_int_col = [&col_pos, this]() {
       for (auto pos : col_pos) {
-        auto col = columns_->at(pos);
-        static bool no_desc_support = opt_bool(NO_DESC_INDEX);
-        bool column_desc = false;
-        if (!no_desc_support) {
-          column_desc = rand_int(100) < DESC_INDEXES_IN_COLUMN
-                            ? true
-                            : false; // 33 % are desc //
-        }
-        id->AddInternalColumn(
-            new Ind_col(col, column_desc)); // desc is set as true
+        if (columns_->at(pos)->type_ == Column::INT)
+          return true;
       }
-      AddInternalIndex(id);
+      return false;
+    };
+
+    if (index_has_int_col() &&
+        rand_int(1000) < options->at(Option::UNIQUE_INDEX_PROB_K)->getInt()) {
+      id->unique = true;
     }
+
+    for (auto pos : col_pos) {
+      auto col = columns_->at(pos);
+      static bool no_desc_support = opt_bool(NO_DESC_INDEX);
+      bool column_desc = false;
+      if (!no_desc_support) {
+        column_desc = rand_int(100) < DESC_INDEXES_IN_COLUMN
+                          ? true
+                          : false; // 33 % are desc //
+      }
+      id->AddInternalColumn(
+          new Ind_col(col, column_desc)); // desc is set as true
+    }
+    AddInternalIndex(id);
+  }
 }
 
 /* Create new table and pick some attributes */
@@ -2412,10 +2437,10 @@ Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
   table->type = type;
 
   table->number_of_initial_records =
-      options->at(Option::EXACT_INITIAL_RECORDS)->getBool()
-          ? options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt()
-          : rand_int(options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt());
-  static auto no_encryption = opt_bool(NO_ENCRYPTION);
+      options->at(Option::RANDOM_INITIAL_RECORDS)->getBool()
+          ? rand_int(number_of_records)
+          : number_of_records;
+  static auto use_encryption = opt_bool(USE_ENCRYPTION);
 
   /* temporary table on 8.0 can't have key block size */
   if (!(server_version() >= 80000 && type == TEMPORARY)) {
@@ -2436,9 +2461,9 @@ Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
   static int tbs_count = opt_int(NUMBER_OF_GENERAL_TABLESPACE);
 
   /* partition and temporary tables don't have tablespaces */
-  if (table->type == PARTITION && !no_encryption) {
+  if (table->type == PARTITION && use_encryption) {
     table->encryption = g_encryption[rand_int(g_encryption.size() - 1)];
-  } else if (table->type != TEMPORARY && !no_encryption) {
+  } else if (table->type != TEMPORARY && use_encryption) {
     int rand_index = rand_int(g_encryption.size() - 1);
     if (g_encryption.at(rand_index) == "Y" ||
         g_encryption.at(rand_index) == "N") {
@@ -2492,9 +2517,9 @@ Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
 }
 
 /* check if table has a primary key */
-bool Table::has_pk() const {
+bool Table::has_int_pk() const {
   for (const auto &col : *columns_) {
-    if (col->primary_key)
+    if (col->primary_key && col->type_ == Column::INT)
       return true;
   }
   return false;
@@ -2552,10 +2577,10 @@ std::string Table::definition(bool with_index, bool with_fk) {
   def.erase(def.length() - 2);
 
   def += " )";
-  static auto no_encryption = opt_bool(NO_ENCRYPTION);
+  static auto use_encryption = opt_bool(USE_ENCRYPTION);
   bool keyring_key_encrypt_flag = 0;
 
-  if (!no_encryption && type != TEMPORARY) {
+  if (use_encryption && type != TEMPORARY) {
     if (encryption == "Y" || encryption == "N")
       def += " ENCRYPTION='" + encryption + "'";
     else if (encryption == "KEYRING") {
@@ -2659,7 +2684,7 @@ void generate_metadata_for_tables() {
         /* Create FK table */
         if (!options->at(Option::NO_FK)->getBool() &&
             options->at(Option::FK_PROB)->getInt() > rand_int(100) &&
-            parent_table->has_pk()) {
+            parent_table->has_int_pk()) {
           auto child_table = Table::table_id(Table::FK, i);
           all_tables->push_back(child_table);
         }
@@ -2758,7 +2783,7 @@ void Table::Compare_between_engine(const std::string &sql, Thd1 *thd) {
   set_default();
 }
 
-bool execute_sql(const std::string &sql, Thd1 *thd) {
+bool execute_sql(const std::string &sql, Thd1 *thd, bool log_result_client) {
   auto query = sql.c_str();
   static auto log_all = opt_bool(LOG_ALL_QUERIES);
   static auto log_failed = opt_bool(LOG_FAILED_QUERIES);
@@ -2767,7 +2792,6 @@ bool execute_sql(const std::string &sql, Thd1 *thd) {
   static auto log_client_output = opt_bool(LOG_CLIENT_OUTPUT);
   static auto log_query_numbers = opt_bool(LOG_QUERY_NUMBERS);
   std::chrono::system_clock::time_point begin, end;
-
   if (log_query_duration) {
     begin = std::chrono::system_clock::now();
   }
@@ -2793,12 +2817,16 @@ bool execute_sql(const std::string &sql, Thd1 *thd) {
   thd->performed_queries_total++;
 
   if (res != 0) { // query failed
+    thd->success = false;
     thd->failed_queries_total++;
     thd->max_con_fail_count++;
     if (log_all || log_failed) {
       thd->thread_log << " F " << sql << std::endl;
       thd->thread_log << "Error " << mysql_error(thd->conn) << std::endl;
+    } else {
+      thd->query_buffer.push("F " + sql);
     }
+
     static std::set<int> mysql_ignore_error =
         splitStringToIntSet(options->at(Option::IGNORE_ERRORS)->getString());
 
@@ -2817,7 +2845,7 @@ bool execute_sql(const std::string &sql, Thd1 *thd) {
                mysql_errno(thd->conn) == CR_WSREP_NOT_PREPARED ||
                mysql_errno(thd->conn) == CR_SERVER_GONE_ERROR ||
                mysql_errno(thd->conn) == CR_SECONDARY_NOT_READY) {
-      print_and_log("Fatal: " + sql, thd, true);
+      print_and_log("Fatal: " + sql.substr(0, 200), thd, true);
       run_query_failed = true;
     }
   } else {
@@ -2829,7 +2857,7 @@ bool execute_sql(const std::string &sql, Thd1 *thd) {
         mysql_free_result(r);
     });
 
-    if (log_client_output) {
+    if (log_client_output && log_result_client) {
       if (thd->result != nullptr) {
         unsigned int i, num_fields;
 
@@ -2865,6 +2893,8 @@ bool execute_sql(const std::string &sql, Thd1 *thd) {
       else
         number = mysql_num_rows(thd->result.get());
       thd->thread_log << " rows:" << number << std::endl;
+    } else {
+      thd->query_buffer.push("S " + sql);
     }
   }
 
@@ -3880,7 +3910,7 @@ std::string Table::SetClause() {
     int set = rand_int(columns_->size() - 1);
     if (columns_->at(set)->type_ != Column::GENERATED) {
       /* if there is just one column we have to pick that */
-      if (columns_->at(set)->name_ == "ipkey" &&
+      if (columns_->at(set)->name_.find("pkey") != std::string::npos &&
           options->at(Option::NO_PKEY_IN_SET)->getBool() &&
           columns_->size() > 1)
         continue;
@@ -3895,7 +3925,7 @@ std::string Table::SetClause() {
     for (const auto &column : *columns_) {
       if (column->type_ != Column::GENERATED && column->name_ != col->name_ &&
           rand_int(100) > 50) {
-        if (column->name_ == "ipkey" &&
+        if (column->name_.find("pkey") != std::string::npos &&
             options->at(Option::NO_PKEY_IN_SET)->getBool())
           continue;
         set_clause += ", " + column->name_ + " = " + column->rand_value();
@@ -3932,7 +3962,7 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   if (number_of_initial_records == 0)
     return true;
 
-  std::string prepare_sql = "INSERT ";
+  std::string prepare_sql = "INSERT IGNORE ";
 
   std::vector<int> fk_unique_keys;
 
@@ -3940,7 +3970,7 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   if (type == TABLE_TYPES::FK) {
     fk_unique_keys = std::move(thd->unique_keys);
   }
-  if (has_pk()) {
+  if (has_int_pk()) {
     thd->unique_keys = generateUniqueRandomNumbers(number_of_initial_records);
   }
   auto column_has_unique_key = [this](Column *col) {
@@ -4003,14 +4033,10 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
     is_list_partition = true;
   }
 
-  if (is_list_partition)
-    prepare_sql += "IGNORE ";
-
   prepare_sql += "INTO " + name_ + " (";
 
   assert(number_of_initial_records <=
-         (options->at(Option::UNIQUE_RANGE)->getInt() *
-          options->at(Option::INITIAL_RECORDS_IN_TABLE)->getInt()));
+         (options->at(Option::UNIQUE_RANGE)->getInt() * number_of_records));
 
   for (const auto &column : *columns_) {
     prepare_sql += column->name_ + ", ";
@@ -4020,7 +4046,9 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   prepare_sql += ")";
 
   std::string values = " VALUES";
-  int records = 0;
+  unsigned int records = 0;
+
+  std::vector<int> pk_insert;
 
   while (records < number_of_initial_records) {
     std::string value = "(";
@@ -4034,8 +4062,11 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
             std::to_string(fk_unique_keys[rand_int(fk_unique_keys.size() - 1)]);
       } else if (column->type_ == Column::COLUMN_TYPES::GENERATED) {
         value += "DEFAULT";
-      } else if (column->primary_key) {
+      } else if (column->primary_key && column->type_ == Column::INT) {
         value += std::to_string(thd->unique_keys.at(records));
+        if (options->at(Option::LOG_PK_BULK_INSERT)->getBool())
+          pk_insert.push_back(thd->unique_keys.at(records));
+
       } else if (column->auto_increment == true) {
         value += "NULL";
       } else if (is_list_partition && column->name_.compare("ip_col") == 0) {
@@ -4054,13 +4085,23 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
     value += ")";
     values += value;
     records++;
-    if (values.size() > 1024 * 1024 || number_of_initial_records == records) {
+    if (values.size() >
+            (size_t)options->at(Option::BULK_INSERT_WIDTH)->getInt() ||
+        number_of_initial_records == records) {
       if (!execute_sql(prepare_sql + values, thd)) {
         print_and_log("Bulk insert failed for table  " + name_, thd, true);
         run_query_failed = true;
         return false;
       }
       values = " VALUES";
+      if (pk_insert.size() > 0) {
+        thd->thread_log << "Primary key inserted : " << name_ << " ";
+        for (auto &pk : pk_insert) {
+          thd->thread_log << pk << " ";
+        }
+        thd->thread_log << std::endl;
+        pk_insert.clear();
+      }
     } else {
       values += ", ";
     }
@@ -4069,27 +4110,33 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   return true;
 }
 
-std::string Table::ColumnValues() {
-  std::string vals;
-  std::string sql = "  ( ";
+std::string Table::ColumnValues(int value_count) {
+  std::string cols = "(";
   for (auto &column : *columns_) {
-    sql += column->name_ + " ,";
-    std::string val;
-    if (column->type_ == Column::COLUMN_TYPES::GENERATED)
-      val = "default";
-    else
-      val = column->rand_value();
-    if (column->auto_increment == true && rand_int(100) < 10)
-      val = "NULL";
-    vals += " " + val + ",";
+    cols += column->name_ + ", ";
   }
+  cols.pop_back();
+  cols.pop_back();
+  cols += ")";
 
-  if (vals.size() > 0) {
+  std::string vals;
+  for (int i = 0; i < value_count; i++) {
+    vals += "(";
+    for (auto &column : *columns_) {
+      if (column->type_ == Column::COLUMN_TYPES::GENERATED)
+        vals += "DEFAULT, ";
+      else if (column->auto_increment == true && rand_int(100) < 10)
+        vals += "NULL, ";
+      else
+        vals += column->rand_value() + ", ";
+    }
     vals.pop_back();
-    sql.pop_back();
+    vals.pop_back();
+    vals += "), ";
   }
-  sql += ") VALUES(" + vals + ")";
-  return sql;
+  vals.pop_back();
+  vals.pop_back();
+  return cols + " VALUES" + vals;
 }
 
 void Table::InsertRandomRow(Thd1 *thd) {
@@ -4099,6 +4146,14 @@ void Table::InsertRandomRow(Thd1 *thd) {
   unlock_table_mutex();
 
   std::shared_lock lock(dml_mutex);
+  execute_sql(sql, thd);
+}
+void Table::InsertRandomRowBulk(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  std::string sql =
+      "INSERT IGNORE INTO " + name_ +
+      ColumnValues(options->at(Option::INSERT_BULK_COUNT)->getInt());
+  unlock_table_mutex();
   execute_sql(sql, thd);
 }
 
@@ -4313,11 +4368,12 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
     do {
       std::unique_lock<std::mutex> lock(all_table_mutex);
       auto working_table = all_tables->at(rand_int(all_tables->size() - 1));
-      /* if we are running DML, lets enforce so it compare result */
+      /* if we are running DML, lets enforce so it compare result
       if (options->at(Option::COMPARE_RESULT)->getBool()) {
         working_table = enforce_table;
         table_check = 0;
       }
+      */
       working_table->lock_table_mutex(thd->ddl_query);
       table.found_name = working_table->name_;
 
@@ -4401,8 +4457,8 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
   if (options->at(Option::COMPARE_RESULT)->getBool()) {
     enforce_table->Compare_between_engine(sql, thd);
   } else {
-    if (!execute_sql(sql, thd)) {
-      print_and_log("Grammar SQL failed " + sql, thd, true);
+    if (!execute_sql(sql, thd, true)) {
+      // print_and_log("Grammar SQL failed " + sql, thd, true);
     }
   }
 }
@@ -4474,7 +4530,7 @@ void create_in_memory_data() {
   }
 
   /* set some of tablespace encrypt */
-  if (!options->at(Option::NO_ENCRYPTION)->getBool() &&
+  if (options->at(Option::USE_ENCRYPTION)->getBool() &&
       !(strcmp(FORK, "MySQL") == 0 && server_version() < 80000)) {
     int i = 0;
     for (auto &tablespace : g_tablespace) {
@@ -4660,8 +4716,8 @@ static std::string load_metadata_from_file() {
     }
 
     all_tables->push_back(table);
-    options->at(Option::TABLES)->setInt(all_tables->size());
   }
+
   fclose(fp);
   return file;
 }
@@ -4734,7 +4790,7 @@ void create_database_tablespace(Thd1 *thd) {
     }
 
     /* encrypt tablespace */
-    if (!options->at(Option::NO_ENCRYPTION)->getBool()) {
+    if (options->at(Option::USE_ENCRYPTION)->getBool()) {
       if (tab.substr(tab.size() - 2, 2).compare("_e") == 0)
         sql += " ENCRYPTION='Y'";
       else if (server_version() >= 80000)
@@ -4756,50 +4812,6 @@ void create_database_tablespace(Thd1 *thd) {
   }
 }
 
-/* check all tables and partition in the starting and if any check table false
- * return false */
-static bool check_tables_partitions_preload(Table *table, Thd1 *thd) {
-  size_t failures = 0;
-  if (table->type == Table::PARTITION) {
-    int partition_count;
-    switch (static_cast<Partition *>(table)->part_type) {
-    case Partition::LIST:
-      partition_count = static_cast<Partition *>(table)->lists.size();
-      for (int i = 0; i < partition_count; i++) {
-        get_check_result("ALTER TABLE " + table->name_ + " CHECK PARTITION " +
-                             static_cast<Partition *>(table)->lists[i].name,
-                         thd) ||
-            failures++;
-      }
-      break;
-    case Partition::RANGE:
-      partition_count = static_cast<Partition *>(table)->positions.size();
-      for (int i = 0; i < partition_count; i++) {
-        get_check_result("ALTER TABLE " + table->name_ + " CHECK PARTITION " +
-                             static_cast<Partition *>(table)->positions[i].name,
-                         thd) ||
-            failures++;
-      }
-      break;
-    case Partition::HASH:
-    case Partition::KEY:
-      partition_count = static_cast<Partition *>(table)->number_of_part;
-      for (int i = 0; i < partition_count; i++) {
-        get_check_result("ALTER TABLE " + table->name_ + " CHECK PARTITION p" +
-                             std::to_string(i),
-                         thd) ||
-            failures++;
-      }
-      break;
-    }
-  } else {
-    get_check_result("CHECK TABLE " + table->name_, thd) || failures++;
-  }
-  if (failures != 0) {
-    check_failures++;
-  }
-  return failures == 0 ? true : false;
-}
 
 /* load metadata */
 bool Thd1::load_metadata() {
@@ -4833,7 +4845,6 @@ bool Thd1::load_metadata() {
     print_and_log("no table to work on \n");
     exit(EXIT_FAILURE);
   }
-  initial_tables = all_tables->size();
 
   return 1;
 }
@@ -4850,6 +4861,7 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
                option != Option::SELECT_ROW_USING_PKEY &&
                option != Option::SELECT_FOR_UPDATE &&
                option != Option::SELECT_FOR_UPDATE_BULK &&
+               option != Option::GRAMMAR_SQL &&
                option != Option::COMPARE_RESULT) {
       if (thread_id < options->at(Option::THREAD_DOING_ONLY_SELECT)->getInt()) {
         return true;
@@ -4872,10 +4884,16 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
 
 /* return true if successful or error out in case of fail */
 bool Thd1::run_some_query() {
+  // save current time in a variable so we have print time it took to execute
+
+  /* set seed for current thread */
+  rng = std::mt19937(set_seed(this));
+  thread_log << " value of rand_int(500) " << rand_int(500) << std::endl;
   std::vector<Table::TABLE_TYPES> tableTypes = {Table::NORMAL, Table::FK,
                                                 Table::PARTITION};
   if (options->at(Option::SECONDARY_ENGINE)->getString() != "") {
     execute_sql("SET SESSION sql_generate_invisible_primary_key = TRUE", this);
+    execute_sql("SET SESSION sql_generate_invisible_unique_key = TRUE", this);
   }
   execute_sql("USE " + options->at(Option::DATABASE)->getString(), this);
 
@@ -4899,32 +4917,44 @@ bool Thd1::run_some_query() {
     session_temp_tables->push_back(table);
   }
 
-  /* prepare is passed, create all tables */
+  static std::atomic<int> table_processed = 0;
+  int starting_index = 1 + thread_id;
+  thread_log << "Total table to process "
+             << options->at(Option::TABLES)->getInt() << std::endl;
+
   if (options->at(Option::PREPARE)->getBool() ||
       options->at(Option::STEP)->getInt() == 1) {
-    auto current = table_started++;
-
-    while (current <= (size_t)options->at(Option::TABLES)->getInt()) {
-      /* first load normal table , then FK and then partition
-       FK table uses thd->unique_key vector to pick random FK
-       thd->unique_key is populated from primary key */
-
+    while (starting_index <= options->at(Option::TABLES)->getInt()) {
       for (const auto &tableType : tableTypes) {
-        auto table = pick_table(tableType, current + 1);
-        if (table == nullptr)
+        auto table = pick_table(tableType, starting_index);
+        if (table == nullptr) {
+          thread_log << "Table with index " << starting_index << " not found"
+                     << std::endl;
           continue;
+        }
         if (!table->load(this)) {
           return false;
         }
-        table_completed++;
+        thread_log << " checksum " + table->name_ + " " +
+                          checksum(table->name_, this)
+                   << std::endl;
       }
-      current = table_started++;
+      thread_log << "Thread " << thread_id << " finished processing table "
+                 << starting_index << std::endl;
+      if (run_query_failed) {
+        thread_log << "some other thread failed, Exiting. Please check logs "
+                   << std::endl;
+        return false;
+      }
+      table_processed++;
+      starting_index += options->at(Option::THREADS)->getInt();
     }
 
     // wait for all tables to finish loading
-    while (table_completed < initial_tables) {
-      thread_log << "Waiting for all threds to finish initial load "
-                 << std::endl;
+    while (table_processed < options->at(Option::TABLES)->getInt()) {
+      thread_log << "Waiting for all threds to finish processing. Total table "
+                    "processed "
+                 << table_processed << std::endl;
       std::chrono::seconds dura(1);
       if (run_query_failed) {
         thread_log << "Some other thread failed, Exiting. Please check logs "
@@ -4933,27 +4963,9 @@ bool Thd1::run_some_query() {
       }
       std::this_thread::sleep_for(dura);
     }
-    /* table initial data is created delete , empty the unique_keys */
-    this->unique_keys.resize(0);
-
-  } else if (options->at(Option::CHECK_TABLE_PRELOAD)->getBool()) {
-    auto current = table_started++;
-
-    while (current < initial_tables) {
-      auto table = all_tables->at(current);
-      check_tables_partitions_preload(table, this);
-      table_completed++;
-      current = table_started++;
-    }
-
-    // wait for all tables to finish check table
-    while (table_completed < all_tables->size()) {
-      thread_log << "Waiting for all threds to finish check tables "
-                 << std::endl;
-      std::chrono::seconds dura(1);
-      std::this_thread::sleep_for(dura);
-    }
   }
+  /* table initial data is created, empty the unique_keys */
+  this->unique_keys.resize(0);
 
   if (options->at(Option::JUST_LOAD_DDL)->getBool() ||
       options->at(Option::PREPARE)->getBool())
@@ -4961,17 +4973,12 @@ bool Thd1::run_some_query() {
 
   /*Print once on screen and in general logs */
   if (!lock_stream.test_and_set()) {
-    std::stringstream s;
-    if (check_failures > 0) {
-      s << "Check table failed for " << check_failures << " "
-        << (check_failures == 1 ? "table" : " tables")
-        << ". Check thread logs for details \n ";
-    }
-    s << "Starting random load in " << options->at(Option::THREADS)->getInt()
-      << " threads. Gtid before strarting LOAD "
-      << mysql_read_single_value("select @@global.gtid_executed", this) << "\n";
-    std::cout << s.str();
-    this->ddl_logs << s.str();
+    print_and_log(
+        "Starting load in " +
+            std::to_string(options->at(Option::THREADS)->getInt()) +
+            " threads. GTID " +
+            mysql_read_single_value("select @@global.gtid_executed", this),
+        this);
   }
 
   if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
@@ -4983,9 +4990,6 @@ bool Thd1::run_some_query() {
   auto end =
       std::chrono::system_clock::time_point(begin + std::chrono::seconds(sec));
 
-  /* set seed for current thread */
-  rng = std::mt19937(set_seed(this));
-  thread_log << " value of rand_int(100) " << rand_int(100) << std::endl;
 
   /* freqency of all options per thread */
   int opt_feq[Option::MAX][2] = {{0, 0}};
@@ -4999,6 +5003,9 @@ bool Thd1::run_some_query() {
   }
 
   int pick_table_id = 0;
+  // save the start time in a variable so in every N seconds we print the number
+  // of transaction processed
+  auto start_time_for_print = std::chrono::system_clock::now();
   while (std::chrono::system_clock::now() < end) {
     auto option = pick_some_option();
 
@@ -5145,6 +5152,9 @@ bool Thd1::run_some_query() {
     case Option::INSERT_RANDOM_ROW:
       table->InsertRandomRow(this);
       break;
+    case Option::INSERT_BULK:
+      table->InsertRandomRowBulk(this);
+      break;
     case Option::DELETE_ALL_ROW:
       table->DeleteAllRows(this);
       break;
@@ -5234,10 +5244,33 @@ bool Thd1::run_some_query() {
 
     /* sql executed is at 0 index, and if successful at 1 */
     opt_feq[option][0]++;
+    if (options->at(Option::PRINT_TRANSACTION_RATE)->getInt() > 0) {
+      options->at(option)->query_in_timespan++;
+    }
     if (success) {
       options->at(option)->success_queries++;
       opt_feq[option][1]++;
       success = false;
+    }
+    if (options->at(Option::PRINT_TRANSACTION_RATE)->getInt() > 0 and
+        thread_id == 0) {
+      auto current_time = std::chrono::system_clock::now();
+      auto time_span = std::chrono::duration_cast<std::chrono::seconds>(
+          current_time - start_time_for_print);
+      if (time_span.count() >=
+          options->at(Option::PRINT_TRANSACTION_RATE)->getInt()) {
+        for (auto option : *options) {
+          if (option == nullptr)
+            continue;
+          auto current_value = option->query_in_timespan.load();
+          if (current_value > 0) {
+            std::cout << option->short_help << "=>" << current_value << ",";
+            option->query_in_timespan.store(0);
+          }
+        }
+        std::cout << std::endl;
+        start_time_for_print = std::chrono::system_clock::now();
+      }
     }
 
     if (run_query_failed) {

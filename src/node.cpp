@@ -66,6 +66,7 @@ void Node::writeFinalReport() {
                    performed_queries_total
             << "% were successful)";
     general_log << exitmsg.str() << std::endl;
+    std::cout << exitmsg.str() << std::endl;
   }
 }
 
@@ -76,10 +77,14 @@ int Node::startWork() {
     return 2;
   }
 
-  std::cout << "- Connecting to " << myParams.myName << " [" << myParams.address
+  std::string connectionInfo =
+      (myParams.socket != "") ? myParams.socket : std::to_string(myParams.port);
+
+  std::cout << "- Connecting to " << myParams.myName << " [" << connectionInfo
             << "]..." << std::endl;
-  general_log << "- Connecting to " << myParams.myName << " ["
-              << myParams.address << "]..." << std::endl;
+  general_log << "- Connecting to " << myParams.myName << " [" << connectionInfo
+              << "]..." << std::endl;
+
   tryConnect();
 
   if (options->at(Option::PQUERY)->getBool()) {
@@ -115,6 +120,7 @@ int Node::startWork() {
   /* END log replaying */
   workers.resize(myParams.threads);
   static int thread_id = 0;
+  auto start = std::chrono::system_clock::now();
 
   for (int i = 0; i < myParams.threads; i++) {
     workers[i] = std::thread(&Node::workerThread, this, thread_id++);
@@ -123,6 +129,14 @@ int Node::startWork() {
   for (int i = 0; i < myParams.threads; i++) {
     workers[i].join();
   }
+  std::cout << "Time taken by pstress is " +
+                   std::to_string(
+                       std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now() - start)
+                           .count()) +
+                   " seconds"
+            << std::endl;
+
   return EXIT_SUCCESS;
 }
 

@@ -56,7 +56,7 @@ SELECT LOCATE("a", T1_INT_1) from T1 order by 1 desc
 SELECT NULLIF(T1_TEXT_1, T1_TEXT_2) from T1 order by 1 desc
 SELECT COALESCE(T1_TEXT_1, T1_TEXT_2) from T1 order by 1 desc
 #some with grammar
-WITH tmp AS (SELECT T1_TEXT_1 a, T1_TEXT_2 b from T1 ) SELECT * from tmp where LENGTH(a) = LENGTH(b) order by 1 desc
+WITH tmp AS (SELECT T1_TEXT_1 a, T1_TEXT_2 b from T1 ) SELECT * from tmp where LENGTH(a) = LENGTH(b) order by 1,2 desc
 WITH tmp AS (SELECT T1_TEXT_1 a from T1 UNION SELECT T2_TEXT_1 a from T2) SELECT * from tmp where LENGTH(a) = 5 order by 1 desc
 #GROUP CONCAT
 #SELECT MD5(GROUP_CONCAT(T1_TEXT_1)) from T1 order by 1 desc
