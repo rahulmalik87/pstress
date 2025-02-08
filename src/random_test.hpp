@@ -42,6 +42,10 @@ int rand_int(long int upper, long int lower = 0);
 std::string rand_float(float upper, float lower = 0);
 std::string rand_double(double upper, double lower = 0);
 std::string rand_string(int upper, int lower = 2);
+const int maximum_records_in_each_parititon_list = 100;
+/* used to create metadata */
+const int version = 2;
+std::string add_ignore_clause();
 struct Thd1;
 
 struct Table;
@@ -657,4 +661,7 @@ struct grammar_tables {
 };
 void print_and_log(std::string &&str, Thd1 *thd = nullptr,
                    bool print_error = false);
+std::vector<int> generateUniqueRandomNumbers(int number_of_records);
+void wait_till_sync(const std::string &name, Thd1 *thd);
+std::string load_metadata_from_file();
 #endif
