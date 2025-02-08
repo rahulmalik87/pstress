@@ -1,7 +1,4 @@
-#include "table_operations.hpp"
-#include "bulk_inserts.hpp"
-#include "column_values.hpp"
-#include "table_serialization.hpp"
+#include "random_test.hpp"
 #include <document.h>
 extern std::mutex all_table_mutex;
 extern std::vector<Table *> *all_tables;
