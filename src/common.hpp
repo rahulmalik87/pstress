@@ -224,6 +224,7 @@ struct Option {
     INSERT_BULK,
     INSERT_BULK_COUNT,
     NON_INT_PK,
+    DICTIONARY_FILE,
     MAX
   } option;
   Option(Type t, Opt o, std::string n)

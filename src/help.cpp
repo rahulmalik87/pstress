@@ -575,6 +575,11 @@ void add_options() {
               "choose a high value. If it is update/delete choose low value  ";
   opt->setInt(100);
 
+  /* dictionary file */
+  opt = newOption(Option::STRING, Option::DICTIONARY_FILE, "dictionary-file");
+  opt->help = "Dictionary file for random string";
+  opt->setString("english_dictionary.txt");
+
   /* disable text columns*/
   opt = newOption(Option::BOOL, Option::NO_TEXT, "no-text");
   opt->help = "Disable text columns";

@@ -38,6 +38,7 @@ std::vector<std::string> g_tablespace;
 std::vector<std::string> locks;
 std::vector<std::string> algorithms;
 std::vector<int> g_key_block_size;
+std::vector<std::string> random_strs;
 int g_max_columns_length = 30;
 int g_innodb_page_size;
 int sum_of_all_opts = 0; // sum of all probablility
@@ -791,31 +792,23 @@ int set_seed(Thd1 *thd) {
 }
 
 /* generate random strings of size N_STR */
-std::vector<std::string> *random_strs_generator(unsigned long int seed) {
-  static const char alphabet[] = "  abcdefghijklmnopqrstuvwxyz"
-                                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                                 "0123456789";
+std::vector<std::string> random_strs_generator() {
 
-  static const size_t N_STRS = 10000;
-
-  std::default_random_engine rng(seed);
-  std::uniform_int_distribution<> dist(0, sizeof(alphabet) / sizeof(*alphabet) -
-                                              2);
-
-  std::vector<std::string> *strs = new std::vector<std::string>;
-  strs->reserve(N_STRS);
-  std::generate_n(std::back_inserter(*strs), strs->capacity(), [&] {
-    std::string str;
-    str.reserve(MAX_RANDOM_STRING_SIZE);
-    std::generate_n(std::back_inserter(str), MAX_RANDOM_STRING_SIZE,
-                    [&]() { return alphabet[dist(rng)]; });
-
-    return str;
-  });
+  auto exePath = getExecutablePath();
+  std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
+  std::ifstream file(exeDir /
+                     options->at(Option::DICTIONARY_FILE)->getString());
+  if (!file) {
+    throw std::runtime_error("Failed to open file: " +
+                             options->at(Option::DICTIONARY_FILE)->getString());
+  }
+  std::vector<std::string> strs;
+  std::string str;
+  while (std::getline(file, str)) {
+    strs.push_back(str);
+  }
   return strs;
 }
-
-std::vector<std::string> *random_strs;
 
 int rand_int(long int upper, long int lower) {
   assert(upper >= lower);
@@ -854,18 +847,26 @@ static std::string rand_bit(int length) {
 
 /* return random string in range of upper and lower */
 std::string rand_string(int upper, int lower) {
-  std::string rs = ""; /*random_string*/
+  std::string rs = "";
   assert(upper >= 2);
   assert(upper >= lower);
-  auto size = rand_int(upper, lower);
+  size_t size = rand_int(upper, lower);
+  if (rand_int(1000) <= options->at(Option::NULL_PROB)->getInt()) {
+    return "NULL";
+  }
 
   while (size > 0) {
-    auto str = random_strs->at(rand_int(random_strs->size() - 1));
-    if (size > MAX_RANDOM_STRING_SIZE)
+    auto str = random_strs.at(rand_int(random_strs.size() - 1));
+    if (size > str.size()) {
       rs += str;
-    else
-      rs += str.substr(0, size);
-    size -= MAX_RANDOM_STRING_SIZE;
+      size -= str.size();
+      if (size > 0) {
+        rs += " ";
+        size--;
+      }
+    } else {
+      return rs;
+    }
   }
   return rs;
 }
@@ -1014,9 +1015,9 @@ std::string Column::rand_value_universal() {
   case Column::COLUMN_TYPES::CHAR:
   case Column::COLUMN_TYPES::VARCHAR:
   case Column::COLUMN_TYPES::TEXT:
-    return "\'" + rand_string(length) + "\'";
+    return "\"" + rand_string(length) + "\"";
   case Column::COLUMN_TYPES::BLOB:
-    return "_binary\'" + rand_string(length) + "\'";
+    return "_binary\"" + rand_string(length) + "\"";
   case Column::COLUMN_TYPES::JSON:
     return "\'" + json_rand_doc(this) + "\'";
   case Column::COLUMN_TYPES::BIT:
@@ -1897,8 +1898,9 @@ void Table::CreateDefaultColumn() {
     /* First column can be primary */
     if (i == 0 &&
         rand_int(100, 1) <= options->at(Option::PRIMARY_KEY)->getInt()) {
-      if (rand_int(100) < options->at(Option::NON_INT_PK)->getInt() &&
-          !options->at(Option::NO_VARCHAR)->getBool()) {
+      if ((rand_int(100) < options->at(Option::NON_INT_PK)->getInt() &&
+           !options->at(Option::NO_VARCHAR)->getBool()) or
+          options->at(Option::NO_INT)->getBool()) {
         type = Column::VARCHAR;
       } else {
         type = Column::INT;
@@ -2610,7 +2612,8 @@ void Table::EnforceRebuildInSecondary(Thd1 *thd) {
   std::string sql = " SET GLOBAL " +
                     options->at(Option::SECONDARY_ENGINE)->getString() +
                     " PRAGMA = \"rewrite_table(" +
-                    options->at(Option::DATABASE)->getString() + "." + name_;
+                    options->at(Option::DATABASE)->getString() + "." + name_ +
+                    ",second_level_merge='true'";
 
   if (!options->at(Option::PLAIN_REWRITE)->getBool()) {
     /* Shuffle options for more combinations */
@@ -3349,8 +3352,8 @@ std::string Table::GetWherePrecise() {
   }
 
   if (col->type_ == Column::BLOB && rand_int(100) == 1) {
-    return randPartition + " WHERE instr( " + col->name_ + ",_binary\'" +
-           rand_string(10, 3) + "%\')";
+    return randPartition + " WHERE instr( " + col->name_ + ",_binary\"" +
+           rand_string(10, 3) + "%\")";
   }
 
 
@@ -3409,7 +3412,7 @@ std::string Table::GetWhereBulk() {
   }
 
   if (col->is_col_string() && rand_int(100) < 20) {
-    return where + " LIKE " + "\'" + rand_string(10, 3) + "%\'";
+    return where + " LIKE " + "\"" + rand_string(10, 3) + "%\"";
   }
 
   if (col->is_col_string() && rand_int(100) < 90) {
@@ -3759,12 +3762,11 @@ void create_in_memory_data() {
 }
 
 
-/* clean tables from memory,random_strs */
+/* clean tables from memory */
 void clean_up_at_end() {
   for (auto &table : *all_tables)
     delete table;
   delete all_tables;
-  delete random_strs;
 }
 
 static void ensure_no_table_in_secondary(Thd1 *thd) {
@@ -3804,13 +3806,6 @@ void create_database_tablespace(Thd1 *thd) {
 
   if (options->at(Option::SECONDARY_ENGINE)->getString() != "") {
     ensure_no_table_in_secondary(thd);
-    execute_sql("CREATE TABLE " + options->at(Option::DATABASE)->getString() +
-                    ".dummy(i int  primary key) SECONDARY_ENGINE=" +
-                    options->at(Option::SECONDARY_ENGINE)->getString(),
-                thd);
-    execute_sql("insert into " + options->at(Option::DATABASE)->getString() +
-                    ".dummy values(1)",
-                thd);
   }
 
 
@@ -3854,9 +3849,7 @@ void create_database_tablespace(Thd1 *thd) {
 bool Thd1::load_metadata() {
   sum_of_all_opts = sum_of_all_options(this);
 
-  auto seed = opt_int(INITIAL_SEED);
-  seed += options->at(Option::STEP)->getInt();
-  random_strs = random_strs_generator(seed);
+  random_strs = random_strs_generator();
 
   /*set seed for current step*/
   auto initial_seed = opt_int(INITIAL_SEED);
