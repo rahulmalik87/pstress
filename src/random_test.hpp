@@ -43,6 +43,10 @@ std::string rand_float(float upper, float lower = 0);
 std::string rand_double(double upper, double lower = 0);
 std::string rand_string(int upper, int lower = 2);
 const int maximum_records_in_each_parititon_list = 100;
+const std::string TABLE_PREFIX = "tt_";
+const std::string PARTITION_SUFFIX = "_p";
+const std::string FK_SUFFIX = "_fk";
+const std::string TEMP_SUFFIX = "_t";
 /* used to create metadata */
 const int version = 2;
 std::string add_ignore_clause();
@@ -664,4 +668,10 @@ void print_and_log(std::string &&str, Thd1 *thd = nullptr,
 std::vector<int> generateUniqueRandomNumbers(int number_of_records);
 void wait_till_sync(const std::string &name, Thd1 *thd);
 std::string load_metadata_from_file();
+MYSQL_ROW mysql_fetch_row_safe(Thd1 *thd);
+bool mysql_num_fields_safe(Thd1 *thd, unsigned int req);
+std::string mysql_read_single_value(const std::string &sql, Thd1 *thd);
+std::string lower_case_secondary();
+typedef std::vector<std::vector<std::string>> query_result;
+query_result get_query_result(Thd1 *thd, const std::string &query);
 #endif
