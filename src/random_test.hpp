@@ -665,7 +665,10 @@ struct grammar_tables {
 };
 void print_and_log(std::string &&str, Thd1 *thd = nullptr,
                    bool print_error = false);
+std::string getExecutablePath();
+std::vector<std::string> random_strs_generator();
 std::vector<int> generateUniqueRandomNumbers(int number_of_records);
+
 void wait_till_sync(const std::string &name, Thd1 *thd);
 std::string load_metadata_from_file();
 MYSQL_ROW mysql_fetch_row_safe(Thd1 *thd);

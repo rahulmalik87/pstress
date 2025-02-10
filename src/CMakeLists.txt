@@ -13,6 +13,9 @@ IF (MYSQL_FOUND)
  # Copy all .sql files
   FILE(GLOB SQL_FILES "*.sql")
   FILE(COPY ${SQL_FILES} DESTINATION .)
+  FILE(GLOB TEXT_FILES "*.txt")
+  FILE(COPY ${TEXT_FILES} DESTINATION .)
+
 
   # Install all .sql files to the bin directory
   INSTALL(FILES ${SQL_FILES} DESTINATION bin)

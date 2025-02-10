@@ -2,6 +2,9 @@
 #include "random_test.hpp"
 #include <regex>
 #include <thread>
+#if __APPLE__
+#include <mach-o/dyld.h>
+#endif
 extern std::vector<Table *> *all_tables;
 extern std::mutex all_table_mutex;
 extern thread_local std::mt19937 rng;
@@ -54,10 +57,15 @@ static void kill_query(Thd1 *thd) {
   return;
 }
 
-static std::string getExecutablePath() {
+std::string getExecutablePath() {
   char buffer[PATH_MAX];
 #ifdef _WIN32
   GetModuleFileNameA(NULL, buffer, PATH_MAX);
+#elif __APPLE__
+  uint32_t size = PATH_MAX;
+  if (_NSGetExecutablePath(buffer, &size) != 0) {
+    throw std::runtime_error("Unable to get executable path");
+  }
 #else
   ssize_t len = readlink("/proc/self/exe", buffer, PATH_MAX);
   if (len == -1) {
