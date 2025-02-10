@@ -73,6 +73,7 @@ public:
     TEXT,
     GENERATED,
     JSON,
+    ENUM,
     COLUMN_MAX // should be last
   } type_;
   /* used to create new table/alter table add column*/
@@ -155,6 +156,15 @@ struct Text_Column : public Column {
   std::string clause() { return sub_type; };
   template <typename Writer> void Serialize(Writer &writer) const;
   bool is_col_string() { return true; }
+  bool is_col_number() { return false; }
+};
+
+struct Enum_Column : public Column {
+  Enum_Column(std::string name, Table *table);
+  Enum_Column(std::string name, Table *table, std::string sub_type_);
+  std::vector<std::string> enum_values;
+  template <typename Writer> void Serialize(Writer &writer) const;
+  bool is_col_string() { return false; }
   bool is_col_number() { return false; }
 };
 

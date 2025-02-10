@@ -192,6 +192,7 @@ struct Option {
     NO_BOOL,
     NO_INTEGER,
     NO_INT,
+    NO_ENUM,
     NO_BIT,
     NULL_PROB,
     SECONDARY_AFTER_CREATE,
