@@ -647,6 +647,12 @@ void add_options() {
   opt->setBool(false);
   opt->setArgs(no_argument);
 
+  /* diable enum columns*/
+  opt = newOption(Option::BOOL, Option::NO_ENUM, "no-enum");
+  opt->help = "Disable enum columns";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
   /* disable int columns*/
   opt = newOption(Option::BOOL, Option::NO_INT, "no-int");
   opt->help = "Disable int  columns";

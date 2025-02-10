@@ -320,6 +320,10 @@ int sum_of_all_options(Thd1 *thd) {
         column_types.end())
       options->at(Option::NO_INTEGER)->setBool(true);
 
+    if (std::find(column_types.begin(), column_types.end(), "ENUM") ==
+        column_types.end())
+      options->at(Option::NO_ENUM)->setBool(true);
+
     if (std::find(column_types.begin(), column_types.end(), "INT") ==
         column_types.end())
       options->at(Option::NO_INT)->setBool(true);
@@ -388,6 +392,7 @@ int sum_of_all_options(Thd1 *thd) {
       options->at(Option::NO_BIT)->getBool() &&
       options->at(Option::NO_BLOB)->getBool() &&
       options->at(Option::NO_JSON)->getBool() &&
+      options->at(Option::NO_ENUM)->getBool() &&
       options->at(Option::NO_CHAR)->getBool() &&
       options->at(Option::NO_VARCHAR)->getBool() &&
       options->at(Option::NO_TEXT)->getBool() &&
@@ -903,6 +908,8 @@ Column::COLUMN_TYPES Column::col_type(std::string type) {
     return TEXT;
   else if (type.compare("BIT") == 0)
     return BIT;
+  else if (type.compare("ENUM") == 0)
+    return ENUM;
   else {
     print_and_log("unhandled " + col_type_to_string(type_) + " at line " +
                   std::to_string(__LINE__));
@@ -913,6 +920,8 @@ Column::COLUMN_TYPES Column::col_type(std::string type) {
 /* return string from a column type */
 const std::string Column::col_type_to_string(COLUMN_TYPES type) {
   switch (type) {
+  case ENUM:
+    return "ENUM";
   case INTEGER:
     return "INTEGER";
   case INT:
@@ -2917,7 +2926,7 @@ void Table::AddColumn(Thd1 *thd) {
     use_virtual = false;
   }
   while (col_type == Column::COLUMN_MAX) {
-    auto prob = rand_int(24);
+    auto prob = rand_int(25);
 
     if (use_virtual && prob == 1)
       col_type = Column::GENERATED;
@@ -2929,9 +2938,10 @@ void Table::AddColumn(Thd1 *thd) {
       col_type = Column::FLOAT;
     else if (!options->at(Option::NO_DOUBLE)->getBool() && prob < 10)
       col_type = Column::DOUBLE;
-    else if (!options->at(Option::NO_VARCHAR)->getBool() && prob < 14)
+    else if (!options->at(Option::NO_VARCHAR)->getBool() && prob < 14 &&
+             prob > 10)
       col_type = Column::VARCHAR;
-    else if (!options->at(Option::NO_CHAR)->getBool() && prob < 16)
+    else if (!options->at(Option::NO_CHAR)->getBool() && prob < 16 && prob > 14)
       col_type = Column::CHAR;
     else if (!options->at(Option::NO_TEXT)->getBool() && prob == 17)
       col_type = Column::TEXT;
@@ -2949,6 +2959,8 @@ void Table::AddColumn(Thd1 *thd) {
       col_type = Column::BIT;
     else if (prob == 24 && !options->at(Option::NO_JSON)->getBool())
       col_type = Column::JSON;
+    else if (prob == 25 && !options->at(Option::NO_ENUM)->getBool())
+      col_type = Column::ENUM;
   }
 
   Column *tc;
@@ -2961,6 +2973,8 @@ void Table::AddColumn(Thd1 *thd) {
     tc = new Blob_Column(name, this);
   else if (col_type == Column::TEXT)
     tc = new Text_Column(name, this);
+  else if (col_type == Column::ENUM)
+    tc = new Enum_Column(name, this);
   else
     tc = new Column(name, this, col_type);
 
@@ -3843,7 +3857,6 @@ void create_database_tablespace(Thd1 *thd) {
     }
   }
 }
-
 
 /* load metadata */
 bool Thd1::load_metadata() {
