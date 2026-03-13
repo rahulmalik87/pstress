@@ -1,20 +1,21 @@
 #ifndef __RANDOM_HPP__
 #define __RANDOM_HPP__
 
+#include "DatabaseInterface.hpp"
 #include "common.hpp"
+#include "filereadstream.h"
 #include "ring_buffer.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
-#include <filereadstream.h>
 #include <fstream>
 #include <iostream>
 #include <memory> //shared_ptr
 #include <mutex>
-#include <mysql.h>
 #include <prettywriter.h>
 #include <random>
+#include <regex>
 #include <shared_mutex>
 #include <sstream>
 #include <string.h>
@@ -38,11 +39,18 @@
 #define opt_bool(a) options->at(Option::a)->getBool();
 #define opt_string(a) options->at(Option::a)->getString()
 
-int rand_int(long int upper, long int lower = 0);
+long int rand_int(long int upper, long int lower = 0);
+template <typename T> static T try_negative(T val) {
+  if (rand_int(100) > options->at(Option::POSITIVE_INT_PROB)->getInt()) {
+    return val * (-1);
+  }
+  return val;
+}
+
 std::string rand_float(float upper, float lower = 0);
 std::string rand_double(double upper, double lower = 0);
-std::string rand_string(int upper, int lower = 2);
-const int maximum_records_in_each_parititon_list = 100;
+std::string rand_string(size_t size);
+const int maximum_records_in_each_parititon_list = 30;
 const std::string TABLE_PREFIX = "tt_";
 const std::string PARTITION_SUFFIX = "_p";
 const std::string FK_SUFFIX = "_fk";
@@ -53,7 +61,7 @@ std::string add_ignore_clause();
 struct Thd1;
 
 struct Table;
-class Column {
+struct Column {
 public:
   enum COLUMN_TYPES {
     /* interger type columns are small ints. they are used for LIST
@@ -61,6 +69,7 @@ public:
     INTEGER,
     INT,
     FLOAT,
+    DECIMAL,
     DOUBLE,
     BOOL,
     DATE,
@@ -73,6 +82,7 @@ public:
     TEXT,
     GENERATED,
     JSON,
+    ENUM,
     COLUMN_MAX // should be last
   } type_;
   /* used to create new table/alter table add column*/
@@ -84,25 +94,28 @@ public:
 
   std::string definition();
   /* return random value of that column */
-  std::string rand_value();
+  virtual std::string rand_value();
   /* return string to call type */
   static const std::string col_type_to_string(COLUMN_TYPES type);
   /* return column type from a string */
   COLUMN_TYPES col_type(std::string type);
   /* used to create_metadata */
   template <typename Writer> void Serialize(Writer &writer) const;
-  /* return the clause of column */
-  std::string rand_value_universal();
 
-private:
   virtual std::string clause() {
-    std::string str = col_type_to_string(type_);
+
+    std::string str;
+    if (type_ == Column::INT) {
+      str = "BIGINT";
+    } else {
+      str = col_type_to_string(type_);
+    }
+
     if (length > 0)
       str += "(" + std::to_string(length) + ")";
     return str;
   };
 
-public:
   virtual ~Column(){};
   std::string name_;
   std::mutex mutex;
@@ -113,6 +126,7 @@ public:
   bool auto_increment = false;
   bool compressed = false; // percona type compressed
   bool not_secondary = false;
+  bool is_partition = false;
   std::vector<int> unique_values;
   Table *table_;
   virtual bool is_col_string() {
@@ -124,8 +138,8 @@ public:
   bool is_col_can_be_compared() {
     return type_ == COLUMN_TYPES::INT || type_ == COLUMN_TYPES::INTEGER ||
            type_ == COLUMN_TYPES::FLOAT || type_ == COLUMN_TYPES::DOUBLE ||
-           type_ == COLUMN_TYPES::DATE || type_ == COLUMN_TYPES::DATETIME ||
-           type_ == COLUMN_TYPES::TIMESTAMP;
+           type_ == COLUMN_TYPES::FLOAT || type_ == COLUMN_TYPES::DATE ||
+           type_ == COLUMN_TYPES::DATETIME || type_ == COLUMN_TYPES::TIMESTAMP;
   }
   /* return the number in name_ */
   int get_id() const {
@@ -142,20 +156,109 @@ struct Blob_Column : public Column {
   Blob_Column(std::string name, Table *table);
   Blob_Column(std::string name, Table *table, std::string sub_type_);
   std::string sub_type; // sub_type can be tiny, medium, large blob
-  std::string clause() { return sub_type; };
+  std::string clause() override { return sub_type; };
   template <typename Writer> void Serialize(Writer &writer) const;
-  bool is_col_string() { return false; }
-  bool is_col_number() { return false; }
+  bool is_col_string() override { return false; }
+  bool is_col_number() override { return false; }
 };
 
 struct Text_Column : public Column {
   Text_Column(std::string name, Table *table);
   Text_Column(std::string name, Table *table, std::string sub_type_);
   std::string sub_type; // sub_type can be tiny, medium, large text
-  std::string clause() { return sub_type; };
+  std::string clause() override { return sub_type; };
   template <typename Writer> void Serialize(Writer &writer) const;
-  bool is_col_string() { return true; }
-  bool is_col_number() { return false; }
+  bool is_col_string() override { return true; }
+  bool is_col_number() override { return false; }
+};
+
+struct Decimal_Column : public Column {
+  /* to restore after a restart */
+  Decimal_Column(std::string name, Table *table, int precision_, int length_)
+      : Column(name, table, Column::DECIMAL), precision(precision_) {
+    length = length_;
+    /* generate maximum value based on length of column */
+    max_left = pow(10, length - precision) - 1;
+    max_precision = pow(10, precision) - 1;
+  };
+
+  /* to randomly intialized */
+  Decimal_Column(std::string name, Table *table)
+      : Column(table, Column::DECIMAL) {
+    name_ = "de" + name;
+    precision = rand_int(5, 0);
+    length = rand_int(10, precision);
+    /* generate maximum value based on length of column */
+    max_left = pow(10, length - precision) - 1;
+    max_precision = pow(10, precision) - 1;
+  }
+
+  template <typename Writer> void Serialize(Writer &writer) const;
+  std::string clause() override {
+    return "DECIMAL(" + std::to_string(length) + "," +
+           std::to_string(precision) + ")";
+  }
+  std::string rand_value() override {
+    if (null_val && rand_int(100) <= options->at(Option::NULL_PROB)->getInt())
+      return "NULL";
+    return std::to_string(try_negative(rand_int(max_left))) + "." +
+           std::to_string(rand_int(max_precision));
+  }
+  int precision;
+  long int max_precision;
+  long int max_left;
+  void update_max_precision() {
+    max_left = pow(10, length - precision) - 1;
+    max_precision = pow(10, precision) - 1;
+  }
+};
+
+struct Enum_Column : public Column {
+
+  /* constructor to randomly initialize value */
+  Enum_Column(std::string name, Table *table);
+
+  /* restore enum column after a restart */
+  Enum_Column(std::string name, Table *table,
+              std::vector<std::string> &&values_)
+      : Column(name, table, Column::ENUM), enum_values(std::move(values_)) {}
+
+  std::string clause() override {
+    std::string str = " ENUM(";
+    for (size_t i = 0; i < enum_values.size(); i++) {
+      auto value = enum_values[i];
+      /* if enum value contains ' transform */
+      if (value.find('\'') != std::string::npos) {
+        // Replace single quotes with escaped single quotes
+        value = std::regex_replace(value, std::regex("\'"), "\\'");
+      }
+
+      str += "\'" + value + "\'";
+      if (i != enum_values.size() - 1)
+        str += ",";
+    }
+    str += ")";
+    return str;
+  };
+
+  std::vector<std::string> enum_values;
+  template <typename Writer> void Serialize(Writer &writer) const;
+  bool is_col_string() override { return false; }
+  bool is_col_number() override { return false; }
+
+  std::string rand_value() override {
+    if (null_val && rand_int(100) <= options->at(Option::NULL_PROB)->getInt())
+      return "NULL";
+    if (enum_values.empty())
+      return "\"\"";
+    std::string result;
+    const auto &value = enum_values[rand_int(enum_values.size() - 1, 0)];
+    result.reserve(value.size() + 2); // Reserve space for quotes + value
+    result += '"';
+    result += value;
+    result += '"';
+    return result;
+  }
 };
 
 struct Generated_Column : public Column {
@@ -170,15 +273,15 @@ struct Generated_Column : public Column {
   template <typename Writer> void Serialize(Writer &writer) const;
 
   std::string str;
-  std::string clause() { return str; };
+  std::string clause() override { return str; };
   ~Generated_Column(){};
   COLUMN_TYPES g_type; // sub type can be blob,int, varchar
   COLUMN_TYPES generate_type() const { return g_type; };
-  bool is_col_string() {
+  bool is_col_string() override {
     return g_type == COLUMN_TYPES::CHAR || g_type == COLUMN_TYPES::VARCHAR ||
            g_type == COLUMN_TYPES::BLOB || g_type == COLUMN_TYPES::TEXT;
   }
-  bool is_col_number() {
+  bool is_col_number() override {
     return g_type == COLUMN_TYPES::INT || g_type == COLUMN_TYPES::INTEGER;
   }
 };
@@ -206,10 +309,11 @@ struct Index {
 
 struct Thd1 {
   Thd1(int id, std::ofstream &tl, std::ofstream &ddl_l, std::ofstream &client_l,
-       MYSQL *c, std::atomic<unsigned long long> &p,
-       std::atomic<unsigned long long> &f, size_t buffer_size)
+       std::unique_ptr<DatabaseInterface> db_,
+       std::atomic<unsigned long long> &p, std::atomic<unsigned long long> &f,
+       size_t buffer_size)
       : thread_id(id), thread_log(tl), ddl_logs(ddl_l), client_log(client_l),
-        conn(c), performed_queries_total(p), failed_queries_total(f),
+        db(std::move(db_)), performed_queries_total(p), failed_queries_total(f),
         query_buffer(buffer_size){};
 
   bool run_some_query(); // create default tables and run random queries
@@ -221,10 +325,9 @@ struct Thd1 {
   std::ofstream &thread_log;
   std::ofstream &ddl_logs;
   std::ofstream &client_log;
-  MYSQL *conn;
+  std::unique_ptr<DatabaseInterface> db;
   std::atomic<unsigned long long> &performed_queries_total;
   std::atomic<unsigned long long> &failed_queries_total;
-  std::shared_ptr<MYSQL_RES> result; // result set of sql
   bool ddl_query = false;            // is the query ddl
   bool success = false;              // if the sql is successfully executed
   int max_con_fail_count = 0;        // consecutive failed queries
@@ -237,12 +340,13 @@ struct Thd1 {
 
   /* for loading Bulkdata, Primary key of current table is stored in this vector
    * which  is used for the FK tables  */
-  std::vector<int> unique_keys;
+  std::vector<long int> unique_keys;
   int query_number = 0;
   std::string get_xid() {
     std::string xid = "\'xid" + std::to_string(thread_id) + "\'";
     return xid;
   }
+  size_t trx_left = 0;
 
   struct workerParams *myParam;
   bool tryreconnet();
@@ -254,7 +358,8 @@ struct Table {
 
   Table(std::string n);
   static Table *table_id(TABLE_TYPES choice, int id, bool suffix = false);
-  std::string definition(bool with_index = true, bool with_fk = false);
+  std::string definition(bool with_index = true, bool with_fk = false,
+                         bool with_forced_secondary = false);
   /* add secondary indexes */
   bool load_secondary_indexes(Thd1 *thd);
   /* execute table definition, Bulk data and then secondary index */
@@ -290,6 +395,7 @@ struct Table {
   void Alter_discard_tablespace(Thd1 *thd);
   void DeleteRandomRow(Thd1 *thd);
   void UpdateRandomROW(Thd1 *thd);
+  void Replace(Thd1 *thd);
   void SelectRandomRow(Thd1 *thd, bool select_for_update = false);
   void SelectAllRow(Thd1 *thd, bool select_for_update = false);
   void CreateFunction(Thd1 *thd);
@@ -298,7 +404,7 @@ struct Table {
   Column *GetRandomColumn();
   std::string GetWherePrecise();
   std::string GetWhereBulk();
-  std::string ColumnValues(int value_count = 1);
+  std::string ColumnValues(Thd1 *thd, int value_count = 1);
   std::string SelectColumn();
   std::string SetClause();
   void DeleteAllRows(Thd1 *thd);
@@ -315,7 +421,7 @@ struct Table {
   std::string compression;
   std::string encryption = "N";
   int key_block_size = 0;
-  unsigned int number_of_initial_records;
+  long int number_of_initial_records;
   size_t auto_inc_index;
   // std::string data_directory; todo add corressponding code
   std::vector<Column *> *columns_;
@@ -325,9 +431,9 @@ struct Table {
     /* if option no ddl then do not lock mutex */
     if (options->at(Option::NO_DDL)->getBool())
       return;
-    if (ddl_query)
+    if (ddl_query) {
       table_mutex.lock();
-    else
+    } else
       table_mutex.lock_shared();
   };
   void unlock_table_mutex() const {
@@ -353,7 +459,8 @@ struct Table {
     return "FAIL";
   };
   bool has_int_pk() const;
-
+  bool has_pk() const;
+  bool has_auto_inc_col() const;
   void set_type(std::string s) {
     if (s.compare("PARTITION") == 0)
       type = PARTITION;
@@ -508,25 +615,41 @@ public:
   int number_of_part;
   /* type of partition supported for current run */
   static std::vector<PART_TYPE> supported;
+
   /* how ranges are distributed */
 
   /* Used by Range Parititon */
   struct Range {
-    Range(std::string n, int r) : name(n), range(r){};
+    Range(const std::string &n, int r) : name(n), range(r){};
     std::string name;
-    int range;
+    long int range;
   };
+
   std::vector<Range> positions;
-  static bool compareRange(Range P1, Range P2) { return P1.range < P2.range; }
 
   /* Used by List Partition */
   struct List {
     List(std::string n) : name(n){};
     std::string name;
-    std::vector<int> list;
+    std::vector<long int> list;
   };
-  std::vector<int> total_left_list;
   std::vector<List> lists;
+
+  /* return the partition columns */
+  std::string get_part_column() {
+    std::string par_columns;
+    bool first = true;
+    for (auto col : *columns_) {
+      if (col->is_partition) {
+        if (!first)
+          par_columns += ", ";
+        par_columns += col->name_;
+        first = false;
+      }
+    }
+    assert(!first);
+    return par_columns;
+  }
 };
 
 /* Temporary table */
@@ -547,7 +670,7 @@ param[in] sql	 	query that we want to execute
 param[in/out] thd	Thd used to execute sql
 */
 bool execute_sql(const std::string &sql, Thd1 *thd,
-                 bool log_result_client = false);
+                 bool force_sql_log_query = true);
 
 void save_metadata_to_file();
 void clean_up_at_end();
@@ -579,6 +702,7 @@ struct grammar_table {
     DATE,
     TIMESTAMP,
     FLOAT,
+    DECIMAL,
     TEXT,
     JSON,
     MAX
@@ -596,6 +720,8 @@ struct grammar_table {
       return DATE;
     if (type == "TIMESTAMP")
       return TIMESTAMP;
+    if (type == "DECIMAL")
+      return DECIMAL;
     if (type == "FLOAT")
       return FLOAT;
     if (type == "TEXT")
@@ -620,6 +746,8 @@ struct grammar_table {
       return "TIMESTAMP";
     case FLOAT:
       return "FLOAT";
+    case DECIMAL:
+      return "DECIMAL";
     case TEXT:
       return "TEXT";
     case JSON:
@@ -664,17 +792,16 @@ struct grammar_tables {
   std::vector<grammar_table> tables;
 };
 void print_and_log(std::string &&str, Thd1 *thd = nullptr,
-                   bool print_error = false);
+                   bool print_error = false, bool count_to_console = true);
 std::string getExecutablePath();
 std::vector<std::string> random_strs_generator();
-std::vector<int> generateUniqueRandomNumbers(int number_of_records);
+std::vector<long int> generateUniqueRandomNumbers(long int number_of_records);
 
 void wait_till_sync(const std::string &name, Thd1 *thd);
 std::string load_metadata_from_file();
-MYSQL_ROW mysql_fetch_row_safe(Thd1 *thd);
-bool mysql_num_fields_safe(Thd1 *thd, unsigned int req);
-std::string mysql_read_single_value(const std::string &sql, Thd1 *thd);
 std::string lower_case_secondary();
 typedef std::vector<std::vector<std::string>> query_result;
 query_result get_query_result(Thd1 *thd, const std::string &query);
+std::string toHumanReadable(double number);
+std::string build_step_file_name(int step);
 #endif

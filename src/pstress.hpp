@@ -13,6 +13,7 @@ void show_help(Option::Opt help);
 void show_help(std::string option);
 void show_config_help(void);
 void show_cli_help(void);
+void crashHandler(int sig);
 
 void read_section_settings(struct workerParams *, std::string, std::string);
 void create_worker(workerParams *wParams);

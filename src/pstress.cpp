@@ -17,8 +17,12 @@
 #include "pstress.hpp"
 #include "random_test.hpp"
 #include <INIReader.hpp>
+#include <cstdlib>  // For free()
+#include <cxxabi.h> // For demangling
+#include <execinfo.h> //For backtrace()
+#include <iostream>
 #include <libgen.h> //dirname() uses this
-#include <mysql.h>
+#include <signal.h> //For signal()
 #include <string>
 #include <thread>
 
@@ -54,8 +58,41 @@ void create_worker(struct workerParams *Params) {
   newNode.end_node();
 }
 
+void crashHandler(int sig) {
+  void *stack[64];
+  int size = backtrace(stack, 64);
+  char **symbols = backtrace_symbols(stack, size);
 
+  std::cerr << "Crash! Signal: " << sig << " (";
+  if (sig == SIGSEGV)
+    std::cerr << "Segmentation Fault";
+  else if (sig == SIGABRT)
+    std::cerr << "Abort";
+  else if (sig == SIGFPE)
+    std::cerr << "Floating-Point Exception";
+  else if (sig == SIGILL)
+    std::cerr << "Illegal Instruction";
+  else
+    std::cerr << "Unknown";
+  std::cerr << ")\nStack:\n";
+
+  for (int i = 0; i < size; i++) {
+    const char *symbol = symbols[i] ? symbols[i] : "??";
+    int status;
+    char *demangled = abi::__cxa_demangle(symbol, nullptr, nullptr, &status);
+    std::cerr << "[" << i << "] " << (status == 0 ? demangled : symbol) << "\n";
+    free(demangled);
+  }
+
+  free(symbols);
+  _exit(1);
+}
 int main(int argc, char *argv[]) {
+  // Register handler for SIGSEGV and other relevant signals
+  signal(SIGSEGV, crashHandler); // Segmentation fault
+  signal(SIGABRT, crashHandler); // Abort (e.g., from assert)
+  signal(SIGFPE, crashHandler);  // Floating-point exception
+  signal(SIGILL, crashHandler);  // Illegal instruction
 
   std::vector<std::thread> nodes;
   add_options();
@@ -118,8 +155,10 @@ int main(int argc, char *argv[]) {
           op->setString(optarg);
           break;
         case Option::BOOL:
-          std::string s(optarg);
-          op->setBool(s);
+          op->setBool(optarg);
+          break;
+        case Option::FLOAT:
+          op->setFloat(optarg);
           break;
         }
       } else if (op->getArgs() == no_argument) {
@@ -133,17 +172,19 @@ int main(int argc, char *argv[]) {
     }
   } // while
   auto initial_seed = opt_int(INITIAL_SEED);
+  if (initial_seed == 0) {
+    // Generate a random seed using a random device
+    std::random_device rd;
+    initial_seed = rd() ^ static_cast<unsigned int>(std::time(nullptr));
+    std::cout << "Generated random seed: " << initial_seed << std::endl;
+    options->at(Option::INITIAL_SEED)->setInt(initial_seed);
+  }
   initial_seed += options->at(Option::STEP)->getInt();
   rng = std::mt19937(initial_seed);
 
   /* check if user has asked for help */
   if (options->at(Option::HELP)->getBool() == true) {
-    if (options->at(Option::VERBOSE)->getBool() == true)
       show_help("verbose");
-    else if (options->at(Option::HELP)->getString().empty())
-      show_help();
-    else
-      show_help(options->at(Option::HELP)->getString());
     delete_options();
     exit(0);
   }
@@ -152,22 +193,36 @@ int main(int argc, char *argv[]) {
     read_option_prob_file(options->at(Option::OPTION_PROB_FILE)->getString());
   }
 
-  if (options->at(Option::PQUERY)->getBool()) {
-    std::cout << "runnng as pquery" << std::endl;
+#ifdef USE_DUCKDB
+  // if step=1 or prepare=true remove the duckdb file in logdir
+  if (options->at(Option::STEP)->getInt() == 1 ||
+      options->at(Option::PREPARE)->getBool() == true) {
+    std::cout << "Will recreate duckdb file" << std::endl;
+    std::string logdir = options->at(Option::LOGDIR)->getString();
+    std::string duckdb_file = logdir + "/duckdb";
+    if (remove(duckdb_file.c_str()) != 0) {
+      std::cerr << "Error deleting file " << duckdb_file << std::endl;
+    }
   }
+#endif
 
   auto confFile = options->at(Option::CONFIGFILE)->getString();
   auto ports = splitStringToArray<int>(options->at(Option::PORT)->getString());
+#ifdef USE_MYSQL
+  std::string name = "mysql";
+#elif USE_DUCKDB
+  std::string name = "duckdb";
+#endif
   if (confFile.empty() && ports.size() == 1) {
     /*single node and command line */
     workerParams *wParams = new workerParams(ports[0]);
-    wParams->myName = "node";
+    wParams->myName = name;
     create_worker(wParams);
     delete wParams;
   } else if (confFile.empty() && ports.size() > 1) {
     for (auto port : ports) {
       workerParams *wParams = new workerParams(port);
-      wParams->myName = "node." + std::to_string(port);
+      wParams->myName = name + "." + std::to_string(port);
       nodes.push_back(std::thread(create_worker, wParams));
     }
     /* join all nodes */
@@ -199,7 +254,6 @@ int main(int argc, char *argv[]) {
   save_metadata_to_file();
   clean_up_at_end();
 
-  mysql_library_end();
   /* print option with total_queries */
   for (auto op : *options) {
     if (op != nullptr && op->sql && op->total_queries > 0) {

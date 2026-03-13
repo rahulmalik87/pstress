@@ -1,7 +1,9 @@
-
 #include "random_test.hpp"
+#include <filesystem>
+#include <limits.h> // for PATH_MAX
 #include <regex>
 #include <thread>
+#include <unistd.h> // for readlink
 #if __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -10,7 +12,7 @@ extern std::mutex all_table_mutex;
 extern thread_local std::mt19937 rng;
 extern std::atomic_flag lock_stream;
 extern std::atomic<bool> run_query_failed;
-extern std::atomic<bool> keyring_comp_status;
+extern bool keyring_comp_status;
 extern std::vector<std::string> g_undo_tablespace;
 static void random_timezone(Thd1 *thd) {
   std::string time_zone;
@@ -35,17 +37,15 @@ static void kill_query(Thd1 *thd) {
   if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
     execute_sql("SET @@SESSION.USE_SECONDARY_ENGINE=OFF", thd);
   }
-  unsigned long current_thread_id = mysql_thread_id(thd->conn);
+  auto current_thread_id = thd->db->get_single_value("SELECT CONNECTION_ID()");
+
   std::string query =
       "select ID from information_schema.processlist where user='";
   query += options->at(Option::USER)->getString() + "'";
-  /* the Sleep is added so it doesn't kill a query which is about to kill */
-  query += " and command not like  '%Sleep%' and id != " +
-           std::to_string(current_thread_id);
-  if (!execute_sql(query, thd)) {
-    return;
-  }
-  auto result = get_query_result(thd, query);
+  query += " id != " + current_thread_id;
+
+  auto result = thd->db->get_query_result(query);
+
   if (result.empty()) {
     return;
   }
@@ -160,7 +160,7 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
 
   if (options->at(Option::COMPARE_RESULT)->getBool() ||
       options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
-    execute_sql("COMMIT", thd);
+    // execute_sql("COMMIT", thd);
   }
   auto sql = currrent_table.sql;
   auto &sql_tables = currrent_table.tables;
@@ -171,12 +171,11 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
     do {
       std::unique_lock<std::mutex> lock(all_table_mutex);
       auto working_table = all_tables->at(rand_int(all_tables->size() - 1));
-      /* if we are running DML, lets enforce so it compare result
-      if (options->at(Option::COMPARE_RESULT)->getBool()) {
+      if (!options->at(Option::ONLY_SELECT)->getBool() &&
+          options->at(Option::COMPARE_RESULT)->getBool()) {
         working_table = enforce_table;
         table_check = 0;
       }
-      */
       working_table->lock_table_mutex(thd->ddl_query);
       table.found_name = working_table->name_;
 
@@ -254,16 +253,15 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
     sql = std::regex_replace(sql, std::regex(randString),
                              std::to_string(rand_int(100)));
   }
+
   sql = std::regex_replace(sql, std::regex("RAND_INT"),
                            std::to_string(rand_int(100)));
 
   if (options->at(Option::COMPARE_RESULT)->getBool()) {
     enforce_table->Compare_between_engine(sql, thd);
-  } else {
-    if (!execute_sql(sql, thd, true)) {
-      // print_and_log("Grammar SQL failed " + sql, thd, true);
-    }
+    return;
   }
+  execute_sql(sql, thd);
 }
 
 /* create,alter,drop undo tablespace */
@@ -304,9 +302,11 @@ static void AddTable(Thd1 *thd) {
   Table *table = nullptr;
   std::unique_lock<std::mutex> lock(all_table_mutex);
   int table_id = rand_int(options->at(Option::TABLES)->getInt(), 1);
-  if (!options->at(Option::NO_FK)->getBool() &&
-      options->at(Option::FK_PROB)->getInt() > rand_int(100)) {
+  if (options->at(Option::FK_PROB)->getInt() > rand_int(100)) {
     table = Table::table_id(Table::FK, table_id, true);
+  } else if (options->at(Option::ONLY_PARTITION)->getBool() ||
+             options->at(Option::PARTITION_PROB)->getInt() > rand_int(100)) {
+    table = Table::table_id(Table::PARTITION, table_id, true);
   } else {
     table = Table::table_id(Table::NORMAL, table_id, true);
   }
@@ -352,7 +352,6 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
     }
   }
 
-  ddl_query = options->at(option)->ddl == true ? true : false;
 
   if (thread_id != 1 && options->at(Option::SINGLE_THREAD_DDL)->getBool() &&
       ddl_query == true)
@@ -378,28 +377,19 @@ static Table *pick_table(Table::TABLE_TYPES type, int id) {
   return nullptr;
 }
 
-static std::string checksum(const std::string &table, Thd1 *thd) {
-  std::string sql = "CHECKSUM TABLE " + table;
-  execute_sql(sql, thd);
-  auto row = mysql_fetch_row_safe(thd);
-  if (row && mysql_num_fields_safe(thd, 2))
-    return row[1];
-  return "";
-}
-
 bool Thd1::run_some_query() {
   // save current time in a variable so we have print time it took to execute
-
   /* set seed for current thread */
   rng = std::mt19937(set_seed(this));
-  thread_log << " value of rand_int(500) " << rand_int(500) << std::endl;
   std::vector<Table::TABLE_TYPES> tableTypes = {Table::NORMAL, Table::FK,
                                                 Table::PARTITION};
   if (options->at(Option::SECONDARY_ENGINE)->getString() != "") {
     execute_sql("SET SESSION sql_generate_invisible_primary_key = TRUE", this);
     execute_sql("SET SESSION sql_generate_invisible_unique_key = TRUE", this);
   }
+#ifdef USE_MYSQL
   execute_sql("USE " + options->at(Option::DATABASE)->getString(), this);
+#endif
 
   /* first create temporary tables metadata if requried */
   int temp_tables;
@@ -432,16 +422,11 @@ bool Thd1::run_some_query() {
       for (const auto &tableType : tableTypes) {
         auto table = pick_table(tableType, starting_index);
         if (table == nullptr) {
-          thread_log << "Table with index " << starting_index << " not found"
-                     << std::endl;
           continue;
         }
         if (!table->load(this)) {
           return false;
         }
-        thread_log << " checksum " + table->name_ + " " +
-                          checksum(table->name_, this)
-                   << std::endl;
       }
       thread_log << "Thread " << thread_id << " finished processing table "
                  << starting_index << std::endl;
@@ -469,7 +454,7 @@ bool Thd1::run_some_query() {
     }
   }
   /* table initial data is created, empty the unique_keys */
-  this->unique_keys.resize(0);
+  unique_keys.resize(0);
 
   if (options->at(Option::JUST_LOAD_DDL)->getBool() ||
       options->at(Option::PREPARE)->getBool())
@@ -477,12 +462,11 @@ bool Thd1::run_some_query() {
 
   /*Print once on screen and in general logs */
   if (!lock_stream.test_and_set()) {
-    print_and_log(
-        "Starting load in " +
-            std::to_string(options->at(Option::THREADS)->getInt()) +
-            " threads. GTID " +
-            mysql_read_single_value("select @@global.gtid_executed", this),
-        this);
+    print_and_log("Starting load in " +
+                      std::to_string(options->at(Option::THREADS)->getInt()) +
+                      " threads. GTID " +
+                      db->get_single_value("select @@global.gtid_executed"),
+                  this);
   }
 
   if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
@@ -500,7 +484,6 @@ bool Thd1::run_some_query() {
 
   static auto savepoint_prob = options->at(Option::SAVEPOINT_PRB_K)->getInt();
 
-  int trx_left = 0;
   int current_save_point = 0;
   if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
     execute_sql(" SET @@SESSION.USE_SECONDARY_ENGINE=FORCED ", this);
@@ -510,12 +493,15 @@ bool Thd1::run_some_query() {
   // save the start time in a variable so in every N seconds we print the number
   // of transaction processed
   auto start_time_for_print = std::chrono::system_clock::now();
-  while (std::chrono::system_clock::now() < end) {
+  while (sec > 0 && (std::chrono::system_clock::now() < end ||
+                     options->at(Option::TOTAL_QUERIES)->getInt() > 0)) {
     auto option = pick_some_option();
 
+    ddl_query = options->at(option)->ddl == true ? true : false;
     if (is_query_blocked(this, option)) {
       continue;
     }
+
 
     /* check if we need to make sql as part of existing or new trx */
     if (trx_left > 0) {
@@ -560,15 +546,19 @@ bool Thd1::run_some_query() {
     if (trx_left == 0) {
       if (rand_int(1000) < options->at(Option::TRANSATION_PRB_K)->getInt()) {
         execute_sql("START TRANSACTION", this);
-        trx_left =
-            rand_int(options->at(Option::TRANSACTIONS_SIZE)->getInt(), 1);
         trx = NON_XA;
+        trx_left =
+            options->at(Option::EXTACT_TRANSACTION_SIZE)->getBool()
+                ? options->at(Option::TRANSACTIONS_SIZE)->getInt()
+                : rand_int(options->at(Option::TRANSACTIONS_SIZE)->getInt(), 1);
       } else if (rand_int(1000) <
                  options->at(Option::XA_TRANSACTION)->getInt()) {
         execute_sql("XA START " + get_xid(), this);
-        trx_left =
-            rand_int(options->at(Option::TRANSACTIONS_SIZE)->getInt(), 1);
         trx = XA;
+        trx_left =
+            options->at(Option::EXTACT_TRANSACTION_SIZE)->getBool()
+                ? options->at(Option::TRANSACTIONS_SIZE)->getInt()
+                : rand_int(options->at(Option::TRANSACTIONS_SIZE)->getInt(), 1);
       }
     }
 
@@ -668,6 +658,9 @@ bool Thd1::run_some_query() {
     case Option::UPDATE_ROW_USING_PKEY:
       table->UpdateRandomROW(this);
       break;
+    case Option::REPLACE_ROW:
+      table->Replace(this);
+      break;
     case Option::CALL_FUNCTION:
       table->CreateFunction(this);
       break;
@@ -744,7 +737,6 @@ bool Thd1::run_some_query() {
       break;
     }
 
-    options->at(option)->total_queries++;
 
     /* sql executed is at 0 index, and if successful at 1 */
     opt_feq[option][0]++;
@@ -775,6 +767,15 @@ bool Thd1::run_some_query() {
         std::cout << std::endl;
         start_time_for_print = std::chrono::system_clock::now();
       }
+    }
+    options->at(option)->total_queries++;
+
+    if (options->at(Option::TOTAL_QUERIES)->getInt() > 0 &&
+        options->at(option)->total_queries >=
+            (size_t)options->at(Option::TOTAL_QUERIES)->getInt()) {
+      thread_log << "Total queries reached for " << options->at(option)->help
+                 << std::endl;
+      break;
     }
 
     if (run_query_failed) {
