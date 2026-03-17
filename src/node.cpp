@@ -7,7 +7,6 @@
 
 std::mutex node_mutex;
 Node::Node() {
-  workers.clear();
   performed_queries_total = 0;
   failed_queries_total = 0;
 }
@@ -16,42 +15,14 @@ void Node::end_node() {
   writeFinalReport();
   if (general_log)
     general_log.close();
-  if (options->at(Option::PQUERY)->getBool() && querylist)
-    delete querylist;
-}
-
-/* create the logdir if does not exist
-@return false on error, true on success */
-
-static bool create_log_dir() {
-  std::string logdir_path(opt_string(LOGDIR));
-  struct stat st;
-  if (stat(logdir_path.c_str(), &st) != 0) {
-    if (mkdir(logdir_path.c_str(), 0755) == -1)
-      return false;
-  }
-  return true;
 }
 
 bool Node::createGeneralLog() {
-  std::string logName;
-  logName = myParams.logdir + "/" + myParams.myName + "_ddl_step_" +
-            std::to_string(options->at(Option::STEP)->getInt()) + ".log";
-  bool is_success = create_log_dir();
-  if (!is_success) {
-    std::cerr << "Could not create log dir: " << strerror(errno) << std::endl;
-    return false;
-  }
-  general_log.open(logName, std::ios::out | std::ios::trunc);
-  general_log << "- PStress v" << PQVERSION << "-" << PQREVISION
-              << " compiled with " << FORK << "-" << mysql_get_client_info()
-              << std::endl;
-
-  if (!general_log.is_open()) {
-    std::cout << "Unable to open log file " << logName << ": "
-              << std::strerror(errno) << std::endl;
-    return false;
-  }
+  std::string file_name;
+  file_name = myParams.myName + "_" +
+              options->at(Option::DATABASE)->getString() + "_general_step_" +
+              std::to_string(options->at(Option::STEP)->getInt()) + ".log";
+  setupClientOutputLog(general_log, myParams.logdir, file_name);
   return true;
 }
 
@@ -85,49 +56,29 @@ int Node::startWork() {
   general_log << "- Connecting to " << myParams.myName << " [" << connectionInfo
               << "]..." << std::endl;
 
-  tryConnect();
-
-  if (options->at(Option::PQUERY)->getBool()) {
-    std::ifstream sqlfile_in;
-    sqlfile_in.open(myParams.infile);
-
-    if (!sqlfile_in.is_open()) {
-      std::cerr << "Unable to open SQL file " << myParams.infile << ": "
-                << strerror(errno) << std::endl;
-      general_log << "Unable to open SQL file " << myParams.infile << ": "
-                  << strerror(errno) << std::endl;
-      return EXIT_FAILURE;
-    }
-    querylist = new std::vector<std::string>;
-    std::string line;
-
-    while (getline(sqlfile_in, line)) {
-      if (!line.empty()) {
-        querylist->push_back(line);
-      }
-    }
-
-    sqlfile_in.close();
-    general_log << "- Read " << querylist->size() << " lines from "
-                << myParams.infile << std::endl;
-
-    /* log replaying */
-    if (options->at(Option::NO_SHUFFLE)->getBool()) {
-      myParams.threads = 1;
-      myParams.queries_per_thread = querylist->size();
-    }
-  }
   /* END log replaying */
-  workers.resize(myParams.threads);
-  static int thread_id = 0;
+  std::vector<std::thread> workers;
   auto start = std::chrono::system_clock::now();
-
-  for (int i = 0; i < myParams.threads; i++) {
-    workers[i] = std::thread(&Node::workerThread, this, thread_id++);
+  try {
+    for (int i = 0; i < myParams.threads; ++i) {
+      // Assuming thread_id starts at 0 unless otherwise specified
+      workers.emplace_back(&Node::workerThread, this, i);
+      // sleep for 10 milliseconds
+    }
+  } catch (const std::system_error &e) {
+    // Handle thread creation failure
+    std::cerr << "Thread creation failed: " << e.what() << std::endl;
+    for (auto &t : workers) {
+      if (t.joinable())
+        t.join(); // Join any threads that were created
+    }
+    throw; // Re-throw or handle the exception further up the call stack
   }
 
-  for (int i = 0; i < myParams.threads; i++) {
-    workers[i].join();
+  // Join all threads
+  for (auto &t : workers) {
+    if (t.joinable())
+      t.join();
   }
   std::cout << "Time taken by pstress is " +
                    std::to_string(
@@ -139,65 +90,28 @@ int Node::startWork() {
 
   return EXIT_SUCCESS;
 }
+void setupClientOutputLog(std::ofstream &log_file, std::string_view logdir,
+                          std::string_view filename) {
 
-void Node::tryConnect() {
-  node_mutex.lock();
-  MYSQL *conn;
-  conn = mysql_init(NULL);
-  if (conn == NULL) {
-    std::cerr << "Error " << mysql_errno(conn) << ": " << mysql_error(conn)
-              << std::endl;
-    std::cerr << "* PSTRESS: Unable to continue [1], exiting" << std::endl;
-    general_log << "Error " << mysql_errno(conn) << ": " << mysql_error(conn)
-                << std::endl;
-    general_log << "* PSTRESS: Unable to continue [1], exiting" << std::endl;
-    mysql_close(conn);
-    mysql_library_end();
-    exit(EXIT_FAILURE);
-  }
-  if (mysql_real_connect(conn, myParams.address.c_str(),
-                         myParams.username.c_str(), myParams.password.c_str(),
-                         options->at(Option::DATABASE)->getString().c_str(),
-                         myParams.port, myParams.socket.c_str(), 0) == NULL) {
-    std::cerr << "Error " << mysql_errno(conn) << ": " << mysql_error(conn)
-              << std::endl;
-    std::cerr << "* PSTRESS: Unable to continue [2], exiting" << std::endl;
-    general_log << "Error " << mysql_errno(conn) << ": " << mysql_error(conn)
-                << std::endl;
-    general_log << "* PSTRESS: Unable to continue [2], exiting" << std::endl;
-    mysql_close(conn);
-    mysql_library_end();
-    exit(EXIT_FAILURE);
-  }
-  general_log << "- Connected to " << mysql_get_host_info(conn) << "..."
-              << std::endl;
-  // getting the real server version
-  MYSQL_RES *result = NULL;
-  std::string server_version;
-
-  if (!mysql_query(conn, "select @@version_comment limit 1") &&
-      (result = mysql_use_result(conn))) {
-    MYSQL_ROW row = mysql_fetch_row(result);
-    if (row && row[0]) {
-      server_version = mysql_get_server_info(conn);
-      server_version.append(" ");
-      server_version.append(row[0]);
+  namespace fs = std::filesystem;
+  try {
+    // Ensure log directory exists
+    if (!logdir.empty() && !fs::exists(logdir)) {
+      fs::create_directories(logdir);
     }
-  } else {
-    server_version = mysql_get_server_info(conn);
+
+    // Construct and normalize path
+    fs::path clientPath = fs::path(logdir) / filename;
+    clientPath = fs::absolute(clientPath); // Normalize to absolute path
+
+    // Open the log file
+    log_file.open(clientPath, std::ios::out | std::ios::trunc);
+    if (!log_file.is_open()) {
+      throw std::runtime_error("Unable to open logfile " + clientPath.string() +
+                               ": " + std::strerror(errno));
+    }
+  } catch (const fs::filesystem_error &e) {
+    throw std::runtime_error("Filesystem error for path '" +
+                             std::string(logdir) + "': " + e.what());
   }
-  general_log << "- Connected server version: " << server_version << std::endl;
-  if (strcmp(PLATFORM_ID, "Darwin") == 0)
-    general_log << "- Table compression is disabled as hole punching is not "
-                   "supported on OSX"
-                << std::endl;
-  if (result != NULL) {
-    mysql_free_result(result);
-  }
-  mysql_close(conn);
-  mysql_thread_end();
-  if (options->at(Option::TEST_CONNECTION)->getBool()) {
-    exit(EXIT_SUCCESS);
-  }
-  node_mutex.unlock();
 }

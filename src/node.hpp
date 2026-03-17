@@ -1,12 +1,14 @@
 #ifndef __NODE_HPP__
 #define __NODE_HPP__
 
+#include "DatabaseInterface.hpp"
 #include "pstress.hpp"
 #include "random_test.hpp"
 #include <atomic>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <mysql.h>
+#include <semaphore.h>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -58,6 +60,8 @@ enum LogLevel {
 It represents standalone MySQL server or MySQL node in cluster (PXC) setup
 */
 
+void setupClientOutputLog(std::ofstream &client_log, std::string_view logdir,
+                          std::string_view filename);
 class Node {
 public:
   Node();
@@ -68,17 +72,16 @@ public:
 private:
   // declaration for worker thread function
   void workerThread(int);
-  inline unsigned long long getAffectedRows(MYSQL *);
-  void tryConnect();
   bool createGeneralLog();
   void readSettings(std::string);
   void writeFinalReport();
 
-  std::vector<std::thread> workers;
   std::vector<std::string> *querylist;
   struct workerParams myParams;
   std::ofstream general_log;
   std::atomic<unsigned long long> performed_queries_total;
   std::atomic<unsigned long long> failed_queries_total;
 };
+
+
 #endif
