@@ -11,10 +11,6 @@
 #endif
 #endif
 
-#ifndef FORK
-#define FORK "MySQL"
-#endif
-
 #ifndef PQREVISION
 #define PQREVISION "unknown"
 #endif
@@ -33,10 +29,11 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <variant>
 #include <vector>
 
 struct Option {
-  enum Type { BOOL, INT, STRING } type;
+  enum Type { BOOL, INT, STRING, FLOAT } type;
   enum Opt {
     INITIAL_SEED,
     NUMBER_OF_GENERAL_TABLESPACE,
@@ -88,18 +85,19 @@ struct Option {
     NO_SELECT,
     NO_INSERT,
     NO_UPDATE,
+    NO_REPLACE,
     NO_DELETE,
     ONLY_SELECT,
     SELECT_ALL_ROW,
     SELECT_ROW_USING_PKEY,
     INSERT_RANDOM_ROW,
     UPDATE_ROW_USING_PKEY,
+    REPLACE_ROW,
     UPDATE_ALL_ROWS,
     DELETE_ALL_ROW,
     DELETE_ROW_USING_PKEY,
     INVALID_OPTION = 63,
     LOG_ALL_QUERIES = 'A',
-    PQUERY = 'k',
     DATABASE = 'd',
     ADDRESS = 'a',
     INFILE = 'i',
@@ -124,6 +122,7 @@ struct Option {
     MYSQLD_SERVER_OPTION = 'z',
     TRANSATION_PRB_K,
     TRANSACTIONS_SIZE,
+    EXTACT_TRANSACTION_SIZE,
     COMMIT_PROB,
     SAVEPOINT_PRB_K,
     CHECK_TABLE,
@@ -162,6 +161,7 @@ struct Option {
     OPTION_PROB_FILE,
     NO_TIMESTAMP,
     COMPARE_RESULT,
+    COMPARE_CASE_INSENSTIVE,
     SECONDARY_ENGINE,
     WAIT_FOR_SYNC,
     ALTER_SECONDARY_ENGINE,
@@ -188,10 +188,12 @@ struct Option {
     NO_CHAR,
     NO_VARCHAR,
     NO_FLOAT,
+    NO_DECIMAL,
     NO_DOUBLE,
     NO_BOOL,
     NO_INTEGER,
     NO_INT,
+    NO_ENUM,
     NO_BIT,
     NULL_PROB,
     SECONDARY_AFTER_CREATE,
@@ -201,9 +203,9 @@ struct Option {
     RANDOM_COLUMNS,
     ADD_NEW_TABLE,
     SINGLE_THREAD_DDL,
-    RANDOM_INDEXES,
+    INDEXES_PROB,
     POSITIVE_INT_PROB,
-    PLAIN_REWRITE,
+    SECOND_LEVEL_MERGE,
     USING_PK_PROB,
     SELECT_FOR_UPDATE,
     SELECT_FOR_UPDATE_BULK,
@@ -216,7 +218,7 @@ struct Option {
     THREAD_DOING_ONLY_SELECT,
     NO_JSON,
     RANDOM_TIMEZONE,
-    NO_PKEY_IN_SET,
+    PKEY_IN_SET,
     LOG_PK_BULK_INSERT,
     BULK_INSERT_WIDTH,
     N_LAST_QUERIES,
@@ -225,8 +227,15 @@ struct Option {
     INSERT_BULK_COUNT,
     NON_INT_PK,
     DICTIONARY_FILE,
+    TOTAL_QUERIES,
+    VARCHAR_COLUMN_MAX_WIDTH,
+    COMPOSITE_KEY_PROB,
     MAX
   } option;
+
+  using ValueType = std::variant<bool, long int, std::string, float>;
+  ValueType value;
+
   Option(Type t, Opt o, std::string n)
       : type(t), option(o), name(n), sql(false), ddl(false), total_queries(0),
         success_queries(0), query_in_timespan(0){};
@@ -236,27 +245,105 @@ struct Option {
   Type getType() { return type; };
   Opt getOption() { return option; };
   const char *getName() { return name.c_str(); };
-  bool getBool() { return default_bool; }
-  long int getInt() { return default_int; }
-  std::string getString() { return default_value; }
+  // Getters for specific types
+  bool getBool() {
+    if (std::holds_alternative<bool>(value)) {
+      return std::get<bool>(value);
+    }
+    throw std::runtime_error("Option " + name + " is not a BOOL");
+  }
+
+  long int getInt() {
+    if (std::holds_alternative<long int>(value)) {
+      return std::get<long int>(value);
+    }
+    throw std::runtime_error("Option " + name + " is not an INT");
+  }
   short getArgs() { return args; }
   void setArgs(short s) { args = s; };
+
+  std::string getString() {
+    if (std::holds_alternative<std::string>(value)) {
+      return std::get<std::string>(value);
+    }
+    throw std::runtime_error("Option " + name + " is not a STRING");
+  }
+
+  float getFloat() {
+    if (std::holds_alternative<float>(value)) {
+      return std::get<float>(value);
+    }
+    throw std::runtime_error("Option " + name + " is not a FLOAT");
+  }
+
+  // Setters for specific types
   void setBool(std::string s) {
+    if (type != BOOL) {
+      throw std::runtime_error("Cannot set BOOL for non-BOOL option " + name);
+    }
     std::transform(s.begin(), s.end(), s.begin(), ::toupper);
-    if (s.compare("ON") == 0 || s.compare("TRUE") == 0 || s.compare("1") == 0)
-      default_bool = true;
-    else if (s.compare("OFF") == 0 || s.compare("FALSE") == 0 ||
-             s.compare("0") == 0)
-      default_bool = false;
-    else {
-      // todo throw some execption
+    if (s == "ON" || s == "TRUE" || s == "1") {
+      value = true;
+    } else if (s == "OFF" || s == "FALSE" || s == "0") {
+      value = false;
+    } else {
+      throw std::runtime_error("Invalid boolean value for option " + name +
+                               ": " + s);
     }
   }
 
-  void setBool(bool in) { default_bool = in; }
-  void setInt(std::string n) { default_int = std::stol(n); }
-  void setInt(int n) { default_int = n; }
-  void setString(std::string n) { default_value = n; };
+  void setBool(bool b) {
+    if (type != BOOL) {
+      throw std::runtime_error("Cannot set BOOL for non-BOOL option " + name);
+    }
+    value = b;
+  }
+
+  void setInt(std::string n) {
+    if (type != INT) {
+      throw std::runtime_error("Cannot set INT for non-INT option " + name);
+    }
+    try {
+      value = std::stol(n);
+    } catch (const std::exception &e) {
+      throw std::runtime_error("Invalid integer value for option " + name +
+                               ": " + n);
+    }
+  }
+
+  void setInt(long int n) {
+    if (type != INT) {
+      throw std::runtime_error("Cannot set INT for non-INT option " + name);
+    }
+    value = n;
+  }
+
+  void setString(std::string n) {
+    if (type != STRING) {
+      throw std::runtime_error("Cannot set STRING for non-STRING option " +
+                               name);
+    }
+    value = n;
+  }
+
+  void setFloat(std::string n) {
+    if (type != FLOAT) {
+      throw std::runtime_error("Cannot set FLOAT for non-FLOAT option " + name);
+    }
+    try {
+      value = std::stof(n);
+    } catch (const std::exception &e) {
+      throw std::runtime_error("Invalid float value for option " + name + ": " +
+                               n);
+    }
+  }
+
+  void setFloat(float f) {
+    if (type != FLOAT) {
+      throw std::runtime_error("Cannot set FLOAT for non-FLOAT option " + name);
+    }
+    value = f;
+  }
   void setSQL() { sql = true; };
   void setDDL() { ddl = true; };
   void set_cl() { cl = true; }

@@ -60,14 +60,6 @@ void add_options() {
   options->resize(Option::MAX);
   Option *opt;
 
-  /* Mode of Pstress */
-  opt = newOption(Option::BOOL, Option::PQUERY, "pquery");
-  opt->help = "run pstress as pquery 2.0. sqls will be executed from --infine "
-              "in some order based on shuffle. basically it will run in pquery "
-              "mode you can also use -k";
-  opt->setBool(false); // todo disable in release
-  opt->setArgs(no_argument);
-
   /* Intial Seed for test */
   opt = newOption(Option::INT, Option::INITIAL_SEED, "seed");
   opt->help = "Initial seed used for the test";
@@ -82,13 +74,13 @@ void add_options() {
   /* Number of Undo tablespaces */
   opt = newOption(Option::INT, Option::NUMBER_OF_UNDO_TABLESPACE,
                   "undo-tbs-count");
-  opt->setInt("3");
+  opt->setInt(0);
   opt->help = "Number of default undo tablespaces ";
 
   /* Engine */
   opt = newOption(Option::STRING, Option::ENGINE, "engine");
   opt->help = "Engine used ";
-  opt->setString("INNODB");
+  opt->setString(strcmp(FORK, "MySQL") == 0 ? "INNODB" : "");
 
   /* Just Load DDL*/
   opt = newOption(Option::BOOL, Option::JUST_LOAD_DDL, "jlddl");
@@ -160,7 +152,7 @@ void add_options() {
   opt = newOption(Option::STRING, Option::FUNCTION_CONTAINS_DML,
                   "function-contains-dml");
   opt->help =
-      "Function contains DML. It tels what type of  SQL FUNCTION CONTAINS"
+      "Function contains DML. It tells what type of  SQL FUNCTION CONTAINS"
       "--function-contains-dml=update,delete,insert. Even order matters. for "
       "example if it insert,update then it would first insert and then update "
       "or";
@@ -182,15 +174,21 @@ void add_options() {
   opt->setBool(false);
   opt->setArgs(no_argument);
 
-  opt = newOption(Option::BOOL, Option::RANDOM_INDEXES, "random-indexes");
-  opt->help = "Use random number of indexes for each table ";
-  opt->setBool(false);
-  opt->setArgs(no_argument);
+  opt = newOption(Option::INT, Option::INDEXES_PROB, "index-prob");
+  opt->help = "Probability a table would have index";
+  opt->setInt(10);
 
   opt = newOption(Option::INT, Option::POSITIVE_INT_PROB, "positive-prob");
   opt->help =
       "Probablity of using positive interger for random value in a int column";
   opt->setInt(70);
+
+  opt =
+      newOption(Option::INT, Option::COMPOSITE_KEY_PROB, "composite-key-prob");
+  opt->help = "Probablity of using a composite key in primary key. Then "
+              "enforcing column would be ipkey or vpkey. But other key are "
+              "added just part of primary key ";
+  opt->setInt(1);
 
   opt = newOption(Option::INT, Option::CALL_FUNCTION, "call-function-prob");
   opt->help = "Probability of calling function ";
@@ -261,7 +259,7 @@ void add_options() {
   /* use session random timezone */
   opt = newOption(Option::INT, Option::RANDOM_TIMEZONE, "timezone-session");
   opt->help = "Use random timezone for each session";
-  opt->setInt(1);
+  opt->setInt(0);
   opt->short_help = "Timezone";
   opt->setSQL();
 
@@ -283,8 +281,8 @@ void add_options() {
 
   /* Number of indexes in a table */
   opt = newOption(Option::INT, Option::INDEXES, "indexes");
-  opt->help = "maximum indexes in a table,default depends on page-size as well";
-  opt->setInt(7);
+  opt->help = "Maximum indexes in a table,default depends on page-size as well";
+  opt->setInt(1);
 
   /* Process option prob file */
   opt = newOption(Option::STRING, Option::OPTION_PROB_FILE, "option-prob-file");
@@ -295,6 +293,11 @@ void add_options() {
 
   opt = newOption(Option::BOOL, Option::NO_TIMESTAMP, "no-timestamp");
   opt->help = "Disable timestamp";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  opt = newOption(Option::BOOL, Option::COMPARE_CASE_INSENSTIVE, "compare-ci");
+  opt->help = "for compare use case insensitive";
   opt->setBool(false);
   opt->setArgs(no_argument);
 
@@ -322,6 +325,7 @@ void add_options() {
 
   opt = newOption(Option::STRING, Option::SECONDARY_ENGINE, "secondary-engine");
   opt->help = "Use secondary engine for some tables";
+  opt->setString("");
 
   /* algorithm for alter */
   opt = newOption(Option::STRING, Option::ALGORITHM, "alter-algorithm");
@@ -416,7 +420,7 @@ void add_options() {
   opt->setInt(50);
 
   opt = newOption(Option::INT, Option::PARTITION_PROB, "partition-prob");
-  opt->help = "Probability of parititon tables";
+  opt->help = "Probability of partition tables";
   opt->setInt(10);
 
   /* Ratio of temporary table to normal table */
@@ -433,11 +437,10 @@ void add_options() {
       "also pass 10K, 1M  ";
   opt->setString("1K");
 
-  /* plain rewrite */
-  opt = newOption(Option::BOOL, Option::PLAIN_REWRITE, "plain-rewrite");
-  opt->help = "Execute rewrite without passing any option";
-  opt->setBool(false);
-  opt->setArgs(no_argument);
+  opt =
+      newOption(Option::INT, Option::SECOND_LEVEL_MERGE, "second-level-merge");
+  opt->help = "Probability of executing second level merges";
+  opt->setInt(50);
 
   opt =
       newOption(Option::BOOL, Option::LOG_PK_BULK_INSERT, "log-bulk-insert-pk");
@@ -467,7 +470,7 @@ void add_options() {
   /* primary key probability */
   opt = newOption(Option::INT, Option::PRIMARY_KEY, "pk-prob");
   opt->help = "Probability of adding primary key in a table";
-  opt->setInt(50);
+  opt->setInt(95);
 
   /*Encrypt table */
   opt = newOption(Option::INT, Option::ALTER_TABLE_ENCRYPTION,
@@ -481,7 +484,7 @@ void add_options() {
   opt = newOption(Option::INT, Option::BULK_INSERT_WIDTH, "bulk-insert-width");
   opt->help = "The maximum width of each insert in bulk insert default is " +
               std::to_string(1024 * 1024);
-  opt->setInt(1024 * 1024);
+  opt->setInt(4024 * 1024);
 
   /* ENFORCE REWRITE  */
   opt = newOption(Option::INT, Option::ENFORCE_MERGE, "enforce-merge-prob");
@@ -563,22 +566,36 @@ void add_options() {
   opt->setDDL();
 
   /* probability of null value in a column */
-  opt = newOption(Option::INT, Option::NULL_PROB, "null-prob-k");
+  opt = newOption(Option::INT, Option::NULL_PROB, "null-prob");
   opt->help = "Probability that a column would have null value. It is used for "
-              "update, insert, delete and also in where clause";
+              "insert, update, delete and also in where clause";
   opt->setInt(1);
 
-  /* probability of null  columns */
-  opt = newOption(Option::INT, Option::UNIQUE_RANGE, "range");
-  opt->help = "range for random number int, integers, floats and double.  more "
-              "the value. Default to 100. If target is success insert the "
-              "choose a high value. If it is update/delete choose low value  ";
-  opt->setInt(100);
+  opt = newOption(Option::FLOAT, Option::UNIQUE_RANGE, "range");
+  opt->help = "Sets the range for random number generation (integers, floats, "
+              "doubles). "
+              "A larger range increases randomness. For example, with 100 "
+              "records and a range of 100, "
+              "pstress generates values between -10,000 and +10,000 for int, "
+              "float, and decimal columns. "
+              "If the range is 0.1, values are generated between -10 and +10.";
+  opt->setFloat(100.0);
 
   /* dictionary file */
   opt = newOption(Option::STRING, Option::DICTIONARY_FILE, "dictionary-file");
   opt->help = "Dictionary file for random string";
   opt->setString("english_dictionary.txt");
+
+  /* total number of queries */
+  opt = newOption(Option::INT, Option::TOTAL_QUERIES, "total-queries");
+  opt->help = "Total number of queries to be executed";
+  opt->setInt(0);
+
+  /* maximum width of varchar column */
+  opt = newOption(Option::INT, Option::VARCHAR_COLUMN_MAX_WIDTH,
+                  "varchar-column-max-width");
+  opt->help = "Maximum width of varchar column";
+  opt->setInt(30);
 
   /* disable text columns*/
   opt = newOption(Option::BOOL, Option::NO_TEXT, "no-text");
@@ -599,17 +616,16 @@ void add_options() {
   opt->short_help = "AlterColumnSecondary";
   opt->setDDL();
 
-  /* probability of modifying columns with/without NOT SECONDARY clause" */
+  /* probability of modifying columns using primary key in where clause" */
   opt = newOption(Option::INT, Option::USING_PK_PROB, "using-pkey");
   opt->help = "Probability of using pk column in where clause. if table does "
               "not pk column then first column of index. and if it does not "
               "have index then any random column";
-  opt->setInt(50);
+  opt->setInt(90);
 
-  opt = newOption(Option::BOOL, Option::NO_PKEY_IN_SET, "no-pk-in-set");
-  opt->help = "Do not use ipkey column in update tt_N set col=";
-  opt->setBool(false);
-  opt->setArgs(no_argument);
+  opt = newOption(Option::INT, Option::PKEY_IN_SET, "pk-in-set");
+  opt->help = "USE PKEY IN SET tt_N set col=";
+  opt->setInt(1);
 
   /* disable char columns*/
   opt = newOption(Option::BOOL, Option::NO_CHAR, "no-char");
@@ -620,6 +636,12 @@ void add_options() {
   /* disable VARCHAR columns*/
   opt = newOption(Option::BOOL, Option::NO_VARCHAR, "no-varchar");
   opt->help = "Disable varchar columns";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  /* disable DEICMAL columns*/
+  opt = newOption(Option::BOOL, Option::NO_DECIMAL, "no-decimal");
+  opt->help = "Disable decimal columns";
   opt->setBool(false);
   opt->setArgs(no_argument);
 
@@ -644,6 +666,12 @@ void add_options() {
   /* disable integer columns*/
   opt = newOption(Option::BOOL, Option::NO_INTEGER, "no-integer");
   opt->help = "Disable integer columns";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  /* diable enum columns*/
+  opt = newOption(Option::BOOL, Option::NO_ENUM, "no-enum");
+  opt->help = "Disable enum columns";
   opt->setBool(false);
   opt->setArgs(no_argument);
 
@@ -679,7 +707,7 @@ void add_options() {
       "combination key block size will be used. \n uncompressed: do not use "
       "compressed row_format, i.e. key block size will not used. \n"
       "none: do not use any encryption";
-  opt->setString("all");
+  opt->setString("none");
 
   /* MySQL server option */
   opt = newOption(Option::STRING, Option::MYSQLD_SERVER_OPTION, "mso");
@@ -688,6 +716,7 @@ void add_options() {
       "--set-variable. n:option=v1=v2 where n is probabality of picking "
       "option, v1 and v2 different value that is supported. "
       "for e.g. --md=20:innodb_temp_tablespace_encrypt=on=off";
+  opt->setString("");
 
   opt = newOption(Option::STRING, Option::SERVER_OPTION_FILE, "sof");
   opt->help =
@@ -697,6 +726,7 @@ void add_options() {
       "session.\n see --set-variable.\n File should contain lines like\n "
       "20:innodb_temp_tablespace_encrypt=on=off\n, means 20% chances "
       "that it would be processed. ";
+  opt->setString("");
 
   /* Set Global */
   opt = newOption(Option::INT, Option::SET_GLOBAL_VARIABLE, "set-variable");
@@ -827,6 +857,11 @@ void add_options() {
   opt->setBool(false);
   opt->setArgs(no_argument);
 
+  opt = newOption(Option::BOOL, Option::NO_REPLACE, "no-replace");
+  opt->help = "do not execute REPLACE into tables";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
   /* UPDATE */
   opt = newOption(Option::BOOL, Option::NO_UPDATE, "no-update");
   opt->help = "do not execute any type of update on tables";
@@ -887,7 +922,7 @@ void add_options() {
 
   opt = newOption(Option::INT, Option::PK_COLUMN_AUTOINC, "pk-auto-inc-prob");
   opt->help = "Probability of primary key column being auto increment";
-  opt->setInt(75);
+  opt->setInt(10);
 
   opt = newOption(Option::INT, Option::INSERT_BULK_COUNT, "insert-bulk-count");
   opt->help = "Number of rows to insert in a single insert statement";
@@ -910,6 +945,12 @@ void add_options() {
   opt->help = "Update using where clause";
   opt->setInt(200);
   opt->short_help = "UP";
+  opt->setSQL();
+
+  opt = newOption(Option::INT, Option::REPLACE_ROW, "replace-row");
+  opt->help = "execute REPLACE INTO TABLE ";
+  opt->setInt(10);
+  opt->short_help = "Replace INTO ";
   opt->setSQL();
 
   opt = newOption(Option::INT, Option::UPDATE_ALL_ROWS, "update-bulk");
@@ -993,7 +1034,7 @@ void add_options() {
   opt = newOption(Option::INT, Option::CHECK_TABLE, "check");
   opt->help = "check table, for partition table randomly check either "
               "partition or full table";
-  opt->setInt(1);
+  opt->setInt(0);
   opt->setSQL();
   opt->short_help = "Check";
   opt->setDDL();
@@ -1061,6 +1102,7 @@ void add_options() {
   /* Address */
   opt = newOption(Option::STRING, Option::ADDRESS, "address");
   opt->help = "IP address to connect to";
+  opt->setString("");
 
   /* Infile */
   opt = newOption(Option::STRING, Option::INFILE, "infile");
@@ -1075,6 +1117,7 @@ void add_options() {
   /* Socket */
   opt = newOption(Option::STRING, Option::SOCKET, "socket");
   opt->help = "Socket file to use";
+  opt->setString("");
 
   {
     /* grep from env */
@@ -1088,6 +1131,7 @@ void add_options() {
   /*config file */
   opt = newOption(Option::STRING, Option::CONFIGFILE, "config-file");
   opt->help = "Config file to use for test";
+  opt->setString("");
 
   /*Port */
   opt = newOption(Option::STRING, Option::PORT, "port");
@@ -1106,6 +1150,7 @@ void add_options() {
   opt = newOption(Option::BOOL, Option::HELP, "help");
   opt->help = "user asked for help";
   opt->setArgs(optional_argument);
+  opt->setBool(false);
 
   opt = newOption(Option::BOOL, Option::VERBOSE, "verbose");
   opt->help = "verbose";
@@ -1193,7 +1238,7 @@ void add_options() {
   /* transaction probability */
   opt = newOption(Option::INT, Option::TRANSATION_PRB_K, "trx-prob-k");
   opt->help = "probability(out of 1000) of combining sql as single trx";
-  opt->setInt(1);
+  opt->setInt(0);
 
   /* XA TRansaction */
   opt = newOption(Option::INT, Option::XA_TRANSACTION, "xa-trx-prob-k");
@@ -1213,6 +1258,12 @@ void add_options() {
   opt = newOption(Option::INT, Option::TRANSACTIONS_SIZE, "trx-size");
   opt->help = "average size of each trx";
   opt->setInt(10);
+
+  opt = newOption(Option::BOOL, Option::EXTACT_TRANSACTION_SIZE,
+                  "exact-trx-size");
+  opt->help = "exact transaction size";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
 
   /* probability of executing commit */
   opt = newOption(Option::INT, Option::COMMIT_PROB, "commit-prob");
@@ -1234,6 +1285,7 @@ void add_options() {
   /* metadata file path */
   opt = newOption(Option::STRING, Option::METADATA_PATH, "metadata-path");
   opt->help = "path of metadata file";
+  opt->setString("");
 
   /* sql format for */
   opt = newOption(Option::INT, Option::GRAMMAR_SQL, "grammar-sql");
@@ -1267,6 +1319,9 @@ void Option::print_pretty() {
     break;
   case BOOL:
     std::cout << ": " << getBool() << std::endl;
+    break;
+  case FLOAT:
+    std::cout << ": " << getFloat() << std::endl;
   }
   std::cout << std::endl;
 }
@@ -1299,11 +1354,11 @@ void show_help(Option::Opt option) {
 
 void print_version(void) {
   std::cout << " - PStress v" << PQVERSION << "-" << PQREVISION
-            << " compiled with " << FORK << "-" << mysql_get_client_info()
-            << std::endl;
+            << " compiled with " << FORK << std::endl;
 }
 
 void show_help(std::string help) {
+  print_version();
   if (help.compare("verbose") == 0) {
 
     for (auto &op : *options) {
@@ -1327,7 +1382,7 @@ void show_help() {
   std::cout << " - For complete help use => pstress  --help --verbose"
             << std::endl;
   std::cout << " - For help on any option => pstress --help=OPTION e.g. \n "
-               "            pstress --help=ddl"
+               "            pstress --help=no-ddl"
             << std::endl;
 }
 

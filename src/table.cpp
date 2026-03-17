@@ -1,5 +1,7 @@
 #include "random_test.hpp"
+#include <array>
 #include <document.h>
+#include <malloc.h>
 extern std::mutex all_table_mutex;
 extern std::vector<Table *> *all_tables;
 extern int number_of_records;
@@ -15,31 +17,76 @@ static int table_initial_record(std::string name) {
   assert(false);
   return 0;
 }
+template <typename Container>
+static void log_pk_insert(Thd1 *thd, const std::string &name_,
+                          const Container &pk_insert) {
+  if (pk_insert.empty()) {
+    return;
+  }
+
+  thd->thread_log << "Primary key inserted: " << name_ << ' ';
+  for (const auto &pk : pk_insert) {
+    thd->thread_log << pk << ' ';
+  }
+  thd->thread_log << '\n';
+}
 
 bool Table::InsertBulkRecord(Thd1 *thd) {
-  bool is_list_partition = false;
-
-  // if parent has no records, child can't have records
-  if (type == FK) {
-    std::string parent = name_.substr(0, name_.length() - 3);
-    if (table_initial_record(parent) == 0)
-      number_of_initial_records = 0;
-  }
+  assert(number_of_initial_records <=
+         (options->at(Option::UNIQUE_RANGE)->getFloat() * number_of_records));
 
   if (number_of_initial_records == 0)
     return true;
 
-  std::string prepare_sql = "INSERT IGNORE ";
-
-  std::vector<int> fk_unique_keys;
-
-  /* If a table has FK move its parent keys in fk_unique_keys */
+  long int parent_initial_record = 0;
+  std::vector<long int> fk_parent_unique_keys;
+  /* If a table has fk move its parent keys in fk_parent_unique_keys */
   if (type == TABLE_TYPES::FK) {
-    fk_unique_keys = std::move(thd->unique_keys);
+    std::string parent = name_.substr(0, name_.length() - 3);
+    parent_initial_record = table_initial_record(parent);
+    if (parent_initial_record == 0) {
+      number_of_initial_records = 0;
+      return true;
+    }
+    /* parent table must have been populated with autoinc values */
+    if (thd->unique_keys.size() == 0) {
+      fk_parent_unique_keys.resize(parent_initial_record);
+      std::iota(fk_parent_unique_keys.begin(), fk_parent_unique_keys.end(), 1);
+    } else {
+      fk_parent_unique_keys = std::move(thd->unique_keys);
+    }
   }
-  if (has_int_pk()) {
-    thd->unique_keys = generateUniqueRandomNumbers(number_of_initial_records);
+
+  thd->unique_keys.clear();
+
+  if (has_pk()) {
+    bool is_auto_increment = false;
+    if (has_int_pk()) {
+      for (const auto &col : *columns_) {
+        if (col->primary_key && col->auto_increment) {
+          is_auto_increment = true;
+          break;
+        }
+      }
+    }
+    if (!is_auto_increment) {
+      thd->unique_keys = generateUniqueRandomNumbers(number_of_initial_records);
+
+      print_and_log("Generated " + toHumanReadable(thd->unique_keys.size()) +
+                        " unique number for " + name_,
+                    thd, false, false);
+
+      // sort key based on type
+      if (has_int_pk())
+        std::sort(thd->unique_keys.begin(), thd->unique_keys.end());
+      else
+        std::sort(thd->unique_keys.begin(), thd->unique_keys.end(),
+                  [](const long int &a, const long int &b) {
+                    return std::to_string(a) < std::to_string(b);
+                  });
+    }
   }
+
   auto column_has_unique_key = [this](Column *col) {
     for (auto &index : *indexes_) {
       if (index->unique) {
@@ -53,25 +100,26 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
     return false;
   };
 
-  std::map<std::string, std::vector<int>> unique_keys;
+  std::map<std::string, std::vector<long int>> unique_keys;
 
-  auto generate_random_fk_keys_with_unique_column = [thd, this]() {
+  auto generate_random_fk_keys_with_unique_column = [fk_parent_unique_keys,
+                                                     this]() {
     /* generate unique keys for FK column which picks unique value from parent
      * table */
-    std::unordered_set<int> unique_keys_set(number_of_initial_records);
+    std::unordered_set<long int> unique_keys_set(number_of_initial_records);
 
-    if (thd->unique_keys.size() ==
+    if (fk_parent_unique_keys.size() ==
         static_cast<size_t>(number_of_initial_records))
-      return thd->unique_keys;
+      return fk_parent_unique_keys;
 
     /* populate unique_keys_set with unique keys */
     while (unique_keys_set.size() <
            static_cast<size_t>(number_of_initial_records)) {
       unique_keys_set.insert(
-          thd->unique_keys.at(rand_int(number_of_initial_records)));
+          fk_parent_unique_keys.at(rand_int(fk_parent_unique_keys.size() - 1)));
     }
-    std::vector<int> unique_keys(unique_keys_set.begin(),
-                                 unique_keys_set.end());
+    std::vector<long int> unique_keys(unique_keys_set.begin(),
+                                      unique_keys_set.end());
     return unique_keys;
   };
 
@@ -80,10 +128,11 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
       continue;
     if (column_has_unique_key(column)) {
       if (column->name_ == "fk_col") {
+
         number_of_initial_records =
-            thd->unique_keys.size() <
+            fk_parent_unique_keys.size() <
                     static_cast<size_t>(number_of_initial_records)
-                ? thd->unique_keys.size()
+                ? fk_parent_unique_keys.size()
                 : number_of_initial_records;
         unique_keys[column->name_] =
             generate_random_fk_keys_with_unique_column();
@@ -93,17 +142,12 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
       }
     }
   }
+  // to reduce space of map using in generateUniqueRandomNumbers
+  malloc_trim(0);
 
-  /* ignore error in the case parition list  */
-  if (type == PARTITION &&
-      static_cast<Partition *>(this)->part_type == Partition::LIST) {
-    is_list_partition = true;
-  }
-
+  std::string prepare_sql = "INSERT ";
   prepare_sql += "INTO " + name_ + " (";
 
-  assert(number_of_initial_records <=
-         (options->at(Option::UNIQUE_RANGE)->getInt() * number_of_records));
 
   for (const auto &column : *columns_) {
     prepare_sql += column->name_ + ", ";
@@ -124,24 +168,17 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
       if (unique_keys.find(column->name_) != unique_keys.end()) {
         value += std::to_string(unique_keys.at(column->name_).at(records));
       } else if (column->name_.find("fk_col") != std::string::npos) {
-        /* For FK we get the unique value from the parent table unique vector */
-        value +=
-            std::to_string(fk_unique_keys[rand_int(fk_unique_keys.size() - 1)]);
+          value += std::to_string(fk_parent_unique_keys[rand_int(
+              fk_parent_unique_keys.size() - 1)]);
       } else if (column->type_ == Column::COLUMN_TYPES::GENERATED) {
         value += "DEFAULT";
-      } else if (column->primary_key && column->type_ == Column::INT) {
+      } else if (column->primary_key and thd->unique_keys.size() > 0) {
         value += std::to_string(thd->unique_keys.at(records));
         if (options->at(Option::LOG_PK_BULK_INSERT)->getBool())
           pk_insert.push_back(thd->unique_keys.at(records));
 
       } else if (column->auto_increment == true) {
         value += "NULL";
-      } else if (is_list_partition && column->name_.compare("ip_col") == 0) {
-        /* for list partition we insert only maximum possible value
-         * todo modify rand_value to return list parititon range */
-        value += std::to_string(
-            rand_int(maximum_records_in_each_parititon_list *
-                     options->at(Option::MAX_PARTITIONS)->getInt()));
       } else {
         value += column->rand_value();
       }
@@ -155,29 +192,29 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
     if (values.size() >
             (size_t)options->at(Option::BULK_INSERT_WIDTH)->getInt() ||
         number_of_initial_records == records) {
-      if (!execute_sql(prepare_sql + values, thd)) {
+      if (!execute_sql(prepare_sql + values, thd, false)) {
         print_and_log("Bulk insert failed for table  " + name_, thd, true);
         run_query_failed = true;
         return false;
       }
       values = " VALUES";
-      if (pk_insert.size() > 0) {
-        thd->thread_log << "Primary key inserted : " << name_ << " ";
-        for (auto &pk : pk_insert) {
-          thd->thread_log << pk << " ";
-        }
-        thd->thread_log << std::endl;
-        pk_insert.clear();
-      }
+      log_pk_insert(thd, name_, pk_insert);
     } else {
       values += ", ";
+    }
+    // after insert million of records we write to thread log that million
+    // records are insert
+    if (records % 1000000 == 0) {
+      print_and_log("Inserted " + toHumanReadable(records) +
+                        " records in table " + name_,
+                    thd, false, false);
     }
   }
 
   return true;
 }
 
-std::string Table::ColumnValues(int value_count) {
+std::string Table::ColumnValues(Thd1 *thd, int value_count) {
   std::string cols = "(";
   for (auto &column : *columns_) {
     cols += column->name_ + ", ";
@@ -186,21 +223,32 @@ std::string Table::ColumnValues(int value_count) {
   cols.pop_back();
   cols += ")";
 
+  std::vector<std::string> pk_insert;
+  if (value_count != 1)
+    pk_insert.reserve(value_count);
   std::string vals;
   for (int i = 0; i < value_count; i++) {
     vals += "(";
     for (auto &column : *columns_) {
       if (column->type_ == Column::COLUMN_TYPES::GENERATED)
         vals += "DEFAULT, ";
-      else if (column->auto_increment == true && rand_int(100) < 10)
+      else if (column->auto_increment)
         vals += "NULL, ";
-      else
-        vals += column->rand_value() + ", ";
+      else {
+        auto rand_val = column->rand_value();
+        vals += rand_val + ", ";
+        if (value_count != 1 &&
+            options->at(Option::LOG_PK_BULK_INSERT)->getBool() &&
+            column->primary_key)
+          pk_insert.push_back(rand_val);
+      }
     }
+
     vals.pop_back();
     vals.pop_back();
     vals += "), ";
   }
+  log_pk_insert(thd, name_, pk_insert);
   vals.pop_back();
   vals.pop_back();
   return cols + " VALUES" + vals;
@@ -209,7 +257,7 @@ std::string Table::ColumnValues(int value_count) {
 void Table::InsertRandomRow(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
   std::string sql =
-      "INSERT " + add_ignore_clause() + " INTO " + name_ + ColumnValues();
+      "INSERT " + add_ignore_clause() + " INTO " + name_ + ColumnValues(thd);
   unlock_table_mutex();
 
   std::shared_lock lock(dml_mutex);
@@ -217,11 +265,12 @@ void Table::InsertRandomRow(Thd1 *thd) {
 }
 void Table::InsertRandomRowBulk(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
+
   std::string sql =
-      "INSERT IGNORE INTO " + name_ +
-      ColumnValues(options->at(Option::INSERT_BULK_COUNT)->getInt());
+      "INSERT " + add_ignore_clause() + " INTO " + name_ +
+      ColumnValues(thd, options->at(Option::INSERT_BULK_COUNT)->getInt());
   unlock_table_mutex();
-  execute_sql(sql, thd);
+  execute_sql(sql, thd, false);
 }
 
 template <typename Writer> void Table::Serialize(Writer &writer) const {
@@ -306,6 +355,9 @@ template <typename Writer> void Table::Serialize(Writer &writer) const {
   writer.String("key_block_size");
   writer.Int(key_block_size);
 
+  writer.String("number_of_initial_records");
+  writer.Int(number_of_initial_records);
+
   writer.String(("columns"));
   writer.StartArray();
 
@@ -317,7 +369,12 @@ template <typename Writer> void Table::Serialize(Writer &writer) const {
       static_cast<Generated_Column *>(col)->Serialize(writer);
     } else if (col->type_ == Column::BLOB || col->type_ == Column::TEXT) {
       static_cast<Blob_Column *>(col)->Serialize(writer);
+    } else if (col->type_ == Column::ENUM) {
+      static_cast<Enum_Column *>(col)->Serialize(writer);
+    } else if (col->type_ == Column::DECIMAL) {
+      static_cast<Decimal_Column *>(col)->Serialize(writer);
     }
+
     writer.EndObject();
   }
 
@@ -398,6 +455,8 @@ template <typename Writer> void Column::Serialize(Writer &writer) const {
   writer.Bool(auto_increment);
   writer.String("not secondary");
   writer.Bool(not_secondary);
+  writer.String("is_partition");
+  writer.Bool(is_partition);
   writer.String("length");
   writer.Int(length);
 }
@@ -405,6 +464,21 @@ template <typename Writer> void Column::Serialize(Writer &writer) const {
 template <typename Writer> void Blob_Column::Serialize(Writer &writer) const {
   writer.String("sub_type");
   writer.String(sub_type.c_str(), static_cast<SizeType>(sub_type.length()));
+}
+template <typename Writer>
+void Decimal_Column::Serialize(Writer &writer) const {
+  writer.String("precision");
+  writer.Int(precision);
+}
+
+template <typename Writer> void Enum_Column::Serialize(Writer &writer) const {
+  /* write all enum values */
+  writer.String("enum_values");
+  writer.StartArray();
+  for (auto &val : enum_values) {
+    writer.String(val.c_str(), static_cast<SizeType>(val.length()));
+  }
+  writer.EndArray();
 }
 
 /* add sub_type and clause in metadata */
@@ -441,13 +515,25 @@ template <typename Writer> void Index::Serialize(Writer &writer) const {
   writer.EndArray();
   writer.EndObject();
 }
+/* step file name based on the database and step */
+std::string build_step_file_name(int step) {
+  std::string path = opt_string(METADATA_PATH);
+  if (path.size() == 0 || step != 0)
+    path = opt_string(LOGDIR);
+#ifdef USE_MYSQL
+  const std::string instance = "mysql";
+#elif USE_DUCKDB
+  const std::string instance = "duckdb";
+#endif
+  auto file = path + "/" + instance + "_" +
+              options->at(Option::DATABASE)->getString() + "_metadata_step_" +
+              std::to_string(step) + ".log";
+  return file;
+}
+
 /* save metadata to a file */
 void save_metadata_to_file() {
-  std::string path = opt_string(METADATA_PATH);
-  if (path.size() == 0)
-    path = opt_string(LOGDIR);
-  auto file = path + "/step_" +
-              std::to_string(options->at(Option::STEP)->getInt()) + ".dll";
+  auto file = build_step_file_name(options->at(Option::STEP)->getInt());
   std::cout << "Saving metadata to file " << file << std::endl;
 
   StringBuffer sb;
@@ -474,17 +560,13 @@ void save_metadata_to_file() {
 /*load objects from a file */
 std::string load_metadata_from_file() {
   auto previous_step = options->at(Option::STEP)->getInt() - 1;
-  auto path = opt_string(METADATA_PATH);
-  if (path.size() == 0)
-    path = opt_string(LOGDIR);
-  auto file = path + "/step_" + std::to_string(previous_step) + ".dll";
+  auto file = build_step_file_name(previous_step);
   FILE *fp = fopen(file.c_str(), "r");
 
   if (fp == nullptr) {
     print_and_log("Unable to find metadata file " + file, nullptr);
-    exit(EXIT_FAILURE);
+    return "FAILED";
   }
-
   char readBuffer[65536];
   FileReadStream is(fp, readBuffer, sizeof(readBuffer));
   Document d;
@@ -557,6 +639,8 @@ std::string load_metadata_from_file() {
     table->compression = tab["compression"].GetString();
 
     table->key_block_size = tab["key_block_size"].GetInt();
+    table->number_of_initial_records =
+        tab["number_of_initial_records"].GetInt();
 
     /* save columns */
     for (auto &col : tab["columns"].GetArray()) {
@@ -582,12 +666,25 @@ std::string load_metadata_from_file() {
       } else if (type.compare("TEXT") == 0) {
         auto sub_type = col["sub_type"].GetString();
         a = new Text_Column(col["name"].GetString(), table, sub_type);
+      } else if (type.compare("DECIMAL") == 0) {
+        a = new Decimal_Column(col["name"].GetString(), table,
+                               col["precision"].GetInt(),
+                               col["length"].GetInt());
+      } else if (type.compare("ENUM") == 0) {
+        auto enum_values = col["enum_values"].GetArray();
+        std::vector<std::string> enum_values_;
+        for (auto &val : enum_values) {
+          enum_values_.push_back(val.GetString());
+        }
+        a = new Enum_Column(col["name"].GetString(), table,
+                            std::move(enum_values_));
       } else {
         print_and_log("unhandled column type " + type, nullptr);
         exit(EXIT_FAILURE);
       }
 
       a->null_val = col["null_val"].GetBool();
+      a->is_partition = col["is_partition"].GetBool();
       a->auto_increment = col["auto_increment"].GetBool();
       a->length = col["length"].GetInt(),
       a->primary_key = col["primary_key"].GetBool();
@@ -618,5 +715,6 @@ std::string load_metadata_from_file() {
   }
 
   fclose(fp);
+  print_and_log("metadata loaded from file " + file, nullptr);
   return file;
 }
