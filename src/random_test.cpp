@@ -452,6 +452,20 @@ int sum_of_all_options(Thd1 *thd) {
     locks.clear();
   }
 
+  if (strcmp(FORK, "ClickHouse") == 0) {
+    options->at(Option::NO_FK)->setBool(true);
+    options->at(Option::NO_AUTO_INC)->setBool(true);
+    options->at(Option::PK_COLUMN_AUTOINC)->setInt(0);
+    options->at(Option::NO_TABLESPACE)->setBool(true);
+    options->at(Option::NO_TEMPORARY)->setBool(true);
+    options->at(Option::NO_COLUMN_COMPRESSION)->setBool(true);
+    options->at(Option::NO_TABLE_COMPRESSION)->setBool(true);
+    options->at(Option::XA_TRANSACTION)->setInt(0);
+    options->at(Option::SAVEPOINT_PRB_K)->setInt(0);
+    algorithms.clear();
+    locks.clear();
+  }
+
   /* Disabling alter discard tablespace until 8.0.30
    * Bug: https://jira.percona.com/browse/PS-7865 is fixed by upstream in
    * MySQL 8.0.31 */
@@ -2510,6 +2524,11 @@ std::string Table::definition(bool with_index, bool with_fk,
 
   if (!engine.empty())
     def += " ENGINE=" + engine;
+
+#ifdef USE_CLICKHOUSE
+  if (!engine.empty() && !columns_->empty())
+    def += " ORDER BY (" + columns_->at(0)->name_ + ")";
+#endif
 
   if (options->at(Option::SECONDARY_ENGINE)->getString().size() > 0 &&
       (!options->at(Option::SECONDARY_AFTER_CREATE)->getBool() ||

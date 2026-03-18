@@ -524,6 +524,8 @@ std::string build_step_file_name(int step) {
   const std::string instance = "mysql";
 #elif USE_DUCKDB
   const std::string instance = "duckdb";
+#elif USE_CLICKHOUSE
+  const std::string instance = "clickhouse";
 #endif
   auto file = path + "/" + instance + "_" +
               options->at(Option::DATABASE)->getString() + "_metadata_step_" +

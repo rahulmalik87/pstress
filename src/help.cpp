@@ -80,7 +80,8 @@ void add_options() {
   /* Engine */
   opt = newOption(Option::STRING, Option::ENGINE, "engine");
   opt->help = "Engine used ";
-  opt->setString(strcmp(FORK, "MySQL") == 0 ? "INNODB" : "");
+  opt->setString(strcmp(FORK, "MySQL") == 0 ? "INNODB" :
+                 strcmp(FORK, "ClickHouse") == 0 ? "MergeTree()" : "");
 
   /* Just Load DDL*/
   opt = newOption(Option::BOOL, Option::JUST_LOAD_DDL, "jlddl");

@@ -212,6 +212,8 @@ int main(int argc, char *argv[]) {
   std::string name = "mysql";
 #elif USE_DUCKDB
   std::string name = "duckdb";
+#elif USE_CLICKHOUSE
+  std::string name = "clickhouse";
 #endif
   if (confFile.empty() && ports.size() == 1) {
     /*single node and command line */
