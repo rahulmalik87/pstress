@@ -462,6 +462,10 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::NO_TABLE_COMPRESSION)->setBool(true);
     options->at(Option::XA_TRANSACTION)->setInt(0);
     options->at(Option::SAVEPOINT_PRB_K)->setInt(0);
+    options->at(Option::NO_VIRTUAL_COLUMNS)->setBool(true);
+    options->at(Option::NO_ENUM)->setBool(true);
+    options->at(Option::NO_DESC_INDEX)->setBool(true);
+    options->at(Option::INDEXES)->setInt(0);
     algorithms.clear();
     locks.clear();
   }
@@ -1175,10 +1179,16 @@ std::string Column::rand_value() {
         options->at(Option::UNIQUE_RANGE)->getFloat() * number_of_records)));
     if (current_type == Column::COLUMN_TYPES::VARCHAR) {
       std::string result;
-      result.reserve(value.size() + 2); // Pre-allocate for quotes + value
+      result.reserve(value.size() + 2);
+#ifdef USE_MYSQL
       result += '"';
       result += value;
       result += '"';
+#else
+      result += '\'';
+      result += value;
+      result += '\'';
+#endif
       return result;
     }
     return value;
@@ -1200,11 +1210,15 @@ std::string Column::rand_value() {
   case Column::COLUMN_TYPES::TEXT:
 #ifdef USE_MYSQL
     return "\"" + rand_string(length) + "\"";
-#elif USE_DUCKDB
+#else
     return "\'" + rand_string(length) + "\'";
 #endif
   case Column::COLUMN_TYPES::BLOB:
+#ifdef USE_MYSQL
     return "_binary\"" + rand_string(length) + "\"";
+#else
+    return "\'" + rand_string(length) + "\'";
+#endif
   case Column::COLUMN_TYPES::JSON:
     return "\'" + json_rand_doc(this) + "\'";
   case Column::COLUMN_TYPES::BIT:
@@ -1218,7 +1232,11 @@ std::string Column::rand_value() {
   case Column::COLUMN_TYPES::DATETIME:
     return "\'" + rand_datetime() + "\'";
   case Column::COLUMN_TYPES::TIMESTAMP:
+#ifdef USE_MYSQL
     return "\'" + rand_timestamp() + "\'";
+#else
+    return "\'" + rand_timestamp(0, false) + "\'";
+#endif
     break;
   case Column::COLUMN_TYPES::GENERATED:
   case Column::COLUMN_TYPES::ENUM:
@@ -3498,8 +3516,12 @@ std::string Table::GetWhereBulk() {
   }
 
   if (col->type_ == Column::BLOB && rand_int(1000) == 1) {
+#ifdef USE_MYSQL
     return " WHERE instr( " + col->name_ + ",_binary\"" + rand_string(20) +
            "%\")";
+#else
+    return " WHERE position(" + col->name_ + ", '" + rand_string(20) + "') > 0";
+#endif
   }
 
   if (col->is_col_can_be_compared()) {

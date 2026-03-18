@@ -1,7 +1,7 @@
 #pragma once
+#include <clickhouse/client.h>
 #include "DatabaseInterface.hpp"
 #include "node.hpp"
-#include <clickhouse/client.h>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -35,7 +35,7 @@ static std::string ch_col_to_string(const clickhouse::ColumnRef &col,
   case Type::Float64:
     return std::to_string(col->As<ColumnFloat64>()->At(row));
   case Type::Date:
-    return std::to_string(col->As<ColumnDate>()->At(row).count());
+    return std::to_string(col->As<ColumnDate>()->At(row));
   case Type::DateTime:
     return std::to_string(col->As<ColumnDateTime>()->At(row));
   case Type::Nullable: {
