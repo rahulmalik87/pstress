@@ -466,6 +466,14 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::NO_ENUM)->setBool(true);
     options->at(Option::NO_DESC_INDEX)->setBool(true);
     options->at(Option::INDEXES)->setInt(0);
+    options->at(Option::NO_PARTITION)->setBool(true);
+    options->at(Option::IGNORE_DML_CLAUSE)->setInt(0);
+    options->at(Option::REPLACE_ROW)->setInt(0);
+    options->at(Option::SELECT_FOR_UPDATE)->setInt(0);
+    options->at(Option::SELECT_FOR_UPDATE_BULK)->setInt(0);
+    options->at(Option::CALL_FUNCTION)->setInt(0);
+    options->at(Option::ADD_DROP_PARTITION)->setInt(0);
+    options->at(Option::RENAME_INDEX)->setInt(0);
     algorithms.clear();
     locks.clear();
   }
@@ -2545,7 +2553,9 @@ std::string Table::definition(bool with_index, bool with_fk,
 
 #ifdef USE_CLICKHOUSE
   if (!engine.empty() && !columns_->empty())
-    def += " ORDER BY (" + columns_->at(0)->name_ + ")";
+    def += " ORDER BY (" + columns_->at(0)->name_ + ")"
+           " SETTINGS enable_block_number_column = 1,"
+           " enable_block_offset_column = 1";
 #endif
 
   if (options->at(Option::SECONDARY_ENGINE)->getString().size() > 0 &&
@@ -2948,7 +2958,11 @@ void Table::ModifyColumn(Thd1 *thd) {
   else if (col->not_secondary == true and rand_int(3) == 0)
     col->not_secondary = false;
 
+#ifdef USE_CLICKHOUSE
+  sql += " " + col->name_ + " " + col->clause();
+#else
   sql += " " + col->definition() + pick_algorithm_lock();
+#endif
 
   /* if not successful rollback */
   if (!execute_sql(sql, thd)) {
@@ -3550,7 +3564,11 @@ std::string Table::GetWhereBulk() {
   }
 
   if (col->is_col_string() && rand_int(100) < 20) {
+#ifdef USE_MYSQL
     return where + " LIKE " + "\"" + rand_string(20) + "%\"";
+#else
+    return where + " LIKE '" + rand_string(20) + "%'";
+#endif
   }
 
   if (col->is_col_string() && rand_int(100) < 90) {
