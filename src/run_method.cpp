@@ -1,4 +1,8 @@
+#include "node.hpp"
 #include "random_test.hpp"
+#ifdef USE_CLICKHOUSE
+#include "ch_verify.hpp"
+#endif
 #include <filesystem>
 #include <limits.h> // for PATH_MAX
 #include <regex>
@@ -333,7 +337,7 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
   auto ddl_query = thd->ddl_query;
 
   if (options->at(Option::THREAD_DOING_ONLY_SELECT)->getInt() != 0) {
-    if (options->at(Option::SINGLE_THREAD_DDL)->getBool() && thread_id == 1 &&
+    if (options->at(Option::SINGLE_THREAD_DDL)->getBool() && thread_id == 0 &&
         ddl_query) {
       // do not block ddl query if user want single thread ddl
     } else if (option != Option::SELECT_ALL_ROW &&
@@ -353,7 +357,7 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
   }
 
 
-  if (thread_id != 1 && options->at(Option::SINGLE_THREAD_DDL)->getBool() &&
+  if (thread_id != 0 && options->at(Option::SINGLE_THREAD_DDL)->getBool() &&
       ddl_query == true)
     return true;
 
@@ -418,6 +422,15 @@ bool Thd1::run_some_query() {
 
   if (options->at(Option::PREPARE)->getBool() ||
       options->at(Option::STEP)->getInt() == 1) {
+    /* Distribute tables across all nodes and threads.
+       Global thread ID = node_index * threads_per_node + thread_id
+       Stride = total threads across all nodes
+       Example: 30 tables, 2 nodes, 5 threads each (10 total)
+         node0/t0 -> 1,11,21   node0/t1 -> 2,12,22 ... node1/t0 -> 6,16,26 */
+    int total_threads = myParam->num_nodes * myParam->threads;
+    int global_thread_id = myParam->node_index * myParam->threads + thread_id;
+    starting_index = 1 + global_thread_id;
+
     while (starting_index <= options->at(Option::TABLES)->getInt()) {
       for (const auto &tableType : tableTypes) {
         auto table = pick_table(tableType, starting_index);
@@ -436,7 +449,7 @@ bool Thd1::run_some_query() {
         return false;
       }
       table_processed++;
-      starting_index += options->at(Option::THREADS)->getInt();
+      starting_index += total_threads;
     }
 
     // wait for all tables to finish loading
@@ -502,6 +515,11 @@ bool Thd1::run_some_query() {
       continue;
     }
 
+#ifdef USE_CLICKHOUSE
+    /* Hold a shared lock for the duration of this iteration so the replica
+       verifier (which takes a unique_lock) can pause workers between queries. */
+    std::shared_lock<std::shared_mutex> _verify_lk(g_ch_verify_mutex);
+#endif
 
     /* check if we need to make sql as part of existing or new trx */
     if (trx_left > 0) {

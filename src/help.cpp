@@ -191,6 +191,12 @@ void add_options() {
               "added just part of primary key ";
   opt->setInt(1);
 
+  opt = newOption(Option::INT, Option::CH_VERIFY_INTERVAL, "ch-verify-interval");
+  opt->help = "ClickHouse replica verification interval in seconds (0=disabled, "
+              "only at end). When > 0, a background thread pauses all worker "
+              "threads and checks count+checksum on all replicas every N seconds.";
+  opt->setInt(0);
+
   opt = newOption(Option::INT, Option::CALL_FUNCTION, "call-function-prob");
   opt->help = "Probability of calling function ";
   opt->setInt(10);
@@ -484,8 +490,8 @@ void add_options() {
 
   opt = newOption(Option::INT, Option::BULK_INSERT_WIDTH, "bulk-insert-width");
   opt->help = "The maximum width of each insert in bulk insert default is " +
-              std::to_string(1024 * 1024);
-  opt->setInt(4024 * 1024);
+              std::to_string(16 * 1024 * 1024);
+  opt->setInt(16 * 1024 * 1024);
 
   /* ENFORCE REWRITE  */
   opt = newOption(Option::INT, Option::ENFORCE_MERGE, "enforce-merge-prob");
@@ -927,7 +933,7 @@ void add_options() {
 
   opt = newOption(Option::INT, Option::INSERT_BULK_COUNT, "insert-bulk-count");
   opt->help = "Number of rows to insert in a single insert statement";
-  opt->setInt(10);
+  opt->setInt(1000);
 
   opt = newOption(Option::INT, Option::INSERT_BULK, "insert-bulk");
   opt->help = "insert random row";

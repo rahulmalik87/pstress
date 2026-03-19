@@ -47,13 +47,121 @@ cmake .. -DDUCKDB=ON -DDUCKDB_LIBRARY=$DUCKDB_BUILD_DIR/src/libduckdb.so -DDUCKD
 make
 ```
 
-# Help Section
-First, take a quick look at ``` ./pstress-dd --help --verbos, ./pstress-ms --help --verbose ``` to see available modes and options.
+---
 
-# Example of commad to run pstress
+# Building pstress with ClickHouse
+
+## Prerequisites
+
+Install the [clickhouse-cpp](https://github.com/ClickHouse/clickhouse-cpp) client library:
+
+```bash
+git clone https://github.com/ClickHouse/clickhouse-cpp.git
+cd clickhouse-cpp
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+sudo make install   # installs to /usr/local by default
 ```
-pstress-ms --table=1 --column=10 --seconds=10 --threads=10 --socket=$SOCKET
+
+## Compile pstress-ch
+
+```bash
+cd pstress
+mkdir bld && cd bld
+cmake .. -DCLICKHOUSE=ON
+make -j$(nproc)
+# Binary: bld/src/pstress-ch
 ```
+
+If clickhouse-cpp is installed in a non-standard location:
+
+```bash
+cmake .. -DCLICKHOUSE=ON \
+  -DCLICKHOUSE_INCLUDE_DIR=/path/to/clickhouse-cpp/include \
+  -DCLICKHOUSE_LIBRARY=/path/to/clickhouse-cpp/build/libclickhouse-cpp-lib.a
+```
+
+## Running pstress-ch
+
+**Defaults** (no need to specify unless overriding):
+- `--address 127.0.0.1`
+- `--user default`
+- `--database test_db`
+
+**Single node — step 1 (create tables + load data):**
+```bash
+./bld/src/pstress-ch --port 9000 --tables 10 --threads 5 --seconds 60 \
+  --logdir /tmp/pstress-ch --step 1
+```
+
+**Single node — step 2 (resume workload on existing tables):**
+```bash
+./bld/src/pstress-ch --port 9000 --tables 10 --threads 5 --seconds 60 \
+  --logdir /tmp/pstress-ch --step 2
+```
+
+**Two replicas on the same host (different ports):**
+```bash
+./bld/src/pstress-ch --address 127.0.0.1 --port 9000,9001 \
+  --tables 10 --threads 5 --seconds 60 \
+  --logdir /tmp/pstress-ch --step 1
+```
+
+**Two replicas on different hosts:**
+```bash
+./bld/src/pstress-ch --address 192.168.1.10,192.168.1.11 --port 9000,9001 \
+  --tables 10 --threads 5 --seconds 60 \
+  --logdir /tmp/pstress-ch --step 1
+```
+
+**With periodic replica verification every 30 seconds:**
+```bash
+./bld/src/pstress-ch --port 9000,9001 --tables 10 --threads 5 --seconds 300 \
+  --logdir /tmp/pstress-ch --ch-verify-interval 30 --step 2
+```
+
+**Useful options for ClickHouse:**
+
+| Option | Description |
+|--------|-------------|
+| `--port 9000,9001` | Two-replica mode — splits load, verifies schema+checksums at end |
+| `--address addr1,addr2` | One address per port for replicas on different hosts |
+| `--step 1` | Drop existing tables and start fresh |
+| `--step 2` | Resume workload on existing tables |
+| `--ch-verify-interval N` | Verify replica count+checksum every N seconds during run |
+| `--null-prob=0` | No NULL values; columns use plain types (no `Nullable`) |
+| `--no-json` | Disable JSON columns |
+| `--single-thread-ddl` | Only thread 0 runs DDL (reduces schema conflicts) |
+| `--only-cl-sql` | Run only the SQL operations specified on the command line |
+| `--add-column=N` | Probability weight for ALTER TABLE ADD COLUMN |
+| `--drop-column=N` | Probability weight for ALTER TABLE DROP COLUMN |
+| `--insert-bulk=N` | Probability weight for bulk INSERT |
+| `--threads N` | Threads per node |
+| `--tables N` | Number of tables to create |
+| `--seconds N` | How long to run the workload |
+
+## End-of-run verification
+
+At the end of every run pstress-ch automatically:
+1. **Schema verification** — compares each table's columns in pstress metadata against `system.columns` in ClickHouse and reports missing columns, extra columns, and nullability mismatches.
+2. **Replica verification** (two-node mode only) — waits for replication queues to drain, then compares row counts and checksums across all replicas.
+
+Example output:
+```
+[14:32:01] ==> Schema verification: metadata vs ClickHouse (127.0.0.1:9000)...
+  tt_1                  OK (5 columns)
+  tt_2                  OK (4 columns)
+  tt_3                  OK (6 columns)
+[14:32:01] ==> Schema verification: PASS
+
+[14:32:01] ==> Verifying replica consistency for 3 tables across 2 replicas...
+  tt_1                  r1[cnt=10000    csum=1234567890]  r2[cnt=10000    csum=1234567890]  => OK
+  tt_2                  r1[cnt=5000     csum=9876543210]  r2[cnt=5000     csum=9876543210]  => OK
+[14:32:01] ==> Replica verification: PASS
+```
+
+---
 
 
 # Contributors
@@ -61,4 +169,5 @@ pstress-ms --table=1 --column=10 --seconds=10 --threads=10 --socket=$SOCKET
 * Roel Van de Paar - invention, scripted framework
 * Rahul Malik - pstress developer
 * Mohit Joshi - pstress developer
+* Claude (Anthropic) - ClickHouse backend, ReplicatedMergeTree support, replica verification, schema verification
 * For the full list of contributors, please see [CONTRIBUTORS](https://github.com/Percona-QA/pstress/blob/master/doc/CONTRIBUTORS)

@@ -212,7 +212,33 @@ int main(int argc, char *argv[]) {
 #endif
 
   auto confFile = options->at(Option::CONFIGFILE)->getString();
+
+#ifdef USE_CLICKHOUSE
+  /* Apply ClickHouse defaults early — ch_verify_startup() runs before worker
+     threads call sum_of_all_options(), so defaults must be set here too. */
+  if (options->at(Option::ADDRESS)->getString().empty())
+    options->at(Option::ADDRESS)->setString("127.0.0.1");
+  if (options->at(Option::USER)->getString() == "root")
+    options->at(Option::USER)->setString("default");
+  if (options->at(Option::DATABASE)->getString() == "test")
+    options->at(Option::DATABASE)->setString("test_db");
+#endif
+
   auto ports = splitStringToArray<int>(options->at(Option::PORT)->getString());
+  auto addrs = splitStringToArray<std::string>(options->at(Option::ADDRESS)->getString());
+  if (addrs.empty()) {
+#ifdef USE_CLICKHOUSE
+    addrs.push_back("127.0.0.1");
+#else
+    addrs.push_back("localhost");
+#endif
+  }
+  if (addrs.size() > 1 && addrs.size() != ports.size()) {
+    std::cerr << "Error: --address has " << addrs.size()
+              << " entries but --port has " << ports.size()
+              << ". Provide one address (broadcast) or one per port.\n";
+    exit(EXIT_FAILURE);
+  }
 #ifdef USE_MYSQL
   std::string name = "mysql";
 #elif USE_DUCKDB
@@ -227,14 +253,47 @@ int main(int argc, char *argv[]) {
     create_worker(wParams);
     delete wParams;
   } else if (confFile.empty() && ports.size() > 1) {
-    for (auto port : ports) {
-      workerParams *wParams = new workerParams(port);
-      wParams->myName = name + "." + std::to_string(port);
+#ifdef USE_CLICKHOUSE
+    /* Verify replicas are consistent before starting workload */
+    ch_verify_startup(addrs, ports,
+                      options->at(Option::DATABASE)->getString(),
+                      options->at(Option::USER)->getString(),
+                      options->at(Option::PASSWORD)->getString());
+#endif
+    for (size_t i = 0; i < ports.size(); i++) {
+      workerParams *wParams = new workerParams(ports[i], i, ports.size());
+      wParams->address = (addrs.size() == 1) ? addrs[0] : addrs[i];
+      wParams->myName = name + "." + wParams->address + "." + std::to_string(ports[i]);
       nodes.push_back(std::thread(create_worker, wParams));
     }
+#ifdef USE_CLICKHOUSE
+    /* Periodic replica verification thread: pauses workers, checksums, resumes */
+    std::atomic<bool> nodes_done(false);
+    int verify_interval = options->at(Option::CH_VERIFY_INTERVAL)->getInt();
+    std::thread verifier_thread;
+    if (verify_interval > 0) {
+      verifier_thread = std::thread([&]() {
+        while (!nodes_done.load(std::memory_order_relaxed)) {
+          for (int s = 0; s < verify_interval; s++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (nodes_done.load(std::memory_order_relaxed)) return;
+          }
+          ch_verify_replicas(addrs, ports,
+                             options->at(Option::DATABASE)->getString(),
+                             options->at(Option::USER)->getString(),
+                             options->at(Option::PASSWORD)->getString(),
+                             {});
+        }
+      });
+    }
+#endif
     /* join all nodes */
     for (auto node = nodes.begin(); node != nodes.end(); node++)
       node->join();
+#ifdef USE_CLICKHOUSE
+    nodes_done.store(true, std::memory_order_relaxed);
+    if (verifier_thread.joinable()) verifier_thread.join();
+#endif
   } else {
     INIReader reader(confFile);
     if (reader.ParseError() < 0) {
@@ -261,21 +320,24 @@ int main(int argc, char *argv[]) {
   save_metadata_to_file();
 
 #ifdef USE_CLICKHOUSE
-  if (ports.size() > 1) {
-    /* Collect table names before clean_up_at_end() frees all_tables */
-    std::vector<std::string> tnames;
-    /* deduplicate: both nodes share all_tables, same tables appear twice */
-    std::set<std::string> seen;
-    for (auto *t : *all_tables)
-      if (seen.insert(t->name_).second)
-        tnames.push_back(t->name_);
+  {
+    const std::string &chdb  = options->at(Option::DATABASE)->getString();
+    const std::string &chuser = options->at(Option::USER)->getString();
+    const std::string &chpass = options->at(Option::PASSWORD)->getString();
 
-    ch_verify_replicas(options->at(Option::ADDRESS)->getString(),
-                       ports,
-                       options->at(Option::DATABASE)->getString(),
-                       options->at(Option::USER)->getString(),
-                       options->at(Option::PASSWORD)->getString(),
-                       tnames);
+    if (ports.size() > 1) {
+      /* Collect table names before clean_up_at_end() frees all_tables */
+      std::vector<std::string> tnames;
+      std::set<std::string> seen;
+      for (auto *t : *all_tables)
+        if (seen.insert(t->name_).second)
+          tnames.push_back(t->name_);
+
+      ch_verify_replicas(addrs, ports, chdb, chuser, chpass, tnames);
+    }
+
+    /* Always verify schema (metadata vs actual ClickHouse columns) */
+    ch_verify_schema(addrs, ports, chdb, chuser, chpass);
   }
 #endif
 

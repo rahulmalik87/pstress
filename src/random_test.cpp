@@ -78,8 +78,9 @@ void print_and_log(std::string &&str, Thd1 *thd, bool print_error,
   ss << "[" << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S")
      << "] ";
 
-  ss << "Thread " << (thd ? std::to_string(thd->thread_id) : "#") << " : "
-     << str;
+  ss << "Thread " << (thd ? std::to_string(thd->thread_id) : "#")
+     << (thd && thd->myParam ? "@" + std::to_string(thd->myParam->port) : "")
+     << " : " << str;
   if (print_error) {
     ss << "error: " << thd->db->get_error();
   }
@@ -453,6 +454,13 @@ int sum_of_all_options(Thd1 *thd) {
   }
 
   if (strcmp(FORK, "ClickHouse") == 0) {
+    /* Convenient defaults for ClickHouse (only if not overridden on CLI) */
+    if (options->at(Option::ADDRESS)->getString().empty())
+      options->at(Option::ADDRESS)->setString("127.0.0.1");
+    if (options->at(Option::USER)->getString() == "root")
+      options->at(Option::USER)->setString("default");
+    if (options->at(Option::DATABASE)->getString() == "test")
+      options->at(Option::DATABASE)->setString("test_db");
     options->at(Option::NO_FK)->setBool(true);
     options->at(Option::NO_AUTO_INC)->setBool(true);
     options->at(Option::PK_COLUMN_AUTOINC)->setInt(0);
@@ -1265,8 +1273,10 @@ std::string Column::rand_value() {
 /* return table definition */
 std::string Column::definition() {
 #ifdef USE_CLICKHOUSE
-  /* ClickHouse columns are NOT NULL by default; use Nullable() for nullable */
-  std::string type_str = null_val ? "Nullable(" + clause() + ")" : clause();
+  /* ClickHouse columns are NOT NULL by default; use Nullable() for nullable.
+     If null-prob=0, user wants no NULLs at all — skip Nullable wrapper. */
+  bool ch_nullable = null_val && options->at(Option::NULL_PROB)->getInt() > 0;
+  std::string type_str = ch_nullable ? "Nullable(" + clause() + ")" : clause();
   return name_ + " " + type_str;
 #else
   std::string def = name_ + " " + clause();
@@ -2993,8 +3003,10 @@ void Table::ModifyColumn(Thd1 *thd) {
     col->not_secondary = false;
 
 #ifdef USE_CLICKHOUSE
-  /* Use Nullable() wrapper for nullable columns, matching CREATE TABLE DDL */
-  std::string ch_type = col->null_val ? "Nullable(" + col->clause() + ")" : col->clause();
+  /* Use Nullable() wrapper for nullable columns, matching CREATE TABLE DDL.
+     If null-prob=0, skip Nullable wrapper. */
+  bool ch_mod_nullable = col->null_val && options->at(Option::NULL_PROB)->getInt() > 0;
+  std::string ch_type = ch_mod_nullable ? "Nullable(" + col->clause() + ")" : col->clause();
   sql += " " + col->name_ + " " + ch_type;
 #else
   sql += " " + col->definition() + pick_algorithm_lock();
@@ -4070,21 +4082,25 @@ bool Thd1::load_metadata() {
     if (options->at(Option::XA_TRANSACTION)->getInt() != 0)
       execute_sql("XA COMMIT " + std::to_string(thread_id), this);
 
-    auto file = load_metadata_from_file();
-    if (file == "FAILED") {
-      exit(EXIT_FAILURE);
-    } else {
-      std::cout << "metadata loaded from " << file << std::endl;
+    if (all_tables->empty()) {
+      auto file = load_metadata_from_file();
+      if (file == "FAILED") {
+        exit(EXIT_FAILURE);
+      } else {
+        std::cout << "metadata loaded from " << file << std::endl;
+      }
     }
   } else {
     if (strcmp(FORK, "MySQL") == 0)
       create_database_tablespace(this);
-    if (load_metadata_from_file() == "FAILED") {
-      generate_metadata_for_tables();
-      print_and_log(
-          "metadata generated randomly using seed " +
-              std::to_string(options->at(Option::INITIAL_SEED)->getInt()),
-          this);
+    if (all_tables->empty()) {
+      if (load_metadata_from_file() == "FAILED") {
+        generate_metadata_for_tables();
+        print_and_log(
+            "metadata generated randomly using seed " +
+                std::to_string(options->at(Option::INITIAL_SEED)->getInt()),
+            this);
+      }
     }
   }
 
