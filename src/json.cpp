@@ -5,6 +5,15 @@ using namespace rapidjson;
 static const int MAX_VALUE = 100;
 static const int MAX_KEYS = 100;
 std::string json_where(const Column *col) {
+#ifdef USE_CLICKHOUSE
+  if (col->get_id() % 2 == 0) {
+    return "JSONExtractUInt(" + col->name_ + ", 'key" +
+           std::to_string(rand_int(MAX_KEYS)) + "')";
+  } else {
+    return "JSONExtract(" + col->name_ + ", " +
+           std::to_string(rand_int(MAX_KEYS) + 1) + ", 'UInt64')";
+  }
+#else
   if (col->get_id() % 2 == 0) {
     return "CAST(JSON_EXTRACT(" + col->name_ + ", '$." + "key" +
            std::to_string(rand_int(MAX_KEYS)) + "') AS UNSIGNED)";
@@ -13,6 +22,7 @@ std::string json_where(const Column *col) {
     return "CAST(JSON_EXTRACT(" + col->name_ + ", '$[" +
            std::to_string(rand_int(MAX_KEYS)) + "]') AS UNSIGNED)";
   }
+#endif
   return "";
 }
 
@@ -31,6 +41,10 @@ std::string json_value(const Column *col) {
 
 
 std::string json_set(const Column *col) {
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse lacks MySQL JSON mutation functions; replace with new JSON doc */
+  return "'" + json_rand_doc(col) + "'";
+#else
   int prob = rand_int(3);
   if (col->get_id() % 2 == 0) {
     if (prob == 0) {
@@ -69,6 +83,7 @@ std::string json_set(const Column *col) {
     }
   }
   return "";
+#endif
 }
 std::string json_rand_doc(const Column *col) {
   Document d;
@@ -100,6 +115,39 @@ std::string json_rand_doc(const Column *col) {
 }
 
 std::string json_select(const Column *col) {
+#ifdef USE_CLICKHOUSE
+  if (col->get_id() % 2 == 0) {
+    auto prob = rand_int(MAX_KEYS);
+    std::string key = "'key" + std::to_string(rand_int(MAX_KEYS)) + "'";
+    if (prob == 1) {
+      return "JSONHas(" + col->name_ + ", " + key + ")";
+    } else if (prob == 2) {
+      return "CAST(" + col->name_ + " AS String)";
+    } else if (prob < 5) {
+      return "JSONExtractUInt(" + col->name_ + ", " + key + ")";
+    } else if (prob < 8) {
+      return "JSONExtractString(" + col->name_ + ", " + key + ")";
+    } else if (prob < 9) {
+      return "JSONExtractUInt(" + col->name_ + ", " + key + ")";
+    } else {
+      return "length(JSONExtractKeys(" + col->name_ + "))";
+    }
+  } else {
+    auto prob = rand_int(MAX_KEYS);
+    std::string idx = std::to_string(rand_int(MAX_KEYS) + 1);
+    if (prob == 1) {
+      return "JSONHas(" + col->name_ + ", " + idx + ")";
+    } else if (prob < 5) {
+      return "JSONExtract(" + col->name_ + ", " + idx + ", 'UInt64')";
+    } else if (prob < 8) {
+      return "JSONExtract(" + col->name_ + ", " + idx + ", 'String')";
+    } else if (prob < 9) {
+      return "JSONExtract(" + col->name_ + ", " + idx + ", 'UInt64')";
+    } else {
+      return "JSONLength(" + col->name_ + ")";
+    }
+  }
+#else
   if (col->get_id() % 2 == 0) {
     auto prob = rand_int(MAX_KEYS);
     if (prob == 1) {
@@ -140,5 +188,6 @@ std::string json_select(const Column *col) {
       return "CAST(JSON_LENGTH(" + col->name_ + ") AS UNSIGNED)";
     }
   }
+#endif
   return "";
 }

@@ -474,6 +474,11 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::CALL_FUNCTION)->setInt(0);
     options->at(Option::ADD_DROP_PARTITION)->setInt(0);
     options->at(Option::RENAME_INDEX)->setInt(0);
+    options->at(Option::ALTER_DISCARD_TABLESPACE)->setInt(0);
+    options->at(Option::ALTER_DATABASE_COLLATION)->setInt(0);
+    options->at(Option::NO_BIT)->setBool(true);
+    /* Composite key columns not in primary_key flag would break ORDER BY prefix */
+    options->at(Option::COMPOSITE_KEY_PROB)->setInt(0);
     algorithms.clear();
     locks.clear();
   }
@@ -1259,6 +1264,11 @@ std::string Column::rand_value() {
 
 /* return table definition */
 std::string Column::definition() {
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse columns are NOT NULL by default; use Nullable() for nullable */
+  std::string type_str = null_val ? "Nullable(" + clause() + ")" : clause();
+  return name_ + " " + type_str;
+#else
   std::string def = name_ + " " + clause();
   if (!null_val)
     def += " NOT NULL";
@@ -1270,6 +1280,7 @@ std::string Column::definition() {
   if (not_secondary)
     def += " NOT SECONDARY";
   return def;
+#endif
 }
 
 /* add new column, part of create table or Alter table */
@@ -2552,10 +2563,21 @@ std::string Table::definition(bool with_index, bool with_fk,
     def += " ENGINE=" + engine;
 
 #ifdef USE_CLICKHOUSE
-  if (!engine.empty() && !columns_->empty())
-    def += " ORDER BY (" + columns_->at(0)->name_ + ")"
+  if (!engine.empty() && !columns_->empty()) {
+    /* ORDER BY must include all primary key columns (PK must be a prefix) */
+    std::string order_cols;
+    for (const auto &col : *columns_) {
+      if (col->primary_key) {
+        if (!order_cols.empty()) order_cols += ", ";
+        order_cols += col->name_;
+      }
+    }
+    if (order_cols.empty())
+      order_cols = columns_->at(0)->name_;
+    def += " ORDER BY (" + order_cols + ")"
            " SETTINGS enable_block_number_column = 1,"
            " enable_block_offset_column = 1";
+  }
 #endif
 
   if (options->at(Option::SECONDARY_ENGINE)->getString().size() > 0 &&
@@ -2959,7 +2981,9 @@ void Table::ModifyColumn(Thd1 *thd) {
     col->not_secondary = false;
 
 #ifdef USE_CLICKHOUSE
-  sql += " " + col->name_ + " " + col->clause();
+  /* Use Nullable() wrapper for nullable columns, matching CREATE TABLE DDL */
+  std::string ch_type = col->null_val ? "Nullable(" + col->clause() + ")" : col->clause();
+  sql += " " + col->name_ + " " + ch_type;
 #else
   sql += " " + col->definition() + pick_algorithm_lock();
 #endif
@@ -3585,7 +3609,11 @@ std::string Table::GetWhereBulk() {
   }
 
   if (rand_int(100) == 1) {
+#ifdef USE_CLICKHOUSE
+    return " WHERE 1=1";
+#else
     return "";
+#endif
   }
 
   return where + " = " + col->rand_value();
