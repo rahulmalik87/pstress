@@ -16,6 +16,10 @@
 #include "node.hpp"
 #include "pstress.hpp"
 #include "random_test.hpp"
+extern std::vector<Table *> *all_tables;
+#ifdef USE_CLICKHOUSE
+#include "ch_verify.hpp"
+#endif
 #include <INIReader.hpp>
 #include <cstdlib>  // For free()
 #include <cxxabi.h> // For demangling
@@ -23,6 +27,7 @@
 #include <iostream>
 #include <libgen.h> //dirname() uses this
 #include <signal.h> //For signal()
+#include <set>
 #include <string>
 #include <thread>
 
@@ -254,6 +259,26 @@ int main(int argc, char *argv[]) {
   }
 
   save_metadata_to_file();
+
+#ifdef USE_CLICKHOUSE
+  if (ports.size() > 1) {
+    /* Collect table names before clean_up_at_end() frees all_tables */
+    std::vector<std::string> tnames;
+    /* deduplicate: both nodes share all_tables, same tables appear twice */
+    std::set<std::string> seen;
+    for (auto *t : *all_tables)
+      if (seen.insert(t->name_).second)
+        tnames.push_back(t->name_);
+
+    ch_verify_replicas(options->at(Option::ADDRESS)->getString(),
+                       ports,
+                       options->at(Option::DATABASE)->getString(),
+                       options->at(Option::USER)->getString(),
+                       options->at(Option::PASSWORD)->getString(),
+                       tnames);
+  }
+#endif
+
   clean_up_at_end();
 
   /* print option with total_queries */

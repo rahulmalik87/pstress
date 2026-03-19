@@ -2465,7 +2465,11 @@ std::string Table::definition(bool with_index, bool with_fk,
   std::string def = "CREATE";
   if (type == TEMPORARY)
     def += " TEMPORARY";
+#ifdef USE_CLICKHOUSE
+  def += " TABLE IF NOT EXISTS " + name_ + " (";
+#else
   def += " TABLE " + name_ + " (";
+#endif
 
   assert(columns_->size() > 0);
 
@@ -2564,6 +2568,14 @@ std::string Table::definition(bool with_index, bool with_fk,
 
 #ifdef USE_CLICKHOUSE
   if (!engine.empty() && !columns_->empty()) {
+    /* Use ReplicatedMergeTree when running against multiple ports */
+    bool replicated = options->at(Option::PORT)->getString().find(',') != std::string::npos;
+    if (replicated) {
+      auto pos = def.rfind("ENGINE=MergeTree()");
+      if (pos != std::string::npos)
+        def.replace(pos, strlen("ENGINE=MergeTree()"), "ENGINE=ReplicatedMergeTree()");
+    }
+
     /* ORDER BY must include all primary key columns (PK must be a prefix) */
     std::string order_cols;
     for (const auto &col : *columns_) {
@@ -4033,6 +4045,9 @@ void create_database_tablespace(Thd1 *thd) {
 
 /* load metadata */
 bool Thd1::load_metadata() {
+  /* Serialize initialization: both nodes share global all_tables/options */
+  static std::mutex load_metadata_mutex;
+  std::lock_guard<std::mutex> init_lock(load_metadata_mutex);
   sum_of_all_opts = sum_of_all_options(this);
   rng = std::mt19937(set_seed(nullptr));
 

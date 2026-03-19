@@ -65,8 +65,21 @@ public:
       opts.SetHost(myParams.address)
           .SetPort(myParams.port > 0 ? myParams.port : 9000)
           .SetUser(myParams.username)
-          .SetPassword(myParams.password)
-          .SetDefaultDatabase(myParams.database);
+          .SetPassword(myParams.password);
+      /* Connect without default database first to create it if needed */
+      client = std::make_unique<clickhouse::Client>(opts);
+
+      bool replicated = opt_string(PORT).find(',') != std::string::npos;
+      std::string db = myParams.database;
+      if (replicated) {
+        client->Execute("CREATE DATABASE IF NOT EXISTS " + db +
+                        " ENGINE = Replicated('/clickhouse/databases/" + db +
+                        "', '{shard}', '{replica}')");
+      } else {
+        client->Execute("CREATE DATABASE IF NOT EXISTS " + db);
+      }
+
+      opts.SetDefaultDatabase(db);
       client = std::make_unique<clickhouse::Client>(opts);
       return true;
     } catch (const std::exception &e) {
