@@ -3048,6 +3048,9 @@ void Table::DropColumn(Thd1 *thd) {
   std::string sql = "ALTER TABLE " + name_ + " DROP COLUMN " + name;
 
   sql += pick_algorithm_lock();
+#ifdef USE_CLICKHOUSE
+  sql += " SETTINGS mutations_sync = 2";
+#endif
   unlock_table_mutex();
 
   if (execute_sql(sql, thd)) {
@@ -3191,6 +3194,9 @@ void Table::AddColumn(Thd1 *thd) {
   }
 
   sql += algorithm_lock;
+#ifdef USE_CLICKHOUSE
+  sql += " SETTINGS mutations_sync = 2";
+#endif
 
   unlock_table_mutex();
 
