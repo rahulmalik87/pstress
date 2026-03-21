@@ -2490,12 +2490,15 @@ std::string Table::definition(bool with_index, bool with_fk,
 
 
   /* if column has primary key */
+  std::vector<std::string> pk_cols; /* all PK columns, including composite */
   if (has_pk()) {
     def += " PRIMARY KEY(";
     auto table_has_auto_inc = has_auto_inc_col();
     for (auto col : *columns_) {
-      if (col->primary_key)
+      if (col->primary_key) {
         def += col->name_ + ", ";
+        pk_cols.push_back(col->name_);
+      }
     }
     for (auto col : *columns_) {
       if (col->primary_key)
@@ -2509,6 +2512,7 @@ std::string Table::definition(bool with_index, bool with_fk,
                     options->at(Option::COMPOSITE_KEY_PROB)->getInt() &&
                 col->null_val == false)) {
         def += col->name_ + ", ";
+        pk_cols.push_back(col->name_); /* track composite key cols too */
       }
     }
     def.erase(def.length() - 2);
@@ -2586,13 +2590,13 @@ std::string Table::definition(bool with_index, bool with_fk,
         def.replace(pos, strlen("ENGINE=MergeTree()"), "ENGINE=ReplicatedMergeTree()");
     }
 
-    /* ORDER BY must include all primary key columns (PK must be a prefix) */
+    /* ORDER BY must be a superset of PRIMARY KEY (PK must be a prefix).
+       Use pk_cols which captured every column added to PRIMARY KEY above,
+       including composite key extras whose primary_key flag is not set. */
     std::string order_cols;
-    for (const auto &col : *columns_) {
-      if (col->primary_key) {
-        if (!order_cols.empty()) order_cols += ", ";
-        order_cols += col->name_;
-      }
+    for (const auto &c : pk_cols) {
+      if (!order_cols.empty()) order_cols += ", ";
+      order_cols += c;
     }
     if (order_cols.empty())
       order_cols = columns_->at(0)->name_;
