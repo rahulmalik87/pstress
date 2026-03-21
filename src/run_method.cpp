@@ -469,6 +469,19 @@ bool Thd1::run_some_query() {
   /* table initial data is created, empty the unique_keys */
   unique_keys.resize(0);
 
+#ifdef USE_CLICKHOUSE
+  /* Verify metadata matches actual ClickHouse schema at the start of each
+     step, after tables are created/loaded and before the workload begins.
+     std::call_once ensures this runs exactly once across all threads/nodes. */
+  static std::once_flag startup_schema_check;
+  std::call_once(startup_schema_check, [&]() {
+    ch_verify_schema({myParam->address}, {myParam->port},
+                     options->at(Option::DATABASE)->getString(),
+                     options->at(Option::USER)->getString(),
+                     options->at(Option::PASSWORD)->getString());
+  });
+#endif
+
   if (options->at(Option::JUST_LOAD_DDL)->getBool() ||
       options->at(Option::PREPARE)->getBool())
     return true;
