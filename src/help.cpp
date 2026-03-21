@@ -980,6 +980,28 @@ void add_options() {
   opt->short_help = "DB";
   opt->setSQL();
 
+  /* ClickHouse ALTER TABLE UPDATE mutation */
+  opt = newOption(Option::INT, Option::CH_ALTER_UPDATE, "ch-alter-update");
+  opt->help = "ClickHouse ALTER TABLE t UPDATE col=val WHERE ... SETTINGS mutations_sync=2";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "CHAlterUpdate";
+  opt->setDDL();
+
+  /* ClickHouse ALTER TABLE DELETE mutation */
+  opt = newOption(Option::INT, Option::CH_ALTER_DELETE, "ch-alter-delete");
+  opt->help = "ClickHouse ALTER TABLE t DELETE WHERE ... SETTINGS mutations_sync=2";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "CHAlterDelete";
+  opt->setDDL();
+
+  opt = newOption(Option::BOOL, Option::CH_MUTATIONS_SYNC, "ch-mutations-sync");
+  opt->help = "Append SETTINGS mutations_sync=2 to ClickHouse ALTER mutations "
+              "(ADD/DROP COLUMN, ALTER UPDATE/DELETE). Default: ON";
+  opt->setBool(true);
+  opt->short_help = "CHMutationsSync";
+
   /* Drop column */
   opt = newOption(Option::INT, Option::DROP_COLUMN, "drop-column");
   opt->help = "alter table drop some random column";

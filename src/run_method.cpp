@@ -705,6 +705,12 @@ bool Thd1::run_some_query() {
     case Option::UPDATE_ALL_ROWS:
       table->UpdateAllRows(this);
       break;
+    case Option::CH_ALTER_UPDATE:
+      table->AlterTableUpdate(this);
+      break;
+    case Option::CH_ALTER_DELETE:
+      table->AlterTableDelete(this);
+      break;
     case Option::OPTIMIZE:
       table->Optimize(this);
       break;

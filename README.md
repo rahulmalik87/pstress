@@ -89,63 +89,88 @@ cmake .. -DCLICKHOUSE=ON \
 - `--user default`
 - `--database test_db`
 
-**Single node — step 1 (create tables + load data):**
+**Auto-detect step**: If `--step` is omitted, pstress scans `--logdir` for existing metadata files and automatically sets the next step (step 1 if none found, otherwise max existing step + 1). You can always override with `--step N`.
+
+**Single node — first run (create tables + load data):**
 ```bash
 ./bld/src/pstress-ch --port 9000 --tables 10 --threads 5 --seconds 60 \
-  --logdir /tmp/pstress-ch --step 1
+  --logdir /tmp/pstress-ch
 ```
 
-**Single node — step 2 (resume workload on existing tables):**
+**Single node — subsequent run (auto-detected step, resume workload):**
 ```bash
 ./bld/src/pstress-ch --port 9000 --tables 10 --threads 5 --seconds 60 \
-  --logdir /tmp/pstress-ch --step 2
+  --logdir /tmp/pstress-ch
 ```
 
 **Two replicas on the same host (different ports):**
 ```bash
 ./bld/src/pstress-ch --address 127.0.0.1 --port 9000,9001 \
   --tables 10 --threads 5 --seconds 60 \
-  --logdir /tmp/pstress-ch --step 1
+  --logdir /tmp/pstress-ch
 ```
 
 **Two replicas on different hosts:**
 ```bash
 ./bld/src/pstress-ch --address 192.168.1.10,192.168.1.11 --port 9000,9001 \
   --tables 10 --threads 5 --seconds 60 \
-  --logdir /tmp/pstress-ch --step 1
+  --logdir /tmp/pstress-ch
 ```
 
 **With periodic replica verification every 30 seconds:**
 ```bash
 ./bld/src/pstress-ch --port 9000,9001 --tables 10 --threads 5 --seconds 300 \
-  --logdir /tmp/pstress-ch --ch-verify-interval 30 --step 2
+  --logdir /tmp/pstress-ch --ch-verify-interval 30
 ```
 
 **Useful options for ClickHouse:**
 
-| Option | Description |
-|--------|-------------|
-| `--port 9000,9001` | Two-replica mode — splits load, verifies schema+checksums at end |
-| `--address addr1,addr2` | One address per port for replicas on different hosts |
-| `--step 1` | Drop existing tables and start fresh |
-| `--step 2` | Resume workload on existing tables |
-| `--ch-verify-interval N` | Verify replica count+checksum every N seconds during run |
-| `--null-prob=0` | No NULL values; columns use plain types (no `Nullable`) |
-| `--no-json` | Disable JSON columns |
-| `--single-thread-ddl` | Only thread 0 runs DDL (reduces schema conflicts) |
-| `--only-cl-sql` | Run only the SQL operations specified on the command line |
-| `--add-column=N` | Probability weight for ALTER TABLE ADD COLUMN |
-| `--drop-column=N` | Probability weight for ALTER TABLE DROP COLUMN |
-| `--insert-bulk=N` | Probability weight for bulk INSERT |
-| `--threads N` | Threads per node |
-| `--tables N` | Number of tables to create |
-| `--seconds N` | How long to run the workload |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--port 9000,9001` | `9000` | Two-replica mode — splits load, verifies schema+checksums at end |
+| `--address addr1,addr2` | `127.0.0.1` | One address per port for replicas on different hosts |
+| `--step N` | auto | Force a specific step; omit for auto-detection from logdir |
+| `--ch-verify-interval N` | `0` | Verify replica count+checksum every N seconds during run |
+| `--null-prob=0` | `20` | No NULL values; columns use plain types (no `Nullable`) |
+| `--no-json` | off | Disable JSON columns |
+| `--single-thread-ddl` | off | Only thread 0 runs DDL (reduces schema conflicts) |
+| `--only-cl-sql` | off | Run only the SQL operations specified on the command line |
+| `--add-column=N` | `1` | Probability weight for ALTER TABLE ADD COLUMN |
+| `--drop-column=N` | `1` | Probability weight for ALTER TABLE DROP COLUMN |
+| `--insert-bulk=N` | `0` | Probability weight for bulk INSERT |
+| `--ch-alter-update=N` | `0` | Probability weight for ALTER TABLE UPDATE mutations |
+| `--ch-alter-delete=N` | `0` | Probability weight for ALTER TABLE DELETE mutations |
+| `--ch-mutations-sync` | `ON` | Append `SETTINGS mutations_sync=2` to all mutations (ADD/DROP COLUMN, ALTER UPDATE/DELETE) |
+| `--threads N` | `10` | Threads per node |
+| `--tables N` | `10` | Number of tables to create |
+| `--seconds N` | `100` | How long to run the workload |
 
-## End-of-run verification
+## ClickHouse mutations (ALTER UPDATE / ALTER DELETE)
 
-At the end of every run pstress-ch automatically:
-1. **Schema verification** — compares each table's columns in pstress metadata against `system.columns` in ClickHouse and reports missing columns, extra columns, and nullability mismatches.
-2. **Replica verification** (two-node mode only) — waits for replication queues to drain, then compares row counts and checksums across all replicas.
+ClickHouse uses `ALTER TABLE ... UPDATE` and `ALTER TABLE ... DELETE` instead of standard `UPDATE`/`DELETE`. These are background mutations that rewrite data parts.
+
+Enable them with probability weights:
+
+```bash
+./bld/src/pstress-ch --port 9000 --tables 10 --threads 5 --seconds 120 \
+  --logdir /tmp/pstress-ch \
+  --ch-alter-update 5 --ch-alter-delete 3 --only-cl-sql
+```
+
+Each mutation targets approximately **50–70% of the table's row range** using a `BETWEEN` clause on the integer primary key, ensuring meaningful data churn rather than single-row updates.
+
+By default, `SETTINGS mutations_sync = 2` is appended so mutations complete synchronously on all replicas before the next query proceeds. To run mutations asynchronously:
+
+```bash
+./bld/src/pstress-ch --ch-alter-update 5 --ch-alter-delete 3 \
+  --ch-mutations-sync=OFF ...
+```
+
+## Schema verification
+
+**Startup check (step ≥ 2):** Before the workload begins, pstress compares the saved metadata against the live ClickHouse schema. If any column is missing or has a nullability mismatch, pstress aborts immediately rather than running a workload against a broken schema.
+
+**End-of-run check:** After every run, pstress re-verifies schema and (in two-node mode) replica consistency.
 
 Example output:
 ```
@@ -160,6 +185,10 @@ Example output:
   tt_2                  r1[cnt=5000     csum=9876543210]  r2[cnt=5000     csum=9876543210]  => OK
 [14:32:01] ==> Replica verification: PASS
 ```
+
+## DDL log timestamps
+
+All entries in the general (DDL) log file include a `[HH:MM:SS]` timestamp by default, making it straightforward to correlate DDL operations with server-side events.
 
 ---
 

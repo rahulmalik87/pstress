@@ -514,6 +514,12 @@ int sum_of_all_options(Thd1 *thd) {
     g_encryption = {enc_type};
 
   /* feature not supported by oracle */
+  /* CH_ALTER_UPDATE/DELETE are ClickHouse-only mutations */
+  if (strcmp(FORK, "ClickHouse") != 0) {
+    options->at(Option::CH_ALTER_UPDATE)->setInt(0);
+    options->at(Option::CH_ALTER_DELETE)->setInt(0);
+  }
+
   if (strcmp(FORK, "MySQL") == 0) {
     options->at(Option::ALTER_DATABASE_ENCRYPTION)->setInt(0);
     options->at(Option::NO_COLUMN_COMPRESSION)->setBool("true");
@@ -3057,7 +3063,8 @@ void Table::DropColumn(Thd1 *thd) {
 
   sql += pick_algorithm_lock();
 #ifdef USE_CLICKHOUSE
-  sql += " SETTINGS mutations_sync = 2";
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
 #endif
   unlock_table_mutex();
 
@@ -3203,7 +3210,8 @@ void Table::AddColumn(Thd1 *thd) {
 
   sql += algorithm_lock;
 #ifdef USE_CLICKHOUSE
-  sql += " SETTINGS mutations_sync = 2";
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
 #endif
 
   unlock_table_mutex();
@@ -3790,6 +3798,65 @@ void Table::DeleteAllRows(Thd1 *thd) {
   std::shared_lock lock(dml_mutex);
   execute_sql(sql, thd);
 }
+
+#ifdef USE_CLICKHOUSE
+/* Return a WHERE clause targeting ~50-70% of the table's row range.
+   Uses the integer PK column with a BETWEEN range covering half to
+   two-thirds of the full value span.  Falls back to GetWhereBulk()
+   when no integer PK exists. */
+std::string Table::GetWhereLargeRange() {
+  Column *int_pk = nullptr;
+  for (auto col : *columns_) {
+    if (col->primary_key && col->is_col_number()) {
+      int_pk = col;
+      break;
+    }
+  }
+  if (int_pk == nullptr)
+    return GetWhereBulk();
+
+  auto unique_range = options->at(Option::UNIQUE_RANGE)->getFloat();
+  auto total_range =
+      static_cast<long int>(unique_range * (long int)number_of_records);
+  if (total_range < 2)
+    return GetWhereBulk();
+
+  /* width covers 50-70% of the full value span */
+  auto width = rand_int((long int)(total_range * 0.2)) +
+               (long int)(total_range * 0.5);
+  /* start somewhere in the lower 30% so the range fits inside total_range */
+  auto lo = try_negative(rand_int((long int)(total_range * 0.3)));
+  auto hi = lo + width;
+  return " WHERE " + int_pk->name_ + " BETWEEN " + std::to_string(lo) +
+         " AND " + std::to_string(hi);
+}
+
+/* ALTER TABLE t UPDATE col=val WHERE ... SETTINGS mutations_sync=2
+   mutations_sync=2 waits for the mutation to complete on all replicas. */
+void Table::AlterTableUpdate(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  std::string sql = "ALTER TABLE " + name_ + " UPDATE " + SetClause() +
+                    GetWhereLargeRange();
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+  unlock_table_mutex();
+  execute_sql(sql, thd);
+}
+
+/* ALTER TABLE t DELETE WHERE ... SETTINGS mutations_sync=2 */
+void Table::AlterTableDelete(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  std::string sql =
+      "ALTER TABLE " + name_ + " DELETE" + GetWhereLargeRange();
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+  unlock_table_mutex();
+  execute_sql(sql, thd);
+}
+#else
+void Table::AlterTableUpdate(Thd1 *) {}
+void Table::AlterTableDelete(Thd1 *) {}
+#endif
 
 void Table::SelectAllRow(Thd1 *thd, bool select_for_update) {
   lock_table_mutex(thd->ddl_query);

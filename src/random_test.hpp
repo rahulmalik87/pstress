@@ -404,11 +404,14 @@ struct Table {
   Column *GetRandomColumn();
   std::string GetWherePrecise();
   std::string GetWhereBulk();
+  std::string GetWhereLargeRange();
   std::string ColumnValues(Thd1 *thd, int value_count = 1);
   std::string SelectColumn();
   std::string SetClause();
   void DeleteAllRows(Thd1 *thd);
   void UpdateAllRows(Thd1 *thd);
+  void AlterTableUpdate(Thd1 *thd);
+  void AlterTableDelete(Thd1 *thd);
   void ColumnRename(Thd1 *thd);
   void IndexRename(Thd1 *thd);
   template <typename Writer> void Serialize(Writer &writer) const;
