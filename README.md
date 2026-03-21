@@ -140,7 +140,7 @@ cmake .. -DCLICKHOUSE=ON \
 | `--insert-bulk=N` | `0` | Probability weight for bulk INSERT |
 | `--ch-alter-update=N` | `0` | Probability weight for ALTER TABLE UPDATE mutations |
 | `--ch-alter-delete=N` | `0` | Probability weight for ALTER TABLE DELETE mutations |
-| `--ch-mutations-sync` | `ON` | Append `SETTINGS mutations_sync=2` to all mutations (ADD/DROP COLUMN, ALTER UPDATE/DELETE) |
+| `--ch-mutations-sync` | off | Append `SETTINGS mutations_sync=2` to all mutations (ADD/DROP COLUMN, ALTER UPDATE/DELETE) |
 | `--threads N` | `10` | Threads per node |
 | `--tables N` | `10` | Number of tables to create |
 | `--seconds N` | `100` | How long to run the workload |
@@ -159,11 +159,15 @@ Enable them with probability weights:
 
 Each mutation targets approximately **50–70% of the table's row range** using a `BETWEEN` clause on the integer primary key, ensuring meaningful data churn rather than single-row updates.
 
-By default, `SETTINGS mutations_sync = 2` is appended so mutations complete synchronously on all replicas before the next query proceeds. To run mutations asynchronously:
+Pass `--ch-mutations-sync` to append `SETTINGS mutations_sync = 2`, which makes mutations complete synchronously on all replicas before the next query proceeds. Without the flag, mutations run asynchronously (default):
 
 ```bash
+# synchronous mutations:
 ./bld/src/pstress-ch --ch-alter-update 5 --ch-alter-delete 3 \
-  --ch-mutations-sync=OFF ...
+  --ch-mutations-sync ...
+
+# asynchronous (default, no flag needed):
+./bld/src/pstress-ch --ch-alter-update 5 --ch-alter-delete 3 ...
 ```
 
 ## Schema verification

@@ -998,8 +998,9 @@ void add_options() {
 
   opt = newOption(Option::BOOL, Option::CH_MUTATIONS_SYNC, "ch-mutations-sync");
   opt->help = "Append SETTINGS mutations_sync=2 to ClickHouse ALTER mutations "
-              "(ADD/DROP COLUMN, ALTER UPDATE/DELETE). Default: ON";
-  opt->setBool(true);
+              "(ADD/DROP COLUMN, ALTER UPDATE/DELETE). Pass flag to enable.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
   opt->short_help = "CHMutationsSync";
 
   /* Drop column */

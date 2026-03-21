@@ -138,7 +138,10 @@ void ch_verify_startup(const std::vector<std::string> &addrs,
   std::cout << "\n==> [startup] Waiting for replication to catch up..." << std::endl;
   auto clients = make_clients(addrs, ports, db, user, pass);
   wait_for_replication(clients, db);
-  do_verify(clients, db);
+  if (!do_verify(clients, db)) {
+    std::cerr << "ERROR: Replica mismatch at startup — aborting.\n";
+    exit(EXIT_FAILURE);
+  }
 }
 
 void ch_verify_replicas(const std::vector<std::string> &addrs,
