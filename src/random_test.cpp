@@ -2889,9 +2889,13 @@ bool execute_sql(const std::string &sql, Thd1 *thd, bool force_sql_log_query) {
   }
 
   if (thd->ddl_query) {
+    auto _now = std::chrono::system_clock::now();
+    auto _tt  = std::chrono::system_clock::to_time_t(_now);
+    std::ostringstream _ts;
+    _ts << std::put_time(std::localtime(&_tt), "%H:%M:%S");
     std::lock_guard<std::mutex> lock(ddl_logs_write);
-    thd->ddl_logs << thd->thread_id << " " << sql << " " << thd->db->get_error()
-                  << std::endl;
+    thd->ddl_logs << "[" << _ts.str() << "] " << thd->thread_id << " " << sql
+                  << " " << thd->db->get_error() << std::endl;
   }
 
   return res;
