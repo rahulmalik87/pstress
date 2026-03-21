@@ -4083,9 +4083,13 @@ bool Thd1::load_metadata() {
     validate_secondary_engine(this);
   }
 
-  /*set seed for current step*/
-  std::cout << "Running " << FORK << " version " << db->get_server_version()
-            << std::endl;
+  /*set seed for current step — print version only once across all nodes */
+  static bool version_printed = false;
+  if (!version_printed) {
+    version_printed = true;
+    std::cout << "Running " << FORK << " version " << db->get_server_version()
+              << std::endl;
+  }
 
   /* create in-memory data for general tablespaces */
   create_in_memory_data();
