@@ -27,12 +27,47 @@ extern std::vector<Table *> *all_tables;
 #include <iostream>
 #include <libgen.h> //dirname() uses this
 #include <signal.h> //For signal()
+#include <algorithm>
+#include <filesystem>
 #include <set>
 #include <string>
 #include <thread>
 
 extern std::atomic<bool> run_query_failed;
 thread_local std::mt19937 rng;
+
+/* Scan logdir for existing metadata step files and return the next step to run.
+   File pattern: {instance}_{db}_metadata_step_{N}.log
+   Returns the highest N found + 1, or 1 if no files found. */
+static int detect_next_step(const std::string &logdir, const std::string &db) {
+#ifdef USE_MYSQL
+  const std::string instance = "mysql";
+#elif USE_DUCKDB
+  const std::string instance = "duckdb";
+#else
+  const std::string instance = "clickhouse";
+#endif
+  const std::string prefix = instance + "_" + db + "_metadata_step_";
+  const std::string suffix = ".log";
+  int max_step = 0;
+  try {
+    for (const auto &entry : std::filesystem::directory_iterator(logdir)) {
+      if (!entry.is_regular_file())
+        continue;
+      std::string fname = entry.path().filename().string();
+      if (fname.rfind(prefix, 0) != 0)
+        continue;
+      if (fname.size() <= prefix.size() + suffix.size())
+        continue;
+      std::string num = fname.substr(prefix.size(),
+                                     fname.size() - prefix.size() - suffix.size());
+      if (num.empty() || !std::all_of(num.begin(), num.end(), ::isdigit))
+        continue;
+      max_step = std::max(max_step, std::stoi(num));
+    }
+  } catch (...) {}
+  return max_step + 1;
+}
 
 void read_section_settings(struct workerParams *wParams, std::string secName,
                            std::string confFile) {
@@ -223,6 +258,17 @@ int main(int argc, char *argv[]) {
   if (options->at(Option::DATABASE)->getString() == "test")
     options->at(Option::DATABASE)->setString("test_db");
 #endif
+
+  /* Auto-detect step from logdir if --step was not explicitly given.
+     Scans for the highest existing metadata step file and runs the next one. */
+  if (!options->at(Option::STEP)->cl) {
+    const std::string &logdir = options->at(Option::LOGDIR)->getString();
+    const std::string &db    = options->at(Option::DATABASE)->getString();
+    int next_step = detect_next_step(logdir, db);
+    options->at(Option::STEP)->setInt(next_step);
+    std::cout << "Auto-detected step " << next_step
+              << " (scanned " << logdir << ")" << std::endl;
+  }
 
   auto ports = splitStringToArray<int>(options->at(Option::PORT)->getString());
   auto addrs = splitStringToArray<std::string>(options->at(Option::ADDRESS)->getString());
