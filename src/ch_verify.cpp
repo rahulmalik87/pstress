@@ -157,8 +157,9 @@ void ch_verify_replicas(const std::vector<std::string> &addrs,
 }
 
 /* Compare pstress in-memory metadata columns against actual ClickHouse schema.
-   Uses the first node. Reports missing/extra columns and nullability mismatches. */
-void ch_verify_schema(const std::vector<std::string> &addrs,
+   Uses the first node. Reports missing/extra columns and nullability mismatches.
+   Returns true if all tables match, false on any mismatch. */
+bool ch_verify_schema(const std::vector<std::string> &addrs,
                       const std::vector<int> &ports,
                       const std::string &db, const std::string &user,
                       const std::string &pass) {
@@ -249,5 +250,6 @@ void ch_verify_schema(const std::vector<std::string> &addrs,
 
   std::cout << "[" << now_str() << "] ==> Schema verification: "
             << (all_ok ? "PASS" : "FAIL") << std::endl;
+  return all_ok;
 }
 #endif

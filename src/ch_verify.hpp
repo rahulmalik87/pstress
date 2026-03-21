@@ -26,8 +26,8 @@ void ch_verify_replicas(const std::vector<std::string> &addrs,
 
 /* Compare pstress in-memory metadata columns against actual ClickHouse schema.
    Connects to the first node and reports missing columns, extra columns, and
-   nullability mismatches. */
-void ch_verify_schema(const std::vector<std::string> &addrs,
+   nullability mismatches. Returns true if all tables match, false otherwise. */
+bool ch_verify_schema(const std::vector<std::string> &addrs,
                       const std::vector<int> &ports,
                       const std::string &db, const std::string &user,
                       const std::string &pass);

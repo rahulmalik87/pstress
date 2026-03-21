@@ -474,12 +474,19 @@ bool Thd1::run_some_query() {
      step, after tables are created/loaded and before the workload begins.
      std::call_once ensures this runs exactly once across all threads/nodes. */
   static std::once_flag startup_schema_check;
+  static std::atomic<bool> startup_schema_ok{true};
   std::call_once(startup_schema_check, [&]() {
-    ch_verify_schema({myParam->address}, {myParam->port},
-                     options->at(Option::DATABASE)->getString(),
-                     options->at(Option::USER)->getString(),
-                     options->at(Option::PASSWORD)->getString());
+    bool ok = ch_verify_schema({myParam->address}, {myParam->port},
+                               options->at(Option::DATABASE)->getString(),
+                               options->at(Option::USER)->getString(),
+                               options->at(Option::PASSWORD)->getString());
+    if (!ok) {
+      std::cerr << "ERROR: Schema mismatch at startup — aborting.\n";
+      startup_schema_ok.store(false);
+    }
   });
+  if (!startup_schema_ok.load())
+    return false;
 #endif
 
   if (options->at(Option::JUST_LOAD_DDL)->getBool() ||
