@@ -39,7 +39,6 @@
 
 set -euo pipefail
 
-DOCKER_IMAGE="ghcr.io/rahulmalik87/pstress-ch:latest"
 RELEASE_URL="https://github.com/rahulmalik87/pstress/releases/latest/download/pstress-ch"
 
 # ── Connection / test defaults ───────────────────────────────────────────────
@@ -84,7 +83,7 @@ print_summary() {
   echo ""
 }
 
-# ── macOS path — run via Docker ──────────────────────────────────────────────
+# ── macOS path — run via Docker (downloads binary inside stock Ubuntu) ────────
 if [[ "$OS" == "Darwin" ]]; then
   if ! command -v docker &>/dev/null; then
     echo "ERROR: Docker is required on macOS."
@@ -99,30 +98,29 @@ if [[ "$OS" == "Darwin" ]]; then
     DOCKER_CH_HOST="host.docker.internal"
   fi
 
-  # Rebuild args with the adjusted host
-  DOCKER_ARGS=(
-    --address  "$DOCKER_CH_HOST"
-    --port     "$CH_PORT"
-    --user     "$CH_USER"
-    --database "$CH_DB"
-    --tables   "$TABLES"
-    --threads  "$THREADS"
-    --seconds  "$SECONDS"
-    --logdir   /logs
-  )
-  [[ -n "$CH_PASS" ]] && DOCKER_ARGS+=(--password "$CH_PASS")
-  DOCKER_ARGS+=("$@")
+  # Build the pstress-ch argument string to pass into the container shell.
+  PSTRESS_ARGS="--address $DOCKER_CH_HOST --port $CH_PORT --user $CH_USER"
+  PSTRESS_ARGS+=" --database $CH_DB --tables $TABLES --threads $THREADS"
+  PSTRESS_ARGS+=" --seconds $SECONDS --logdir /logs"
+  [[ -n "$CH_PASS" ]] && PSTRESS_ARGS+=" --password $CH_PASS"
+  for arg in "$@"; do PSTRESS_ARGS+=" $arg"; done
 
-  echo "macOS detected — running via Docker ($DOCKER_IMAGE)"
-  echo "  (pull may take a moment on first run)"
+  echo "macOS detected — running via Docker (ubuntu:22.04, platform linux/amd64)"
+  echo "  (first run will pull the base image ~30 MB)"
   print_summary
 
   exec docker run --rm \
     --platform linux/amd64 \
     --add-host host.docker.internal:host-gateway \
     -v "$LOGDIR":/logs \
-    "$DOCKER_IMAGE" \
-    "${DOCKER_ARGS[@]}"
+    ubuntu:22.04 \
+    bash -c "
+      set -e
+      apt-get update -qq && apt-get install -y -qq curl 2>/dev/null
+      curl -fsSL '$RELEASE_URL' -o /tmp/pstress-ch
+      chmod +x /tmp/pstress-ch
+      exec /tmp/pstress-ch $PSTRESS_ARGS
+    "
 fi
 
 # ── Linux path — native binary ───────────────────────────────────────────────
