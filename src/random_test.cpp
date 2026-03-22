@@ -3287,8 +3287,9 @@ void Table::AddColumn(Thd1 *thd) {
         break;
       }
       std::string backfill = "ALTER TABLE " + name_ + " UPDATE " +
-                             added_name + " = " + rand_expr +
-                             " WHERE 1=1 SETTINGS mutations_sync = 2";
+                             added_name + " = " + rand_expr + " WHERE 1=1";
+      if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+        backfill += " SETTINGS mutations_sync = 2";
       execute_sql(backfill, thd);
     }
 #endif
