@@ -10,7 +10,10 @@
 #   macOS           — NOT supported (binary is Linux only; use a Linux host)
 #
 # Usage:
-#   bash reproduce_ch.sh [options]
+#   bash reproduce_ch.sh [--clean-logdir] [extra pstress-ch flags]
+#
+# Script flags (not passed to pstress-ch):
+#   --clean-logdir   Wipe LOG_DIR before starting (fresh run)
 #
 # Environment variables:
 #   CH_HOST   ClickHouse host   (default: 127.0.0.1)
@@ -34,6 +37,18 @@ CH_USER="${CH_USER:-default}"
 CH_PASS="${CH_PASS:-}"
 CH_DB="${CH_DB:-test_db}"
 LOG_DIR="${LOG_DIR:-/tmp/pstress_ch_reproduce}"
+
+# ── Parse script-level flags (strip them; remainder is passed to pstress-ch) ──
+CLEAN_LOGDIR=0
+EXTRA_ARGS=()
+for _arg in "$@"; do
+  if [[ "$_arg" == "--clean-logdir" ]]; then
+    CLEAN_LOGDIR=1
+  else
+    EXTRA_ARGS+=("$_arg")
+  fi
+done
+set -- "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 
 # ── Platform check ────────────────────────────────────────────────────────────
 OS="$(uname -s)"
@@ -62,6 +77,10 @@ chmod +x "$BINARY"
 echo "    Binary: $BINARY"
 
 # ── Prepare log directory ─────────────────────────────────────────────────────
+if [[ $CLEAN_LOGDIR -eq 1 && -d "$LOG_DIR" ]]; then
+  echo "    Cleaning logdir: $LOG_DIR"
+  rm -rf "$LOG_DIR"
+fi
 mkdir -p "$LOG_DIR"
 echo "    Logs:   $LOG_DIR"
 echo ""
