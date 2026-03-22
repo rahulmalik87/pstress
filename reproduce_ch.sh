@@ -99,19 +99,19 @@ fi
 
 # ── Run 1: 4 threads + kill transaction ──────────────────────────────────────
 echo "==> Run 1 — port $PORTS, 4 threads, kill-trx-prob-k=1"
-"$BINARY" --port="$PORTS" --threads=4 "${COMMON_ARGS[@]}" --single-thread-ddl --kill-trx-prob-k=1
+"$BINARY" --port="$PORTS" --threads=4 "${COMMON_ARGS[@]}" --single-thread-ddl --kill-trx-prob-k=1 "$@"
 echo "    Run 1 complete."
 echo ""
 
 # ── Run 2: 4 threads ─────────────────────────────────────────────────────────
 echo "==> Run 2 — port $PORTS, 4 threads"
-"$BINARY" --port="$PORTS" --threads=4 "${COMMON_ARGS[@]}" --single-thread-ddl
+"$BINARY" --port="$PORTS" --threads=4 "${COMMON_ARGS[@]}" --single-thread-ddl "$@"
 echo "    Run 2 complete."
 echo ""
 
 # ── Run 3: 4 threads ─────────────────────────────────────────────────────────
 echo "==> Run 3 — port $PORTS, 4 threads"
-"$BINARY" --port="$PORTS" --threads=4 "${COMMON_ARGS[@]}"
+"$BINARY" --port="$PORTS" --threads=4 "${COMMON_ARGS[@]}" "$@"
 echo "    Run 3 complete."
 echo ""
 
