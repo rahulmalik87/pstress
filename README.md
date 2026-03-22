@@ -67,7 +67,7 @@ The same command works on both platforms. On macOS the script automatically runs
 
 **Customise with environment variables:**
 ```bash
-CH_HOST=10.0.0.5 CH_PORT=9000 TABLES=20 THREADS=20 SECONDS=600 \
+CH_HOST=10.0.0.5 CH_PORT=9000 TABLES=20 THREADS=20 DURATION=600 \
   bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/run_pstress_ch.sh) \
   --ch-alter-update 5 --ch-alter-delete 3 --ch-mutations-sync
 ```
