@@ -88,6 +88,32 @@ Any additional arguments after the URL are passed directly to `pstress-ch`.
 
 ---
 
+# Reproduce a specific scenario — reproduce_ch.sh
+
+`reproduce_ch.sh` runs a fixed three-step workload designed to reproduce a known stress scenario against a two-replica setup. Any extra flags you pass are forwarded to all three runs.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/reproduce_ch.sh)
+```
+
+**With extra flags (e.g. synchronous mutations):**
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/reproduce_ch.sh) \
+  --ch-mutations-sync
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CH_HOST` | `127.0.0.1` | ClickHouse host/IP |
+| `CH_PORT1` | `9000` | First replica port |
+| `CH_PORT2` | `9001` | Second replica port |
+| `CH_USER` | `default` | ClickHouse user |
+| `CH_PASS` | _(empty)_ | Password |
+| `CH_DB` | `test_db` | Database name |
+| `LOG_DIR` | `/tmp/pstress_ch_reproduce` | Directory for log files |
+
+---
+
 # Building pstress with ClickHouse
 
 ## Prerequisites
