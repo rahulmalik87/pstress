@@ -10,6 +10,9 @@ ADD_EXECUTABLE(${BINARY_NAME}-${PSTRESS_EXT} pstress.cpp help.cpp node.cpp threa
 if(CLICKHOUSE)
   TARGET_LINK_LIBRARIES( ${BINARY_NAME}-${PSTRESS_EXT} ${DB_LIBRARY} ${OTHER_LIBS} inih++
     /usr/local/lib/libcityhash.a /usr/local/lib/liblz4.a /usr/local/lib/libzstdstatic.a)
+  # Statically link libstdc++ and libgcc so the binary runs on any Linux
+  # without needing matching runtime library versions installed.
+  TARGET_LINK_OPTIONS( ${BINARY_NAME}-${PSTRESS_EXT} PRIVATE -static-libstdc++ -static-libgcc)
 else()
   TARGET_LINK_LIBRARIES( ${BINARY_NAME}-${PSTRESS_EXT} ${DB_LIBRARY} ${OTHER_LIBS} inih++)
 endif()
