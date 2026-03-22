@@ -2,14 +2,17 @@
 # ---------------------------------------------------------------------------
 # run_pstress_ch.sh  —  Download and run pstress ClickHouse stress test
 #
-# Usage:
-#   bash run_pstress_ch.sh [options passed directly to pstress-ch]
+# Supported platforms:
+#   Linux x86_64   — downloads pre-built binary from GitHub Releases
+#   macOS (Intel/Apple Silicon) — runs via Docker (requires Docker Desktop)
 #
-# Environment variables (all optional, fall back to defaults):
+# Usage:
+#   bash run_pstress_ch.sh [extra pstress-ch flags]
+#
+# Environment variables (all optional):
 #   CH_HOST      ClickHouse host/IP          (default: 127.0.0.1)
 #   CH_PORT      Native protocol port(s)     (default: 9000)
-#                Pass comma-separated ports for replica testing:
-#                  CH_PORT=9001,9002 bash run_pstress_ch.sh
+#                Comma-separated for replica testing: CH_PORT=9001,9002
 #   CH_USER      ClickHouse user             (default: default)
 #   CH_PASS      Password                    (default: empty)
 #   CH_DB        Database name               (default: test_db)
@@ -17,80 +20,45 @@
 #   THREADS      Worker threads per node     (default: 10)
 #   SECONDS      Test duration in seconds    (default: 300)
 #   LOGDIR       Directory for log files     (default: /tmp/pstress_ch)
-#   PSTRESS_BIN  Path to existing binary     (skip download if set)
+#   PSTRESS_BIN  Path to an existing binary  (Linux only, skips download)
 #
 # Examples:
 #   # Basic single-node test
 #   bash run_pstress_ch.sh
 #
-#   # Custom host/port
+#   # Remote server
 #   CH_HOST=10.0.0.5 CH_PORT=9000 bash run_pstress_ch.sh
 #
-#   # Two-replica test with backfill and mutations
+#   # Two-replica test with mutation stress
 #   CH_PORT=9001,9002 bash run_pstress_ch.sh \
 #     --ch-alter-update 5 --ch-alter-delete 5 --ch-mutations-sync
 #
-#   # High-concurrency 60-second smoke test
+#   # Quick 60-second smoke test
 #   THREADS=50 SECONDS=60 bash run_pstress_ch.sh
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
 
-# ── Release URL ─────────────────────────────────────────────────────────────
+DOCKER_IMAGE="ghcr.io/rahulmalik87/pstress-ch:latest"
 RELEASE_URL="https://github.com/rahulmalik87/pstress/releases/latest/download/pstress-ch"
 
-# ── Connection defaults ──────────────────────────────────────────────────────
+# ── Connection / test defaults ───────────────────────────────────────────────
 CH_HOST="${CH_HOST:-127.0.0.1}"
 CH_PORT="${CH_PORT:-9000}"
 CH_USER="${CH_USER:-default}"
 CH_PASS="${CH_PASS:-}"
 CH_DB="${CH_DB:-test_db}"
-
-# ── Test parameters ──────────────────────────────────────────────────────────
 TABLES="${TABLES:-10}"
 THREADS="${THREADS:-10}"
 SECONDS="${SECONDS:-300}"
 LOGDIR="${LOGDIR:-/tmp/pstress_ch}"
 
-# ── Platform check ───────────────────────────────────────────────────────────
+mkdir -p "$LOGDIR"
+
 OS="$(uname -s)"
 ARCH="$(uname -m)"
-if [[ "$OS" != "Linux" || "$ARCH" != "x86_64" ]]; then
-  echo "ERROR: pstress-ch binary is built for Linux x86_64."
-  echo "       Detected: $OS / $ARCH"
-  exit 1
-fi
 
-# ── Download binary if needed ────────────────────────────────────────────────
-if [[ -n "${PSTRESS_BIN:-}" ]]; then
-  BINARY="$PSTRESS_BIN"
-  echo "Using existing binary: $BINARY"
-else
-  BINARY="$(mktemp -d)/pstress-ch"
-  echo "Downloading pstress-ch from GitHub..."
-  if command -v curl &>/dev/null; then
-    curl -fsSL -o "$BINARY" "$RELEASE_URL"
-  elif command -v wget &>/dev/null; then
-    wget -q -O "$BINARY" "$RELEASE_URL"
-  else
-    echo "ERROR: Neither curl nor wget found. Install one and retry."
-    exit 1
-  fi
-  chmod +x "$BINARY"
-  echo "Downloaded to: $BINARY"
-fi
-
-# ── Verify binary executes ───────────────────────────────────────────────────
-if ! "$BINARY" --help &>/dev/null; then
-  echo "ERROR: Binary does not run. Check glibc version (needs glibc 2.17+)."
-  exit 1
-fi
-
-# ── Prepare log directory ────────────────────────────────────────────────────
-mkdir -p "$LOGDIR"
-echo "Log directory: $LOGDIR"
-
-# ── Build argument list ──────────────────────────────────────────────────────
+# ── Build common args ────────────────────────────────────────────────────────
 ARGS=(
   --address  "$CH_HOST"
   --port     "$CH_PORT"
@@ -101,21 +69,104 @@ ARGS=(
   --seconds  "$SECONDS"
   --logdir   "$LOGDIR"
 )
-if [[ -n "$CH_PASS" ]]; then
-  ARGS+=(--password "$CH_PASS")
+[[ -n "$CH_PASS" ]] && ARGS+=(--password "$CH_PASS")
+ARGS+=("$@")   # pass any extra flags through
+
+print_summary() {
+  echo ""
+  echo "Starting pstress-ch:"
+  echo "  Host:    $CH_HOST"
+  echo "  Port:    $CH_PORT"
+  echo "  User:    $CH_USER"
+  echo "  DB:      $CH_DB"
+  echo "  Tables:  $TABLES  Threads: $THREADS  Duration: ${SECONDS}s"
+  echo "  Logs:    $LOGDIR"
+  echo ""
+}
+
+# ── macOS path — run via Docker ──────────────────────────────────────────────
+if [[ "$OS" == "Darwin" ]]; then
+  if ! command -v docker &>/dev/null; then
+    echo "ERROR: Docker is required on macOS."
+    echo "       Install Docker Desktop: https://www.docker.com/products/docker-desktop/"
+    exit 1
+  fi
+
+  # Replace loopback with host.docker.internal so the container can reach
+  # ClickHouse running on the Mac host.
+  DOCKER_CH_HOST="$CH_HOST"
+  if [[ "$DOCKER_CH_HOST" == "127.0.0.1" || "$DOCKER_CH_HOST" == "localhost" ]]; then
+    DOCKER_CH_HOST="host.docker.internal"
+  fi
+
+  # Rebuild args with the adjusted host
+  DOCKER_ARGS=(
+    --address  "$DOCKER_CH_HOST"
+    --port     "$CH_PORT"
+    --user     "$CH_USER"
+    --database "$CH_DB"
+    --tables   "$TABLES"
+    --threads  "$THREADS"
+    --seconds  "$SECONDS"
+    --logdir   /logs
+  )
+  [[ -n "$CH_PASS" ]] && DOCKER_ARGS+=(--password "$CH_PASS")
+  DOCKER_ARGS+=("$@")
+
+  echo "macOS detected — running via Docker ($DOCKER_IMAGE)"
+  echo "  (pull may take a moment on first run)"
+  print_summary
+
+  exec docker run --rm \
+    --platform linux/amd64 \
+    --add-host host.docker.internal:host-gateway \
+    -v "$LOGDIR":/logs \
+    "$DOCKER_IMAGE" \
+    "${DOCKER_ARGS[@]}"
 fi
-# Append any extra args passed to this script
+
+# ── Linux path — native binary ───────────────────────────────────────────────
+if [[ "$OS" != "Linux" || "$ARCH" != "x86_64" ]]; then
+  echo "ERROR: Unsupported platform: $OS/$ARCH"
+  echo "       Supported: Linux x86_64, macOS (Intel/Apple Silicon via Docker)"
+  exit 1
+fi
+
+if [[ -n "${PSTRESS_BIN:-}" ]]; then
+  BINARY="$PSTRESS_BIN"
+  echo "Using existing binary: $BINARY"
+else
+  BINARY="$(mktemp -d)/pstress-ch"
+  echo "Downloading pstress-ch..."
+  if command -v curl &>/dev/null; then
+    curl -fsSL -o "$BINARY" "$RELEASE_URL"
+  elif command -v wget &>/dev/null; then
+    wget -q -O "$BINARY" "$RELEASE_URL"
+  else
+    echo "ERROR: Neither curl nor wget found."
+    exit 1
+  fi
+  chmod +x "$BINARY"
+  echo "Downloaded to: $BINARY"
+fi
+
+if ! "$BINARY" --help &>/dev/null; then
+  echo "ERROR: Binary failed to run. Requires glibc 2.17+ (RHEL7 / Ubuntu 14.04 or newer)."
+  exit 1
+fi
+
+ARGS=(
+  --address  "$CH_HOST"
+  --port     "$CH_PORT"
+  --user     "$CH_USER"
+  --database "$CH_DB"
+  --tables   "$TABLES"
+  --threads  "$THREADS"
+  --seconds  "$SECONDS"
+  --logdir   "$LOGDIR"
+)
+[[ -n "$CH_PASS" ]] && ARGS+=(--password "$CH_PASS")
 ARGS+=("$@")
 
-# ── Run ──────────────────────────────────────────────────────────────────────
-echo ""
-echo "Starting pstress-ch:"
-echo "  Host:    $CH_HOST"
-echo "  Port:    $CH_PORT"
-echo "  User:    $CH_USER"
-echo "  DB:      $CH_DB"
-echo "  Tables:  $TABLES  Threads: $THREADS  Duration: ${SECONDS}s"
-echo "  Logs:    $LOGDIR"
-echo ""
-
+print_summary
 exec "$BINARY" "${ARGS[@]}"
