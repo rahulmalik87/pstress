@@ -49,6 +49,45 @@ make
 
 ---
 
+# Quick Start — pstress-ch (no build required)
+
+A pre-built portable binary is available for **Linux x86_64** and **macOS** (via Docker). No dependencies need to be installed other than Docker on macOS.
+
+**Linux x86_64:**
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/run_pstress_ch.sh)
+```
+
+**macOS (Intel or Apple Silicon — requires [Docker Desktop](https://www.docker.com/products/docker-desktop/)):**
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/run_pstress_ch.sh)
+```
+
+The same command works on both platforms. On macOS the script automatically runs the binary inside Docker and routes `localhost` to `host.docker.internal` so a local ClickHouse server is reachable.
+
+**Customise with environment variables:**
+```bash
+CH_HOST=10.0.0.5 CH_PORT=9000 TABLES=20 THREADS=20 SECONDS=600 \
+  bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/run_pstress_ch.sh) \
+  --ch-alter-update 5 --ch-alter-delete 3 --ch-mutations-sync
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CH_HOST` | `127.0.0.1` | ClickHouse host/IP |
+| `CH_PORT` | `9000` | Native protocol port; comma-separated for replicas (`9001,9002`) |
+| `CH_USER` | `default` | ClickHouse user |
+| `CH_PASS` | _(empty)_ | Password |
+| `CH_DB` | `test_db` | Database name |
+| `TABLES` | `10` | Number of tables |
+| `THREADS` | `10` | Worker threads per node |
+| `SECONDS` | `300` | Test duration |
+| `LOGDIR` | `/tmp/pstress_ch` | Directory for log files |
+
+Any additional arguments after the URL are passed directly to `pstress-ch`.
+
+---
+
 # Building pstress with ClickHouse
 
 ## Prerequisites
@@ -141,6 +180,7 @@ cmake .. -DCLICKHOUSE=ON \
 | `--ch-alter-update=N` | `0` | Probability weight for ALTER TABLE UPDATE mutations |
 | `--ch-alter-delete=N` | `0` | Probability weight for ALTER TABLE DELETE mutations |
 | `--ch-mutations-sync` | off | Append `SETTINGS mutations_sync=2` to all mutations (ADD/DROP COLUMN, ALTER UPDATE/DELETE) |
+| `--ch-add-column-backfill` | off | After ADD COLUMN, fire a synchronous mutation to fill existing rows with random values instead of leaving them at the ClickHouse zero-default (`''` / `0`) |
 | `--threads N` | `10` | Threads per node |
 | `--tables N` | `10` | Number of tables to create |
 | `--seconds N` | `100` | How long to run the workload |
