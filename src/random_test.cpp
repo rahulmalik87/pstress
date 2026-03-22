@@ -3242,8 +3242,10 @@ void Table::AddColumn(Thd1 *thd) {
 
     /* capture before unlock — tc may be deleted below */
     std::string added_name = tc->name_;
+#ifdef USE_CLICKHOUSE
     Column::COLUMN_TYPES added_type = tc->type_;
     int added_length = tc->length;
+#endif
 
     if (add_new_column)
       AddInternalColumn(tc);

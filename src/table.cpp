@@ -1,7 +1,9 @@
 #include "random_test.hpp"
 #include <array>
 #include <document.h>
+#ifndef __APPLE__
 #include <malloc.h>
+#endif
 extern std::mutex all_table_mutex;
 extern std::vector<Table *> *all_tables;
 extern int number_of_records;
