@@ -81,7 +81,7 @@ CH_HOST=10.0.0.5 CH_PORT=9000 TABLES=20 THREADS=20 SECONDS=600 \
 | `CH_DB` | `test_db` | Database name |
 | `TABLES` | `10` | Number of tables |
 | `THREADS` | `10` | Worker threads per node |
-| `SECONDS` | `300` | Test duration |
+| `DURATION` | `300` | Test duration in seconds |
 | `LOGDIR` | `/tmp/pstress_ch` | Directory for log files |
 
 Any additional arguments after the URL are passed directly to `pstress-ch`.

@@ -18,7 +18,7 @@
 #   CH_DB        Database name               (default: test_db)
 #   TABLES       Number of tables            (default: 10)
 #   THREADS      Worker threads per node     (default: 10)
-#   SECONDS      Test duration in seconds    (default: 300)
+#   DURATION      Test duration in seconds    (default: 300)
 #   LOGDIR       Directory for log files     (default: /tmp/pstress_ch)
 #   PSTRESS_BIN  Path to an existing binary  (Linux only, skips download)
 #
@@ -34,7 +34,7 @@
 #     --ch-alter-update 5 --ch-alter-delete 5 --ch-mutations-sync
 #
 #   # Quick 60-second smoke test
-#   THREADS=50 SECONDS=60 bash run_pstress_ch.sh
+#   THREADS=50 DURATION=60 bash run_pstress_ch.sh
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -49,7 +49,7 @@ CH_PASS="${CH_PASS:-}"
 CH_DB="${CH_DB:-test_db}"
 TABLES="${TABLES:-10}"
 THREADS="${THREADS:-10}"
-SECONDS="${SECONDS:-300}"
+DURATION="${DURATION:-300}"
 LOGDIR="${LOGDIR:-/tmp/pstress_ch}"
 
 mkdir -p "$LOGDIR"
@@ -65,7 +65,7 @@ ARGS=(
   --database "$CH_DB"
   --tables   "$TABLES"
   --threads  "$THREADS"
-  --seconds  "$SECONDS"
+  --seconds  "$DURATION"
   --logdir   "$LOGDIR"
 )
 [[ -n "$CH_PASS" ]] && ARGS+=(--password "$CH_PASS")
@@ -78,7 +78,7 @@ print_summary() {
   echo "  Port:    $CH_PORT"
   echo "  User:    $CH_USER"
   echo "  DB:      $CH_DB"
-  echo "  Tables:  $TABLES  Threads: $THREADS  Duration: ${SECONDS}s"
+  echo "  Tables:  $TABLES  Threads: $THREADS  Duration: ${DURATION}s"
   echo "  Logs:    $LOGDIR"
   echo ""
 }
@@ -101,7 +101,7 @@ if [[ "$OS" == "Darwin" ]]; then
   # Build the pstress-ch argument string to pass into the container shell.
   PSTRESS_ARGS="--address $DOCKER_CH_HOST --port $CH_PORT --user $CH_USER"
   PSTRESS_ARGS+=" --database $CH_DB --tables $TABLES --threads $THREADS"
-  PSTRESS_ARGS+=" --seconds $SECONDS --logdir /logs"
+  PSTRESS_ARGS+=" --seconds $DURATION --logdir /logs"
   [[ -n "$CH_PASS" ]] && PSTRESS_ARGS+=" --password $CH_PASS"
   for arg in "$@"; do PSTRESS_ARGS+=" $arg"; done
 
@@ -160,7 +160,7 @@ ARGS=(
   --database "$CH_DB"
   --tables   "$TABLES"
   --threads  "$THREADS"
-  --seconds  "$SECONDS"
+  --seconds  "$DURATION"
   --logdir   "$LOGDIR"
 )
 [[ -n "$CH_PASS" ]] && ARGS+=(--password "$CH_PASS")
