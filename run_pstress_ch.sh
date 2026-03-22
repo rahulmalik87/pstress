@@ -39,7 +39,7 @@
 
 set -euo pipefail
 
-RELEASE_URL="https://github.com/rahulmalik87/pstress/releases/latest/download/pstress-ch"
+RELEASE_URL="https://github.com/rahulmalik87/pstress/releases/download/v1.0-clickhouse/pstress-ch"
 
 # ── Connection / test defaults ───────────────────────────────────────────────
 CH_HOST="${CH_HOST:-127.0.0.1}"
