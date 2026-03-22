@@ -145,7 +145,9 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
     }
   }
   // to reduce space of map using in generateUniqueRandomNumbers
+#ifndef __APPLE__
   malloc_trim(0);
+#endif
 
   std::string prepare_sql = "INSERT ";
   prepare_sql += "INTO " + name_ + " (";
