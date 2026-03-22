@@ -32,6 +32,20 @@ static void random_timezone(Thd1 *thd) {
 
 static void kill_query(Thd1 *thd) {
 
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse: pick a random running query from system.processes for this
+     user (excluding our own current_query_id) and kill it. */
+  const std::string user = options->at(Option::USER)->getString();
+  /* current_query_id() returns the query_id of the SELECT itself, which
+     lets us exclude our own probe query from the candidate list. */
+  auto result = thd->db->get_query_result(
+      "SELECT query_id FROM system.processes "
+      "WHERE user = '" + user + "' AND query_id != current_query_id()");
+  if (result.empty())
+    return;
+  const std::string qid = result[rand_int(result.size() - 1)][0];
+  execute_sql("KILL QUERY WHERE query_id = '" + qid + "' SYNC", thd);
+#else
   auto on_exit = std::shared_ptr<void>(nullptr, [&](...) {
     if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
       execute_sql("SET @@SESSION.USE_SECONDARY_ENGINE=FORCED", thd);
@@ -58,7 +72,7 @@ static void kill_query(Thd1 *thd) {
   if (!execute_sql(query, thd)) {
     return;
   }
-  return;
+#endif
 }
 
 std::string getExecutablePath() {
