@@ -134,6 +134,11 @@ int main(int argc, char *argv[]) {
   signal(SIGFPE, crashHandler);  // Floating-point exception
   signal(SIGILL, crashHandler);  // Illegal instruction
 
+  std::cout << "Command: ";
+  for (int i = 0; i < argc; i++)
+    std::cout << argv[i] << " ";
+  std::cout << std::endl;
+
   std::vector<std::thread> nodes;
   add_options();
   int c;

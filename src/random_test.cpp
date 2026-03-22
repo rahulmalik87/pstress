@@ -909,30 +909,45 @@ static std::string generateRandomString(int n) {
 /* return random string in range of upper and lower. If it can't find return
  * random generated string*/
 std::string rand_string(size_t size) {
-  /* if bigger string is request then ensure minimum 10 */
-  if (size > 10) {
+  /* if bigger string is requested ensure minimum 10 */
+  if (size > 10)
     size = rand_int(size, 10);
-  }
+
   std::string rs;
-  while (size > 0 && !random_strs.empty()) {
-    const auto &str = random_strs.at(rand_int(random_strs.size() - 1));
-    if (size > str.size()) {
-      if (size == str.size()) {
-        return rs + str;
-      }
-      rs += str + " ";
-      size -= str.size() + 1;
+
+  if (random_strs.empty() || size == 0) {
+    rs = generateRandomString(size);
+  } else {
+    auto pick = [&]() -> const std::string & {
+      return random_strs.at(rand_int(random_strs.size() - 1));
+    };
+
+    int strategy = rand_int(9); /* 0-9 */
+
+    if (strategy < 6) {
+      /* 60%: truncate — pick one word, use up to size chars */
+      rs = pick().substr(0, size);
+    } else if (strategy < 8) {
+      /* 20%: word + numeric suffix for high cardinality */
+      const std::string &w = pick();
+      std::string suffix = std::to_string(rand_int(9999));
+      rs = (w + suffix).substr(0, size);
+    } else if (strategy == 8) {
+      /* 10%: join two words with a separator */
+      static const char seps[] = {' ', '-', '_', '/'};
+      char sep = seps[rand_int(3)];
+      std::string combined = pick() + sep + pick();
+      rs = combined.substr(0, size);
     } else {
-      break;
+      /* 10%: pure random noise */
+      rs = generateRandomString(size);
     }
   }
-  if (rs.empty())
-    return generateRandomString(size);
+
 #ifdef USE_DUCKDB
-      /* if string has ' replace it with '' */
-      rs = std::regex_replace(rs, std::regex("'"), "''");
+  rs = std::regex_replace(rs, std::regex("'"), "''");
 #endif
-      return rs;
+  return rs;
 }
 
 /* return column type from a string */

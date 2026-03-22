@@ -511,7 +511,9 @@ bool Thd1::run_some_query() {
   if (!lock_stream.test_and_set()) {
     print_and_log("Starting load in " +
                       std::to_string(options->at(Option::THREADS)->getInt()) +
-                      " threads. GTID " +
+                      " threads for " +
+                      std::to_string(options->at(Option::NUMBER_OF_SECONDS_WORKLOAD)->getInt()) +
+                      " seconds. GTID " +
                       db->get_single_value("select @@global.gtid_executed"),
                   this);
   }
