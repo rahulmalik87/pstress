@@ -40,6 +40,7 @@
 set -euo pipefail
 
 RELEASE_URL="https://github.com/rahulmalik87/pstress/releases/download/v1.0-clickhouse/pstress-ch"
+DICT_URL="https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/src/english_dictionary.txt"
 
 # ── Connection / test defaults ───────────────────────────────────────────────
 CH_HOST="${CH_HOST:-127.0.0.1}"
@@ -118,6 +119,7 @@ if [[ "$OS" == "Darwin" ]]; then
       set -e
       apt-get update -qq && apt-get install -y -qq curl 2>/dev/null
       curl -fsSL '$RELEASE_URL' -o /tmp/pstress-ch
+      curl -fsSL '$DICT_URL' -o /tmp/english_dictionary.txt
       chmod +x /tmp/pstress-ch
       exec /tmp/pstress-ch $PSTRESS_ARGS
     "
@@ -134,18 +136,21 @@ if [[ -n "${PSTRESS_BIN:-}" ]]; then
   BINARY="$PSTRESS_BIN"
   echo "Using existing binary: $BINARY"
 else
-  BINARY="$(mktemp -d)/pstress-ch"
+  BINDIR="$(mktemp -d)"
+  BINARY="$BINDIR/pstress-ch"
   echo "Downloading pstress-ch..."
   if command -v curl &>/dev/null; then
     curl -fsSL -o "$BINARY" "$RELEASE_URL"
+    curl -fsSL -o "$BINDIR/english_dictionary.txt" "$DICT_URL"
   elif command -v wget &>/dev/null; then
     wget -q -O "$BINARY" "$RELEASE_URL"
+    wget -q -O "$BINDIR/english_dictionary.txt" "$DICT_URL"
   else
     echo "ERROR: Neither curl nor wget found."
     exit 1
   fi
   chmod +x "$BINARY"
-  echo "Downloaded to: $BINARY"
+  echo "Downloaded to: $BINDIR/"
 fi
 
 if ! "$BINARY" --help &>/dev/null; then
