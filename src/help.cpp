@@ -1003,6 +1003,15 @@ void add_options() {
   opt->setArgs(no_argument);
   opt->short_help = "CHMutationsSync";
 
+  opt = newOption(Option::BOOL, Option::CH_ADD_COLUMN_BACKFILL,
+                  "ch-add-column-backfill");
+  opt->help = "After ADD COLUMN succeeds, fire an ALTER TABLE UPDATE to "
+              "backfill existing rows with a random server-side value "
+              "instead of leaving them at the ClickHouse zero-default.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+  opt->short_help = "CHBackfill";
+
   /* Drop column */
   opt = newOption(Option::INT, Option::DROP_COLUMN, "drop-column");
   opt->help = "alter table drop some random column";

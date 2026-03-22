@@ -3240,12 +3240,58 @@ void Table::AddColumn(Thd1 *thd) {
         add_new_column = false;
     }
 
+    /* capture before unlock — tc may be deleted below */
+    std::string added_name = tc->name_;
+    Column::COLUMN_TYPES added_type = tc->type_;
+    int added_length = tc->length;
+
     if (add_new_column)
       AddInternalColumn(tc);
     else
       delete tc;
 
     unlock_table_mutex();
+
+#ifdef USE_CLICKHOUSE
+    if (add_new_column &&
+        options->at(Option::CH_ADD_COLUMN_BACKFILL)->getBool()) {
+      /* Generate a client-side literal value for the backfill.
+         ClickHouse rejects non-deterministic server-side functions
+         (rand64, today, now…) in mutations on Replicated tables.
+         Using a constant literal avoids that restriction entirely. */
+      std::string rand_expr;
+      switch (added_type) {
+      case Column::INT:
+      case Column::INTEGER:
+        rand_expr = std::to_string(rand_int(1000000));
+        break;
+      case Column::FLOAT:
+        rand_expr = rand_float(1000);
+        break;
+      case Column::DOUBLE:
+        rand_expr = rand_double(1000.0);
+        break;
+      case Column::BOOL:
+        rand_expr = rand_int(1) == 1 ? "1" : "0";
+        break;
+      case Column::DATE:
+        rand_expr = "'" + rand_date() + "'";
+        break;
+      case Column::DATETIME:
+      case Column::TIMESTAMP:
+        rand_expr = "'" + rand_timestamp(0, false) + "'";
+        break;
+      default: /* VARCHAR, CHAR, TEXT, BLOB, etc. */
+        rand_expr =
+            "'" + rand_string(added_length > 0 ? added_length : 10) + "'";
+        break;
+      }
+      std::string backfill = "ALTER TABLE " + name_ + " UPDATE " +
+                             added_name + " = " + rand_expr +
+                             " WHERE 1=1 SETTINGS mutations_sync = 2";
+      execute_sql(backfill, thd);
+    }
+#endif
   } else
     delete tc;
 }
