@@ -36,6 +36,18 @@ ENDIF()
 ##
 IF(STRICT_CPU)
   ADD_DEFINITIONS(-march=native)
+ELSE()
+  # Portable x86-64 baseline.
+  # On GCC/Linux we additionally enable runtime SIMD dispatch: hot functions
+  # annotated with PSTRESS_TARGET_CLONES are compiled into multiple ISA
+  # variants (AVX-512, AVX2, generic) and the best one is selected at load
+  # time via GCC IFUNC — no SIGILL on machines that lack AVX-512.
+  ADD_DEFINITIONS(-march=x86-64)
+  IF(ARCH STREQUAL "x86_64" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+     AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    ADD_DEFINITIONS(-DPSTRESS_RUNTIME_SIMD)
+    MESSAGE(STATUS "Runtime SIMD dispatch enabled (AVX-512/AVX2/default via target_clones)")
+  ENDIF()
 ENDIF()
 #
 IF(STRICT_FLAGS)

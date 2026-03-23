@@ -179,6 +179,7 @@ static size_t convert_to_number(const std::string &str) {
 /* generate random numbers to populate system with unique values
 @param[in] number_of_records
 @param[out] vector containing unique elements */
+PSTRESS_TARGET_CLONES
 std::vector<long int> generateUniqueRandomNumbers(long int number_of_records) {
 
   std::unordered_set<long int> unique_keys_set(number_of_records);
@@ -859,6 +860,7 @@ std::vector<std::string> random_strs_generator() {
   return strs;
 }
 
+PSTRESS_TARGET_CLONES
 long int rand_int(long int upper, long int lower) {
   assert(upper >= lower);
   std::uniform_int_distribution<std::mt19937::result_type> dist(lower, upper);
@@ -893,6 +895,7 @@ static std::string rand_bit(int length) {
   return bit;
 }
 
+PSTRESS_TARGET_CLONES
 static std::string generateRandomString(int n) {
   const std::string alphabet =
       "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -908,6 +911,7 @@ static std::string generateRandomString(int n) {
 
 /* return random string in range of upper and lower. If it can't find return
  * random generated string*/
+PSTRESS_TARGET_CLONES
 std::string rand_string(size_t size) {
   /* if bigger string is requested ensure minimum 10 */
   if (size > 10)
