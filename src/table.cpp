@@ -156,7 +156,9 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   for (const auto &column : *columns_) {
     prepare_sql += column->name_ + ", ";
   }
-
+#ifdef USE_CLICKHOUSE
+  prepare_sql += "_pstress_ver, ";
+#endif
   prepare_sql.erase(prepare_sql.length() - 2);
   prepare_sql += ")";
 
@@ -189,6 +191,9 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
 
       value += ", ";
     }
+#ifdef USE_CLICKHOUSE
+    value += "toUnixTimestamp64Micro(now64()), ";
+#endif
     value.erase(value.size() - 2);
     value += ")";
     values += value;
@@ -223,6 +228,9 @@ std::string Table::ColumnValues(Thd1 *thd, int value_count) {
   for (auto &column : *columns_) {
     cols += column->name_ + ", ";
   }
+#ifdef USE_CLICKHOUSE
+  cols += "_pstress_ver, ";
+#endif
   cols.pop_back();
   cols.pop_back();
   cols += ")";
@@ -250,6 +258,9 @@ std::string Table::ColumnValues(Thd1 *thd, int value_count) {
 
     vals.pop_back();
     vals.pop_back();
+#ifdef USE_CLICKHOUSE
+    vals += ", toUnixTimestamp64Micro(now64())";
+#endif
     vals += "), ";
   }
   log_pk_insert(thd, name_, pk_insert);

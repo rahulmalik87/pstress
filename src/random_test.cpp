@@ -2508,6 +2508,10 @@ std::string Table::definition(bool with_index, bool with_fk,
   for (auto col : *columns_) {
     def += col->definition() + ", ";
   }
+#ifdef USE_CLICKHOUSE
+  /* version column for ReplacingMergeTree — always present, never dropped */
+  def += "_pstress_ver UInt64, ";
+#endif
 
 
   /* if column has primary key */
@@ -2603,12 +2607,18 @@ std::string Table::definition(bool with_index, bool with_fk,
 
 #ifdef USE_CLICKHOUSE
   if (!engine.empty() && !columns_->empty()) {
-    /* Use ReplicatedMergeTree when running against multiple ports */
+    /* Always use ReplacingMergeTree(_pstress_ver) so the version column
+       resolves duplicate primary keys deterministically.
+       Use the Replicated variant when running against multiple ports. */
     bool replicated = options->at(Option::PORT)->getString().find(',') != std::string::npos;
-    if (replicated) {
+    {
       auto pos = def.rfind("ENGINE=MergeTree()");
-      if (pos != std::string::npos)
-        def.replace(pos, strlen("ENGINE=MergeTree()"), "ENGINE=ReplicatedMergeTree()");
+      if (pos != std::string::npos) {
+        std::string replacement = replicated
+            ? "ENGINE=ReplicatedReplacingMergeTree(_pstress_ver)"
+            : "ENGINE=ReplacingMergeTree(_pstress_ver)";
+        def.replace(pos, strlen("ENGINE=MergeTree()"), replacement);
+      }
     }
 
     /* ORDER BY must be a superset of PRIMARY KEY (PK must be a prefix).
@@ -3073,6 +3083,13 @@ void Table::DropColumn(Thd1 *thd) {
     unlock_table_mutex();
     return;
   }
+#ifdef USE_CLICKHOUSE
+  /* never drop the version column used by ReplacingMergeTree */
+  if (name == "_pstress_ver") {
+    unlock_table_mutex();
+    return;
+  }
+#endif
 
   std::string sql = "ALTER TABLE " + name_ + " DROP COLUMN " + name;
 
