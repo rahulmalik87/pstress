@@ -32,7 +32,8 @@ jobs:
           cmake .. -DCLICKHOUSE=ON \
             -DCLICKHOUSE_INCLUDE_DIR=/usr/local/include \
             -DCLICKHOUSE_LIBRARY=/usr/local/lib/libclickhouse-cpp-lib.a \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSTRICT_CPU=OFF
           make -j$(nproc)
 
       - name: Verify binary
