@@ -47,13 +47,220 @@ cmake .. -DDUCKDB=ON -DDUCKDB_LIBRARY=$DUCKDB_BUILD_DIR/src/libduckdb.so -DDUCKD
 make
 ```
 
-# Help Section
-First, take a quick look at ``` ./pstress-dd --help --verbos, ./pstress-ms --help --verbose ``` to see available modes and options.
+---
 
-# Example of commad to run pstress
+# Quick Start — pstress-ch (no build required)
+
+A pre-built portable binary is available for **Linux x86_64** and **macOS** (via Docker). No dependencies need to be installed other than Docker on macOS.
+
+**Linux x86_64:**
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/run_pstress_ch.sh)
 ```
-pstress-ms --table=1 --column=10 --seconds=10 --threads=10 --socket=$SOCKET
+
+**macOS (Intel or Apple Silicon — requires [Docker Desktop](https://www.docker.com/products/docker-desktop/)):**
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/run_pstress_ch.sh)
 ```
+
+The same command works on both platforms. On macOS the script automatically runs the binary inside Docker and routes `localhost` to `host.docker.internal` so a local ClickHouse server is reachable.
+
+**Customise with environment variables:**
+```bash
+CH_HOST=10.0.0.5 CH_PORT=9000 TABLES=20 THREADS=20 DURATION=600 \
+  bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/run_pstress_ch.sh) \
+  --ch-alter-update 5 --ch-alter-delete 3 --ch-mutations-sync
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CH_HOST` | `127.0.0.1` | ClickHouse host/IP |
+| `CH_PORT` | `9000` | Native protocol port; comma-separated for replicas (`9001,9002`) |
+| `CH_USER` | `default` | ClickHouse user |
+| `CH_PASS` | _(empty)_ | Password |
+| `CH_DB` | `test_db` | Database name |
+| `TABLES` | `10` | Number of tables |
+| `THREADS` | `10` | Worker threads per node |
+| `DURATION` | `300` | Test duration in seconds |
+| `LOGDIR` | `/tmp/pstress_ch` | Directory for log files |
+
+Any additional arguments after the URL are passed directly to `pstress-ch`.
+
+---
+
+# Reproduce a specific scenario — reproduce_ch.sh
+
+`reproduce_ch.sh` runs a fixed three-step workload designed to reproduce a known stress scenario against a two-replica setup. Any extra flags you pass are forwarded to all three runs.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/reproduce_ch.sh)
+```
+
+**With extra flags (e.g. synchronous mutations):**
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/reproduce_ch.sh) \
+  --ch-mutations-sync
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CH_HOST` | `127.0.0.1` | ClickHouse host/IP |
+| `CH_PORT1` | `9000` | First replica port |
+| `CH_PORT2` | `9001` | Second replica port |
+| `CH_USER` | `default` | ClickHouse user |
+| `CH_PASS` | _(empty)_ | Password |
+| `CH_DB` | `test_db` | Database name |
+| `LOG_DIR` | `/tmp/pstress_ch_reproduce` | Directory for log files |
+
+---
+
+# Building pstress with ClickHouse
+
+## Prerequisites
+
+Install the [clickhouse-cpp](https://github.com/ClickHouse/clickhouse-cpp) client library:
+
+```bash
+git clone https://github.com/ClickHouse/clickhouse-cpp.git
+cd clickhouse-cpp
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+sudo make install   # installs to /usr/local by default
+```
+
+## Compile pstress-ch
+
+```bash
+cd pstress
+mkdir bld && cd bld
+cmake .. -DCLICKHOUSE=ON
+make -j$(nproc)
+# Binary: bld/src/pstress-ch
+```
+
+If clickhouse-cpp is installed in a non-standard location:
+
+```bash
+cmake .. -DCLICKHOUSE=ON \
+  -DCLICKHOUSE_INCLUDE_DIR=/path/to/clickhouse-cpp/include \
+  -DCLICKHOUSE_LIBRARY=/path/to/clickhouse-cpp/build/libclickhouse-cpp-lib.a
+```
+
+## Running pstress-ch
+
+**Defaults** (no need to specify unless overriding):
+- `--address 127.0.0.1`
+- `--user default`
+- `--database test_db`
+
+**Auto-detect step**: If `--step` is omitted, pstress scans `--logdir` for existing metadata files and automatically sets the next step (step 1 if none found, otherwise max existing step + 1). You can always override with `--step N`.
+
+**Single node — first run (create tables + load data):**
+```bash
+./bld/src/pstress-ch --port 9000 --tables 10 --threads 5 --seconds 60 \
+  --logdir /tmp/pstress-ch
+```
+
+**Single node — subsequent run (auto-detected step, resume workload):**
+```bash
+./bld/src/pstress-ch --port 9000 --tables 10 --threads 5 --seconds 60 \
+  --logdir /tmp/pstress-ch
+```
+
+**Two replicas on the same host (different ports):**
+```bash
+./bld/src/pstress-ch --address 127.0.0.1 --port 9000,9001 \
+  --tables 10 --threads 5 --seconds 60 \
+  --logdir /tmp/pstress-ch
+```
+
+**Two replicas on different hosts:**
+```bash
+./bld/src/pstress-ch --address 192.168.1.10,192.168.1.11 --port 9000,9001 \
+  --tables 10 --threads 5 --seconds 60 \
+  --logdir /tmp/pstress-ch
+```
+
+**With periodic replica verification every 30 seconds:**
+```bash
+./bld/src/pstress-ch --port 9000,9001 --tables 10 --threads 5 --seconds 300 \
+  --logdir /tmp/pstress-ch --ch-verify-interval 30
+```
+
+**Useful options for ClickHouse:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--port 9000,9001` | `9000` | Two-replica mode — splits load, verifies schema+checksums at end |
+| `--address addr1,addr2` | `127.0.0.1` | One address per port for replicas on different hosts |
+| `--step N` | auto | Force a specific step; omit for auto-detection from logdir |
+| `--ch-verify-interval N` | `0` | Verify replica count+checksum every N seconds during run |
+| `--null-prob=0` | `20` | No NULL values; columns use plain types (no `Nullable`) |
+| `--no-json` | off | Disable JSON columns |
+| `--single-thread-ddl` | off | Only thread 0 runs DDL (reduces schema conflicts) |
+| `--only-cl-sql` | off | Run only the SQL operations specified on the command line |
+| `--add-column=N` | `1` | Probability weight for ALTER TABLE ADD COLUMN |
+| `--drop-column=N` | `1` | Probability weight for ALTER TABLE DROP COLUMN |
+| `--insert-bulk=N` | `0` | Probability weight for bulk INSERT |
+| `--ch-alter-update=N` | `0` | Probability weight for ALTER TABLE UPDATE mutations |
+| `--ch-alter-delete=N` | `0` | Probability weight for ALTER TABLE DELETE mutations |
+| `--ch-mutations-sync` | off | Append `SETTINGS mutations_sync=2` to all mutations (ADD/DROP COLUMN, ALTER UPDATE/DELETE) |
+| `--ch-add-column-backfill` | off | After ADD COLUMN, fire a synchronous mutation to fill existing rows with random values instead of leaving them at the ClickHouse zero-default (`''` / `0`) |
+| `--threads N` | `10` | Threads per node |
+| `--tables N` | `10` | Number of tables to create |
+| `--seconds N` | `100` | How long to run the workload |
+
+## ClickHouse mutations (ALTER UPDATE / ALTER DELETE)
+
+ClickHouse uses `ALTER TABLE ... UPDATE` and `ALTER TABLE ... DELETE` instead of standard `UPDATE`/`DELETE`. These are background mutations that rewrite data parts.
+
+Enable them with probability weights:
+
+```bash
+./bld/src/pstress-ch --port 9000 --tables 10 --threads 5 --seconds 120 \
+  --logdir /tmp/pstress-ch \
+  --ch-alter-update 5 --ch-alter-delete 3 --only-cl-sql
+```
+
+Each mutation targets approximately **50–70% of the table's row range** using a `BETWEEN` clause on the integer primary key, ensuring meaningful data churn rather than single-row updates.
+
+Pass `--ch-mutations-sync` to append `SETTINGS mutations_sync = 2`, which makes mutations complete synchronously on all replicas before the next query proceeds. Without the flag, mutations run asynchronously (default):
+
+```bash
+# synchronous mutations:
+./bld/src/pstress-ch --ch-alter-update 5 --ch-alter-delete 3 \
+  --ch-mutations-sync ...
+
+# asynchronous (default, no flag needed):
+./bld/src/pstress-ch --ch-alter-update 5 --ch-alter-delete 3 ...
+```
+
+## Schema verification
+
+**Startup check (step ≥ 2):** Before the workload begins, pstress compares the saved metadata against the live ClickHouse schema. If any column is missing or has a nullability mismatch, pstress aborts immediately rather than running a workload against a broken schema.
+
+**End-of-run check:** After every run, pstress re-verifies schema and (in two-node mode) replica consistency.
+
+Example output:
+```
+[14:32:01] ==> Schema verification: metadata vs ClickHouse (127.0.0.1:9000)...
+  tt_1                  OK (5 columns)
+  tt_2                  OK (4 columns)
+  tt_3                  OK (6 columns)
+[14:32:01] ==> Schema verification: PASS
+
+[14:32:01] ==> Verifying replica consistency for 3 tables across 2 replicas...
+  tt_1                  r1[cnt=10000    csum=1234567890]  r2[cnt=10000    csum=1234567890]  => OK
+  tt_2                  r1[cnt=5000     csum=9876543210]  r2[cnt=5000     csum=9876543210]  => OK
+[14:32:01] ==> Replica verification: PASS
+```
+
+## DDL log timestamps
+
+All entries in the general (DDL) log file include a `[HH:MM:SS]` timestamp by default, making it straightforward to correlate DDL operations with server-side events.
+
+---
 
 
 # Contributors
@@ -61,4 +268,5 @@ pstress-ms --table=1 --column=10 --seconds=10 --threads=10 --socket=$SOCKET
 * Roel Van de Paar - invention, scripted framework
 * Rahul Malik - pstress developer
 * Mohit Joshi - pstress developer
+* Claude (Anthropic) - ClickHouse backend, ReplicatedMergeTree support, replica verification, schema verification
 * For the full list of contributors, please see [CONTRIBUTORS](https://github.com/Percona-QA/pstress/blob/master/doc/CONTRIBUTORS)

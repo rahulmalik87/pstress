@@ -1,7 +1,9 @@
 #include "random_test.hpp"
 #include <array>
 #include <document.h>
+#ifndef __APPLE__
 #include <malloc.h>
+#endif
 extern std::mutex all_table_mutex;
 extern std::vector<Table *> *all_tables;
 extern int number_of_records;
@@ -143,7 +145,9 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
     }
   }
   // to reduce space of map using in generateUniqueRandomNumbers
+#ifndef __APPLE__
   malloc_trim(0);
+#endif
 
   std::string prepare_sql = "INSERT ";
   prepare_sql += "INTO " + name_ + " (";
@@ -152,7 +156,9 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   for (const auto &column : *columns_) {
     prepare_sql += column->name_ + ", ";
   }
-
+#ifdef USE_CLICKHOUSE
+  prepare_sql += "_pstress_ver, ";
+#endif
   prepare_sql.erase(prepare_sql.length() - 2);
   prepare_sql += ")";
 
@@ -185,6 +191,9 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
 
       value += ", ";
     }
+#ifdef USE_CLICKHOUSE
+    value += "toUnixTimestamp64Micro(now64()), ";
+#endif
     value.erase(value.size() - 2);
     value += ")";
     values += value;
@@ -219,6 +228,9 @@ std::string Table::ColumnValues(Thd1 *thd, int value_count) {
   for (auto &column : *columns_) {
     cols += column->name_ + ", ";
   }
+#ifdef USE_CLICKHOUSE
+  cols += "_pstress_ver, ";
+#endif
   cols.pop_back();
   cols.pop_back();
   cols += ")";
@@ -246,6 +258,9 @@ std::string Table::ColumnValues(Thd1 *thd, int value_count) {
 
     vals.pop_back();
     vals.pop_back();
+#ifdef USE_CLICKHOUSE
+    vals += ", toUnixTimestamp64Micro(now64())";
+#endif
     vals += "), ";
   }
   log_pk_insert(thd, name_, pk_insert);
@@ -270,6 +285,10 @@ void Table::InsertRandomRowBulk(Thd1 *thd) {
       "INSERT " + add_ignore_clause() + " INTO " + name_ +
       ColumnValues(thd, options->at(Option::INSERT_BULK_COUNT)->getInt());
   unlock_table_mutex();
+
+  /* Hold shared dml_mutex during execute so DROP COLUMN (exclusive dml_mutex)
+     cannot remove a column between SQL build and execution. */
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
   execute_sql(sql, thd, false);
 }
 
@@ -390,6 +409,14 @@ template <typename Writer> void Table::Serialize(Writer &writer) const {
 bool Table::load(Thd1 *thd, bool bulk_insert,
                  bool set_global_run_query_failed) {
   thd->ddl_query = true;
+#ifdef USE_CLICKHOUSE
+  /* For step=1 / prepare, drop existing table so we start from a clean schema.
+     With ReplicatedMergeTree, DROP syncs to all replicas automatically. */
+  if (options->at(Option::STEP)->getInt() == 1 ||
+      options->at(Option::PREPARE)->getBool()) {
+    execute_sql("DROP TABLE IF EXISTS " + name_, thd, false);
+  }
+#endif
   if (!execute_sql(definition(false), thd)) {
     if (set_global_run_query_failed) {
       print_and_log("Failed to create table " + name_, thd, true);
@@ -524,6 +551,8 @@ std::string build_step_file_name(int step) {
   const std::string instance = "mysql";
 #elif USE_DUCKDB
   const std::string instance = "duckdb";
+#elif USE_CLICKHOUSE
+  const std::string instance = "clickhouse";
 #endif
   auto file = path + "/" + instance + "_" +
               options->at(Option::DATABASE)->getString() + "_metadata_step_" +

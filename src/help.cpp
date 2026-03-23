@@ -80,7 +80,8 @@ void add_options() {
   /* Engine */
   opt = newOption(Option::STRING, Option::ENGINE, "engine");
   opt->help = "Engine used ";
-  opt->setString(strcmp(FORK, "MySQL") == 0 ? "INNODB" : "");
+  opt->setString(strcmp(FORK, "MySQL") == 0 ? "INNODB" :
+                 strcmp(FORK, "ClickHouse") == 0 ? "MergeTree()" : "");
 
   /* Just Load DDL*/
   opt = newOption(Option::BOOL, Option::JUST_LOAD_DDL, "jlddl");
@@ -189,6 +190,12 @@ void add_options() {
               "enforcing column would be ipkey or vpkey. But other key are "
               "added just part of primary key ";
   opt->setInt(1);
+
+  opt = newOption(Option::INT, Option::CH_VERIFY_INTERVAL, "ch-verify-interval");
+  opt->help = "ClickHouse replica verification interval in seconds (0=disabled, "
+              "only at end). When > 0, a background thread pauses all worker "
+              "threads and checks count+checksum on all replicas every N seconds.";
+  opt->setInt(0);
 
   opt = newOption(Option::INT, Option::CALL_FUNCTION, "call-function-prob");
   opt->help = "Probability of calling function ";
@@ -483,8 +490,8 @@ void add_options() {
 
   opt = newOption(Option::INT, Option::BULK_INSERT_WIDTH, "bulk-insert-width");
   opt->help = "The maximum width of each insert in bulk insert default is " +
-              std::to_string(1024 * 1024);
-  opt->setInt(4024 * 1024);
+              std::to_string(16 * 1024 * 1024);
+  opt->setInt(16 * 1024 * 1024);
 
   /* ENFORCE REWRITE  */
   opt = newOption(Option::INT, Option::ENFORCE_MERGE, "enforce-merge-prob");
@@ -926,7 +933,7 @@ void add_options() {
 
   opt = newOption(Option::INT, Option::INSERT_BULK_COUNT, "insert-bulk-count");
   opt->help = "Number of rows to insert in a single insert statement";
-  opt->setInt(10);
+  opt->setInt(1000);
 
   opt = newOption(Option::INT, Option::INSERT_BULK, "insert-bulk");
   opt->help = "insert random row";
@@ -972,6 +979,38 @@ void add_options() {
   opt->setInt(8);
   opt->short_help = "DB";
   opt->setSQL();
+
+  /* ClickHouse ALTER TABLE UPDATE mutation */
+  opt = newOption(Option::INT, Option::CH_ALTER_UPDATE, "ch-alter-update");
+  opt->help = "ClickHouse ALTER TABLE t UPDATE col=val WHERE ... SETTINGS mutations_sync=2";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "CHAlterUpdate";
+  opt->setDDL();
+
+  /* ClickHouse ALTER TABLE DELETE mutation */
+  opt = newOption(Option::INT, Option::CH_ALTER_DELETE, "ch-alter-delete");
+  opt->help = "ClickHouse ALTER TABLE t DELETE WHERE ... SETTINGS mutations_sync=2";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "CHAlterDelete";
+  opt->setDDL();
+
+  opt = newOption(Option::BOOL, Option::CH_MUTATIONS_SYNC, "ch-mutations-sync");
+  opt->help = "Append SETTINGS mutations_sync=2 to ClickHouse ALTER mutations "
+              "(ADD/DROP COLUMN, ALTER UPDATE/DELETE). Pass flag to enable.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+  opt->short_help = "CHMutationsSync";
+
+  opt = newOption(Option::BOOL, Option::CH_ADD_COLUMN_BACKFILL,
+                  "ch-add-column-backfill");
+  opt->help = "After ADD COLUMN succeeds, fire an ALTER TABLE UPDATE to "
+              "backfill existing rows with a random server-side value "
+              "instead of leaving them at the ClickHouse zero-default.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+  opt->short_help = "CHBackfill";
 
   /* Drop column */
   opt = newOption(Option::INT, Option::DROP_COLUMN, "drop-column");

@@ -1,0 +1,48 @@
+name: Build and publish pstress-ch binary
+
+on:
+  push:
+    branches: [ps-master-clickhouse]
+  workflow_dispatch:   # allow manual trigger from GitHub UI
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake g++ make git libabsl-dev
+
+      - name: Build and install clickhouse-cpp
+        run: |
+          git clone --depth=1 https://github.com/ClickHouse/clickhouse-cpp.git /tmp/clickhouse-cpp
+          cmake -S /tmp/clickhouse-cpp -B /tmp/clickhouse-cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build /tmp/clickhouse-cpp/build --parallel $(nproc)
+          sudo cmake --install /tmp/clickhouse-cpp/build
+
+      - name: Build pstress-ch
+        run: |
+          mkdir -p bld && cd bld
+          cmake .. -DCLICKHOUSE=ON \
+            -DCLICKHOUSE_INCLUDE_DIR=/usr/local/include \
+            -DCLICKHOUSE_LIBRARY=/usr/local/lib/libclickhouse-cpp-lib.a \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSTRICT_CPU=OFF
+          make -j$(nproc)
+
+      - name: Verify binary
+        run: |
+          ldd bld/src/pstress-ch
+          ls -lh bld/src/pstress-ch
+
+      - name: Upload binary to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v1.0-clickhouse bld/src/pstress-ch --clobber

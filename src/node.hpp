@@ -17,7 +17,7 @@
 
 /* struct for node setup */
 struct workerParams {
-  workerParams(short port_ = 0) {
+  workerParams(short port_ = 0, int node_index_ = 0, int num_nodes_ = 1) {
     myName = "default.node.tld";
     database = opt_string(DATABASE);
     address = opt_string(ADDRESS);
@@ -29,6 +29,8 @@ struct workerParams {
     threads = opt_int(THREADS);
     queries_per_thread = opt_int(QUERIES_PER_THREAD);
     port = port_;
+    node_index = node_index_;
+    num_nodes = num_nodes_;
   };
   std::string myName; // unique name for worker
   std::string database;
@@ -39,6 +41,8 @@ struct workerParams {
   std::string infile;
   std::string logdir;
   short port;
+  int node_index; // 0-based index of this node among all nodes
+  int num_nodes;  // total number of nodes (ports)
   short threads;
   unsigned long queries_per_thread;
   unsigned long maxpacket;

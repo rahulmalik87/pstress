@@ -34,6 +34,17 @@
 #define DESC_INDEXES_IN_COLUMN 34
 #define MYSQL_8 8.0
 
+/* Runtime SIMD dispatch via GCC target_clones.
+   Compiles annotated functions for AVX-512, AVX2, and a generic fallback;
+   the IFUNC resolver picks the best version at load time — no SIGILL.
+   Enabled only on x86_64 GCC/Linux when STRICT_CPU=OFF. */
+#ifdef PSTRESS_RUNTIME_SIMD
+#  define PSTRESS_TARGET_CLONES \
+     __attribute__((target_clones("avx512f", "avx2", "default")))
+#else
+#  define PSTRESS_TARGET_CLONES
+#endif
+
 #define opt_int(a) options->at(Option::a)->getInt();
 #define opt_int_set(a, b) options->at(Option::a)->setInt(b);
 #define opt_bool(a) options->at(Option::a)->getBool();
@@ -404,11 +415,14 @@ struct Table {
   Column *GetRandomColumn();
   std::string GetWherePrecise();
   std::string GetWhereBulk();
+  std::string GetWhereLargeRange();
   std::string ColumnValues(Thd1 *thd, int value_count = 1);
   std::string SelectColumn();
   std::string SetClause();
   void DeleteAllRows(Thd1 *thd);
   void UpdateAllRows(Thd1 *thd);
+  void AlterTableUpdate(Thd1 *thd);
+  void AlterTableDelete(Thd1 *thd);
   void ColumnRename(Thd1 *thd);
   void IndexRename(Thd1 *thd);
   template <typename Writer> void Serialize(Writer &writer) const;

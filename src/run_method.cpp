@@ -1,4 +1,8 @@
+#include "node.hpp"
 #include "random_test.hpp"
+#ifdef USE_CLICKHOUSE
+#include "ch_verify.hpp"
+#endif
 #include <filesystem>
 #include <limits.h> // for PATH_MAX
 #include <regex>
@@ -28,6 +32,20 @@ static void random_timezone(Thd1 *thd) {
 
 static void kill_query(Thd1 *thd) {
 
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse: pick a random running query from system.processes for this
+     user (excluding our own current_query_id) and kill it. */
+  const std::string user = options->at(Option::USER)->getString();
+  /* current_query_id() returns the query_id of the SELECT itself, which
+     lets us exclude our own probe query from the candidate list. */
+  auto result = thd->db->get_query_result(
+      "SELECT query_id FROM system.processes "
+      "WHERE user = '" + user + "' AND query_id != current_query_id()");
+  if (result.empty())
+    return;
+  const std::string qid = result[rand_int(result.size() - 1)][0];
+  execute_sql("KILL QUERY WHERE query_id = '" + qid + "' SYNC", thd);
+#else
   auto on_exit = std::shared_ptr<void>(nullptr, [&](...) {
     if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
       execute_sql("SET @@SESSION.USE_SECONDARY_ENGINE=FORCED", thd);
@@ -54,7 +72,7 @@ static void kill_query(Thd1 *thd) {
   if (!execute_sql(query, thd)) {
     return;
   }
-  return;
+#endif
 }
 
 std::string getExecutablePath() {
@@ -333,7 +351,7 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
   auto ddl_query = thd->ddl_query;
 
   if (options->at(Option::THREAD_DOING_ONLY_SELECT)->getInt() != 0) {
-    if (options->at(Option::SINGLE_THREAD_DDL)->getBool() && thread_id == 1 &&
+    if (options->at(Option::SINGLE_THREAD_DDL)->getBool() && thread_id == 0 &&
         ddl_query) {
       // do not block ddl query if user want single thread ddl
     } else if (option != Option::SELECT_ALL_ROW &&
@@ -353,7 +371,7 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
   }
 
 
-  if (thread_id != 1 && options->at(Option::SINGLE_THREAD_DDL)->getBool() &&
+  if (thread_id != 0 && options->at(Option::SINGLE_THREAD_DDL)->getBool() &&
       ddl_query == true)
     return true;
 
@@ -418,6 +436,15 @@ bool Thd1::run_some_query() {
 
   if (options->at(Option::PREPARE)->getBool() ||
       options->at(Option::STEP)->getInt() == 1) {
+    /* Distribute tables across all nodes and threads.
+       Global thread ID = node_index * threads_per_node + thread_id
+       Stride = total threads across all nodes
+       Example: 30 tables, 2 nodes, 5 threads each (10 total)
+         node0/t0 -> 1,11,21   node0/t1 -> 2,12,22 ... node1/t0 -> 6,16,26 */
+    int total_threads = myParam->num_nodes * myParam->threads;
+    int global_thread_id = myParam->node_index * myParam->threads + thread_id;
+    starting_index = 1 + global_thread_id;
+
     while (starting_index <= options->at(Option::TABLES)->getInt()) {
       for (const auto &tableType : tableTypes) {
         auto table = pick_table(tableType, starting_index);
@@ -436,7 +463,7 @@ bool Thd1::run_some_query() {
         return false;
       }
       table_processed++;
-      starting_index += options->at(Option::THREADS)->getInt();
+      starting_index += total_threads;
     }
 
     // wait for all tables to finish loading
@@ -456,6 +483,26 @@ bool Thd1::run_some_query() {
   /* table initial data is created, empty the unique_keys */
   unique_keys.resize(0);
 
+#ifdef USE_CLICKHOUSE
+  /* Verify metadata matches actual ClickHouse schema at the start of each
+     step, after tables are created/loaded and before the workload begins.
+     std::call_once ensures this runs exactly once across all threads/nodes. */
+  static std::once_flag startup_schema_check;
+  static std::atomic<bool> startup_schema_ok{true};
+  std::call_once(startup_schema_check, [&]() {
+    bool ok = ch_verify_schema({myParam->address}, {myParam->port},
+                               options->at(Option::DATABASE)->getString(),
+                               options->at(Option::USER)->getString(),
+                               options->at(Option::PASSWORD)->getString());
+    if (!ok) {
+      std::cerr << "ERROR: Schema mismatch at startup — aborting.\n";
+      startup_schema_ok.store(false);
+    }
+  });
+  if (!startup_schema_ok.load())
+    return false;
+#endif
+
   if (options->at(Option::JUST_LOAD_DDL)->getBool() ||
       options->at(Option::PREPARE)->getBool())
     return true;
@@ -464,7 +511,9 @@ bool Thd1::run_some_query() {
   if (!lock_stream.test_and_set()) {
     print_and_log("Starting load in " +
                       std::to_string(options->at(Option::THREADS)->getInt()) +
-                      " threads. GTID " +
+                      " threads for " +
+                      std::to_string(options->at(Option::NUMBER_OF_SECONDS_WORKLOAD)->getInt()) +
+                      " seconds. GTID " +
                       db->get_single_value("select @@global.gtid_executed"),
                   this);
   }
@@ -502,6 +551,11 @@ bool Thd1::run_some_query() {
       continue;
     }
 
+#ifdef USE_CLICKHOUSE
+    /* Hold a shared lock for the duration of this iteration so the replica
+       verifier (which takes a unique_lock) can pause workers between queries. */
+    std::shared_lock<std::shared_mutex> _verify_lk(g_ch_verify_mutex);
+#endif
 
     /* check if we need to make sql as part of existing or new trx */
     if (trx_left > 0) {
@@ -666,6 +720,12 @@ bool Thd1::run_some_query() {
       break;
     case Option::UPDATE_ALL_ROWS:
       table->UpdateAllRows(this);
+      break;
+    case Option::CH_ALTER_UPDATE:
+      table->AlterTableUpdate(this);
+      break;
+    case Option::CH_ALTER_DELETE:
+      table->AlterTableDelete(this);
       break;
     case Option::OPTIMIZE:
       table->Optimize(this);

@@ -78,8 +78,9 @@ void print_and_log(std::string &&str, Thd1 *thd, bool print_error,
   ss << "[" << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S")
      << "] ";
 
-  ss << "Thread " << (thd ? std::to_string(thd->thread_id) : "#") << " : "
-     << str;
+  ss << "Thread " << (thd ? std::to_string(thd->thread_id) : "#")
+     << (thd && thd->myParam ? "@" + std::to_string(thd->myParam->port) : "")
+     << " : " << str;
   if (print_error) {
     ss << "error: " << thd->db->get_error();
   }
@@ -178,6 +179,7 @@ static size_t convert_to_number(const std::string &str) {
 /* generate random numbers to populate system with unique values
 @param[in] number_of_records
 @param[out] vector containing unique elements */
+PSTRESS_TARGET_CLONES
 std::vector<long int> generateUniqueRandomNumbers(long int number_of_records) {
 
   std::unordered_set<long int> unique_keys_set(number_of_records);
@@ -452,6 +454,44 @@ int sum_of_all_options(Thd1 *thd) {
     locks.clear();
   }
 
+  if (strcmp(FORK, "ClickHouse") == 0) {
+    /* Convenient defaults for ClickHouse (only if not overridden on CLI) */
+    if (options->at(Option::ADDRESS)->getString().empty())
+      options->at(Option::ADDRESS)->setString("127.0.0.1");
+    if (options->at(Option::USER)->getString() == "root")
+      options->at(Option::USER)->setString("default");
+    if (options->at(Option::DATABASE)->getString() == "test")
+      options->at(Option::DATABASE)->setString("test_db");
+    options->at(Option::NO_FK)->setBool(true);
+    options->at(Option::NO_AUTO_INC)->setBool(true);
+    options->at(Option::PK_COLUMN_AUTOINC)->setInt(0);
+    options->at(Option::NO_TABLESPACE)->setBool(true);
+    options->at(Option::NO_TEMPORARY)->setBool(true);
+    options->at(Option::NO_COLUMN_COMPRESSION)->setBool(true);
+    options->at(Option::NO_TABLE_COMPRESSION)->setBool(true);
+    options->at(Option::XA_TRANSACTION)->setInt(0);
+    options->at(Option::SAVEPOINT_PRB_K)->setInt(0);
+    options->at(Option::NO_VIRTUAL_COLUMNS)->setBool(true);
+    options->at(Option::NO_ENUM)->setBool(true);
+    options->at(Option::NO_DESC_INDEX)->setBool(true);
+    options->at(Option::INDEXES)->setInt(0);
+    options->at(Option::NO_PARTITION)->setBool(true);
+    options->at(Option::IGNORE_DML_CLAUSE)->setInt(0);
+    options->at(Option::REPLACE_ROW)->setInt(0);
+    options->at(Option::SELECT_FOR_UPDATE)->setInt(0);
+    options->at(Option::SELECT_FOR_UPDATE_BULK)->setInt(0);
+    options->at(Option::CALL_FUNCTION)->setInt(0);
+    options->at(Option::ADD_DROP_PARTITION)->setInt(0);
+    options->at(Option::RENAME_INDEX)->setInt(0);
+    options->at(Option::ALTER_DISCARD_TABLESPACE)->setInt(0);
+    options->at(Option::ALTER_DATABASE_COLLATION)->setInt(0);
+    options->at(Option::NO_BIT)->setBool(true);
+    /* Composite key columns not in primary_key flag would break ORDER BY prefix */
+    options->at(Option::COMPOSITE_KEY_PROB)->setInt(0);
+    algorithms.clear();
+    locks.clear();
+  }
+
   /* Disabling alter discard tablespace until 8.0.30
    * Bug: https://jira.percona.com/browse/PS-7865 is fixed by upstream in
    * MySQL 8.0.31 */
@@ -475,6 +515,12 @@ int sum_of_all_options(Thd1 *thd) {
     g_encryption = {enc_type};
 
   /* feature not supported by oracle */
+  /* CH_ALTER_UPDATE/DELETE are ClickHouse-only mutations */
+  if (strcmp(FORK, "ClickHouse") != 0) {
+    options->at(Option::CH_ALTER_UPDATE)->setInt(0);
+    options->at(Option::CH_ALTER_DELETE)->setInt(0);
+  }
+
   if (strcmp(FORK, "MySQL") == 0) {
     options->at(Option::ALTER_DATABASE_ENCRYPTION)->setInt(0);
     options->at(Option::NO_COLUMN_COMPRESSION)->setBool("true");
@@ -814,6 +860,7 @@ std::vector<std::string> random_strs_generator() {
   return strs;
 }
 
+PSTRESS_TARGET_CLONES
 long int rand_int(long int upper, long int lower) {
   assert(upper >= lower);
   std::uniform_int_distribution<std::mt19937::result_type> dist(lower, upper);
@@ -848,6 +895,7 @@ static std::string rand_bit(int length) {
   return bit;
 }
 
+PSTRESS_TARGET_CLONES
 static std::string generateRandomString(int n) {
   const std::string alphabet =
       "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -863,31 +911,47 @@ static std::string generateRandomString(int n) {
 
 /* return random string in range of upper and lower. If it can't find return
  * random generated string*/
+PSTRESS_TARGET_CLONES
 std::string rand_string(size_t size) {
-  /* if bigger string is request then ensure minimum 10 */
-  if (size > 10) {
+  /* if bigger string is requested ensure minimum 10 */
+  if (size > 10)
     size = rand_int(size, 10);
-  }
+
   std::string rs;
-  while (size > 0 && !random_strs.empty()) {
-    const auto &str = random_strs.at(rand_int(random_strs.size() - 1));
-    if (size > str.size()) {
-      if (size == str.size()) {
-        return rs + str;
-      }
-      rs += str + " ";
-      size -= str.size() + 1;
+
+  if (random_strs.empty() || size == 0) {
+    rs = generateRandomString(size);
+  } else {
+    auto pick = [&]() -> const std::string & {
+      return random_strs.at(rand_int(random_strs.size() - 1));
+    };
+
+    int strategy = rand_int(9); /* 0-9 */
+
+    if (strategy < 6) {
+      /* 60%: truncate — pick one word, use up to size chars */
+      rs = pick().substr(0, size);
+    } else if (strategy < 8) {
+      /* 20%: word + numeric suffix for high cardinality */
+      const std::string &w = pick();
+      std::string suffix = std::to_string(rand_int(9999));
+      rs = (w + suffix).substr(0, size);
+    } else if (strategy == 8) {
+      /* 10%: join two words with a separator */
+      static const char seps[] = {' ', '-', '_', '/'};
+      char sep = seps[rand_int(3)];
+      std::string combined = pick() + sep + pick();
+      rs = combined.substr(0, size);
     } else {
-      break;
+      /* 10%: pure random noise */
+      rs = generateRandomString(size);
     }
   }
-  if (rs.empty())
-    return generateRandomString(size);
+
 #ifdef USE_DUCKDB
-      /* if string has ' replace it with '' */
-      rs = std::regex_replace(rs, std::regex("'"), "''");
+  rs = std::regex_replace(rs, std::regex("'"), "''");
 #endif
-      return rs;
+  return rs;
 }
 
 /* return column type from a string */
@@ -1161,10 +1225,16 @@ std::string Column::rand_value() {
         options->at(Option::UNIQUE_RANGE)->getFloat() * number_of_records)));
     if (current_type == Column::COLUMN_TYPES::VARCHAR) {
       std::string result;
-      result.reserve(value.size() + 2); // Pre-allocate for quotes + value
+      result.reserve(value.size() + 2);
+#ifdef USE_MYSQL
       result += '"';
       result += value;
       result += '"';
+#else
+      result += '\'';
+      result += value;
+      result += '\'';
+#endif
       return result;
     }
     return value;
@@ -1186,11 +1256,15 @@ std::string Column::rand_value() {
   case Column::COLUMN_TYPES::TEXT:
 #ifdef USE_MYSQL
     return "\"" + rand_string(length) + "\"";
-#elif USE_DUCKDB
+#else
     return "\'" + rand_string(length) + "\'";
 #endif
   case Column::COLUMN_TYPES::BLOB:
+#ifdef USE_MYSQL
     return "_binary\"" + rand_string(length) + "\"";
+#else
+    return "\'" + rand_string(length) + "\'";
+#endif
   case Column::COLUMN_TYPES::JSON:
     return "\'" + json_rand_doc(this) + "\'";
   case Column::COLUMN_TYPES::BIT:
@@ -1204,7 +1278,11 @@ std::string Column::rand_value() {
   case Column::COLUMN_TYPES::DATETIME:
     return "\'" + rand_datetime() + "\'";
   case Column::COLUMN_TYPES::TIMESTAMP:
+#ifdef USE_MYSQL
     return "\'" + rand_timestamp() + "\'";
+#else
+    return "\'" + rand_timestamp(0, false) + "\'";
+#endif
     break;
   case Column::COLUMN_TYPES::GENERATED:
   case Column::COLUMN_TYPES::ENUM:
@@ -1219,6 +1297,13 @@ std::string Column::rand_value() {
 
 /* return table definition */
 std::string Column::definition() {
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse columns are NOT NULL by default; use Nullable() for nullable.
+     If null-prob=0, user wants no NULLs at all — skip Nullable wrapper. */
+  bool ch_nullable = null_val && options->at(Option::NULL_PROB)->getInt() > 0;
+  std::string type_str = ch_nullable ? "Nullable(" + clause() + ")" : clause();
+  return name_ + " " + type_str;
+#else
   std::string def = name_ + " " + clause();
   if (!null_val)
     def += " NOT NULL";
@@ -1230,6 +1315,7 @@ std::string Column::definition() {
   if (not_secondary)
     def += " NOT SECONDARY";
   return def;
+#endif
 }
 
 /* add new column, part of create table or Alter table */
@@ -2414,7 +2500,11 @@ std::string Table::definition(bool with_index, bool with_fk,
   std::string def = "CREATE";
   if (type == TEMPORARY)
     def += " TEMPORARY";
+#ifdef USE_CLICKHOUSE
+  def += " TABLE IF NOT EXISTS " + name_ + " (";
+#else
   def += " TABLE " + name_ + " (";
+#endif
 
   assert(columns_->size() > 0);
 
@@ -2422,15 +2512,22 @@ std::string Table::definition(bool with_index, bool with_fk,
   for (auto col : *columns_) {
     def += col->definition() + ", ";
   }
+#ifdef USE_CLICKHOUSE
+  /* version column for ReplacingMergeTree — always present, never dropped */
+  def += "_pstress_ver UInt64, ";
+#endif
 
 
   /* if column has primary key */
+  std::vector<std::string> pk_cols; /* all PK columns, including composite */
   if (has_pk()) {
     def += " PRIMARY KEY(";
     auto table_has_auto_inc = has_auto_inc_col();
     for (auto col : *columns_) {
-      if (col->primary_key)
+      if (col->primary_key) {
         def += col->name_ + ", ";
+        pk_cols.push_back(col->name_);
+      }
     }
     for (auto col : *columns_) {
       if (col->primary_key)
@@ -2444,6 +2541,7 @@ std::string Table::definition(bool with_index, bool with_fk,
                     options->at(Option::COMPOSITE_KEY_PROB)->getInt() &&
                 col->null_val == false)) {
         def += col->name_ + ", ";
+        pk_cols.push_back(col->name_); /* track composite key cols too */
       }
     }
     def.erase(def.length() - 2);
@@ -2510,6 +2608,38 @@ std::string Table::definition(bool with_index, bool with_fk,
 
   if (!engine.empty())
     def += " ENGINE=" + engine;
+
+#ifdef USE_CLICKHOUSE
+  if (!engine.empty() && !columns_->empty()) {
+    /* Always use ReplacingMergeTree(_pstress_ver) so the version column
+       resolves duplicate primary keys deterministically.
+       Use the Replicated variant when running against multiple ports. */
+    bool replicated = options->at(Option::PORT)->getString().find(',') != std::string::npos;
+    {
+      auto pos = def.rfind("ENGINE=MergeTree()");
+      if (pos != std::string::npos) {
+        std::string replacement = replicated
+            ? "ENGINE=ReplicatedReplacingMergeTree(_pstress_ver)"
+            : "ENGINE=ReplacingMergeTree(_pstress_ver)";
+        def.replace(pos, strlen("ENGINE=MergeTree()"), replacement);
+      }
+    }
+
+    /* ORDER BY must be a superset of PRIMARY KEY (PK must be a prefix).
+       Use pk_cols which captured every column added to PRIMARY KEY above,
+       including composite key extras whose primary_key flag is not set. */
+    std::string order_cols;
+    for (const auto &c : pk_cols) {
+      if (!order_cols.empty()) order_cols += ", ";
+      order_cols += c;
+    }
+    if (order_cols.empty())
+      order_cols = columns_->at(0)->name_;
+    def += " ORDER BY (" + order_cols + ")"
+           " SETTINGS enable_block_number_column = 1,"
+           " enable_block_offset_column = 1";
+  }
+#endif
 
   if (options->at(Option::SECONDARY_ENGINE)->getString().size() > 0 &&
       (!options->at(Option::SECONDARY_AFTER_CREATE)->getBool() ||
@@ -2794,9 +2924,13 @@ bool execute_sql(const std::string &sql, Thd1 *thd, bool force_sql_log_query) {
   }
 
   if (thd->ddl_query) {
+    auto _now = std::chrono::system_clock::now();
+    auto _tt  = std::chrono::system_clock::to_time_t(_now);
+    std::ostringstream _ts;
+    _ts << std::put_time(std::localtime(&_tt), "%H:%M:%S");
     std::lock_guard<std::mutex> lock(ddl_logs_write);
-    thd->ddl_logs << thd->thread_id << " " << sql << " " << thd->db->get_error()
-                  << std::endl;
+    thd->ddl_logs << "[" << _ts.str() << "] " << thd->thread_id << " " << sql
+                  << " " << thd->db->get_error() << std::endl;
   }
 
   return res;
@@ -2911,7 +3045,15 @@ void Table::ModifyColumn(Thd1 *thd) {
   else if (col->not_secondary == true and rand_int(3) == 0)
     col->not_secondary = false;
 
+#ifdef USE_CLICKHOUSE
+  /* Use Nullable() wrapper for nullable columns, matching CREATE TABLE DDL.
+     If null-prob=0, skip Nullable wrapper. */
+  bool ch_mod_nullable = col->null_val && options->at(Option::NULL_PROB)->getInt() > 0;
+  std::string ch_type = ch_mod_nullable ? "Nullable(" + col->clause() + ")" : col->clause();
+  sql += " " + col->name_ + " " + ch_type;
+#else
   sql += " " + col->definition() + pick_algorithm_lock();
+#endif
 
   /* if not successful rollback */
   if (!execute_sql(sql, thd)) {
@@ -2945,10 +3087,21 @@ void Table::DropColumn(Thd1 *thd) {
     unlock_table_mutex();
     return;
   }
+#ifdef USE_CLICKHOUSE
+  /* never drop the version column used by ReplacingMergeTree */
+  if (name == "_pstress_ver") {
+    unlock_table_mutex();
+    return;
+  }
+#endif
 
   std::string sql = "ALTER TABLE " + name_ + " DROP COLUMN " + name;
 
   sql += pick_algorithm_lock();
+#ifdef USE_CLICKHOUSE
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+#endif
   unlock_table_mutex();
 
   if (execute_sql(sql, thd)) {
@@ -3092,6 +3245,10 @@ void Table::AddColumn(Thd1 *thd) {
   }
 
   sql += algorithm_lock;
+#ifdef USE_CLICKHOUSE
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+#endif
 
   unlock_table_mutex();
 
@@ -3104,12 +3261,61 @@ void Table::AddColumn(Thd1 *thd) {
         add_new_column = false;
     }
 
+    /* capture before unlock — tc may be deleted below */
+    std::string added_name = tc->name_;
+#ifdef USE_CLICKHOUSE
+    Column::COLUMN_TYPES added_type = tc->type_;
+    int added_length = tc->length;
+#endif
+
     if (add_new_column)
       AddInternalColumn(tc);
     else
       delete tc;
 
     unlock_table_mutex();
+
+#ifdef USE_CLICKHOUSE
+    if (add_new_column &&
+        options->at(Option::CH_ADD_COLUMN_BACKFILL)->getBool()) {
+      /* Generate a client-side literal value for the backfill.
+         ClickHouse rejects non-deterministic server-side functions
+         (rand64, today, now…) in mutations on Replicated tables.
+         Using a constant literal avoids that restriction entirely. */
+      std::string rand_expr;
+      switch (added_type) {
+      case Column::INT:
+      case Column::INTEGER:
+        rand_expr = std::to_string(rand_int(1000000));
+        break;
+      case Column::FLOAT:
+        rand_expr = rand_float(1000);
+        break;
+      case Column::DOUBLE:
+        rand_expr = rand_double(1000.0);
+        break;
+      case Column::BOOL:
+        rand_expr = rand_int(1) == 1 ? "1" : "0";
+        break;
+      case Column::DATE:
+        rand_expr = "'" + rand_date() + "'";
+        break;
+      case Column::DATETIME:
+      case Column::TIMESTAMP:
+        rand_expr = "'" + rand_timestamp(0, false) + "'";
+        break;
+      default: /* VARCHAR, CHAR, TEXT, BLOB, etc. */
+        rand_expr =
+            "'" + rand_string(added_length > 0 ? added_length : 10) + "'";
+        break;
+      }
+      std::string backfill = "ALTER TABLE " + name_ + " UPDATE " +
+                             added_name + " = " + rand_expr + " WHERE 1=1";
+      if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+        backfill += " SETTINGS mutations_sync = 2";
+      execute_sql(backfill, thd);
+    }
+#endif
   } else
     delete tc;
 }
@@ -3479,8 +3685,12 @@ std::string Table::GetWhereBulk() {
   }
 
   if (col->type_ == Column::BLOB && rand_int(1000) == 1) {
+#ifdef USE_MYSQL
     return " WHERE instr( " + col->name_ + ",_binary\"" + rand_string(20) +
            "%\")";
+#else
+    return " WHERE position(" + col->name_ + ", '" + rand_string(20) + "') > 0";
+#endif
   }
 
   if (col->is_col_can_be_compared()) {
@@ -3509,7 +3719,11 @@ std::string Table::GetWhereBulk() {
   }
 
   if (col->is_col_string() && rand_int(100) < 20) {
+#ifdef USE_MYSQL
     return where + " LIKE " + "\"" + rand_string(20) + "%\"";
+#else
+    return where + " LIKE '" + rand_string(20) + "%'";
+#endif
   }
 
   if (col->is_col_string() && rand_int(100) < 90) {
@@ -3526,7 +3740,11 @@ std::string Table::GetWhereBulk() {
   }
 
   if (rand_int(100) == 1) {
+#ifdef USE_CLICKHOUSE
+    return " WHERE 1=1";
+#else
     return "";
+#endif
   }
 
   return where + " = " + col->rand_value();
@@ -3665,6 +3883,65 @@ void Table::DeleteAllRows(Thd1 *thd) {
   std::shared_lock lock(dml_mutex);
   execute_sql(sql, thd);
 }
+
+#ifdef USE_CLICKHOUSE
+/* Return a WHERE clause targeting ~50-70% of the table's row range.
+   Uses the integer PK column with a BETWEEN range covering half to
+   two-thirds of the full value span.  Falls back to GetWhereBulk()
+   when no integer PK exists. */
+std::string Table::GetWhereLargeRange() {
+  Column *int_pk = nullptr;
+  for (auto col : *columns_) {
+    if (col->primary_key && col->is_col_number()) {
+      int_pk = col;
+      break;
+    }
+  }
+  if (int_pk == nullptr)
+    return GetWhereBulk();
+
+  auto unique_range = options->at(Option::UNIQUE_RANGE)->getFloat();
+  auto total_range =
+      static_cast<long int>(unique_range * (long int)number_of_records);
+  if (total_range < 2)
+    return GetWhereBulk();
+
+  /* width covers 50-70% of the full value span */
+  auto width = rand_int((long int)(total_range * 0.2)) +
+               (long int)(total_range * 0.5);
+  /* start somewhere in the lower 30% so the range fits inside total_range */
+  auto lo = try_negative(rand_int((long int)(total_range * 0.3)));
+  auto hi = lo + width;
+  return " WHERE " + int_pk->name_ + " BETWEEN " + std::to_string(lo) +
+         " AND " + std::to_string(hi);
+}
+
+/* ALTER TABLE t UPDATE col=val WHERE ... SETTINGS mutations_sync=2
+   mutations_sync=2 waits for the mutation to complete on all replicas. */
+void Table::AlterTableUpdate(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  std::string sql = "ALTER TABLE " + name_ + " UPDATE " + SetClause() +
+                    GetWhereLargeRange();
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+  unlock_table_mutex();
+  execute_sql(sql, thd);
+}
+
+/* ALTER TABLE t DELETE WHERE ... SETTINGS mutations_sync=2 */
+void Table::AlterTableDelete(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  std::string sql =
+      "ALTER TABLE " + name_ + " DELETE" + GetWhereLargeRange();
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+  unlock_table_mutex();
+  execute_sql(sql, thd);
+}
+#else
+void Table::AlterTableUpdate(Thd1 *) {}
+void Table::AlterTableDelete(Thd1 *) {}
+#endif
 
 void Table::SelectAllRow(Thd1 *thd, bool select_for_update) {
   lock_table_mutex(thd->ddl_query);
@@ -3946,6 +4223,9 @@ void create_database_tablespace(Thd1 *thd) {
 
 /* load metadata */
 bool Thd1::load_metadata() {
+  /* Serialize initialization: both nodes share global all_tables/options */
+  static std::mutex load_metadata_mutex;
+  std::lock_guard<std::mutex> init_lock(load_metadata_mutex);
   sum_of_all_opts = sum_of_all_options(this);
   rng = std::mt19937(set_seed(nullptr));
 
@@ -3955,9 +4235,13 @@ bool Thd1::load_metadata() {
     validate_secondary_engine(this);
   }
 
-  /*set seed for current step*/
-  std::cout << "Running " << FORK << " version " << db->get_server_version()
-            << std::endl;
+  /*set seed for current step — print version only once across all nodes */
+  static bool version_printed = false;
+  if (!version_printed) {
+    version_printed = true;
+    std::cout << "Running " << FORK << " version " << db->get_server_version()
+              << std::endl;
+  }
 
   /* create in-memory data for general tablespaces */
   create_in_memory_data();
@@ -3968,21 +4252,25 @@ bool Thd1::load_metadata() {
     if (options->at(Option::XA_TRANSACTION)->getInt() != 0)
       execute_sql("XA COMMIT " + std::to_string(thread_id), this);
 
-    auto file = load_metadata_from_file();
-    if (file == "FAILED") {
-      exit(EXIT_FAILURE);
-    } else {
-      std::cout << "metadata loaded from " << file << std::endl;
+    if (all_tables->empty()) {
+      auto file = load_metadata_from_file();
+      if (file == "FAILED") {
+        exit(EXIT_FAILURE);
+      } else {
+        std::cout << "metadata loaded from " << file << std::endl;
+      }
     }
   } else {
     if (strcmp(FORK, "MySQL") == 0)
       create_database_tablespace(this);
-    if (load_metadata_from_file() == "FAILED") {
-      generate_metadata_for_tables();
-      print_and_log(
-          "metadata generated randomly using seed " +
-              std::to_string(options->at(Option::INITIAL_SEED)->getInt()),
-          this);
+    if (all_tables->empty()) {
+      if (load_metadata_from_file() == "FAILED") {
+        generate_metadata_for_tables();
+        print_and_log(
+            "metadata generated randomly using seed " +
+                std::to_string(options->at(Option::INITIAL_SEED)->getInt()),
+            this);
+      }
     }
   }
 
