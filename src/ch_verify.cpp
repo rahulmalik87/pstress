@@ -233,11 +233,15 @@ bool ch_verify_schema(const std::vector<std::string> &addrs,
       }
     }
 
-    /* Check for extra columns in ClickHouse not present in metadata */
+    /* Check for extra columns in ClickHouse not present in metadata.
+       _pstress_ver is a synthetic version column injected at CREATE TABLE
+       time and is never stored in metadata — always skip it. */
     std::set<std::string> meta_names;
     for (auto *col : meta_cols)
       meta_names.insert(col->name_);
     for (const auto &cn : ch_col_order) {
+      if (cn == "_pstress_ver")
+        continue;
       if (meta_names.find(cn) == meta_names.end()) {
         std::cout << "  " << table->name_ << "." << cn
                   << ": extra column in ClickHouse (not in metadata)\n";
