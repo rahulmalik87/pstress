@@ -230,6 +230,7 @@ struct Option {
     TOTAL_QUERIES,
     VARCHAR_COLUMN_MAX_WIDTH,
     COMPOSITE_KEY_PROB,
+    PREPARED_STMT_PROB,
     MAX
   } option;
 

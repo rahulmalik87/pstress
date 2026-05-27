@@ -2802,6 +2802,50 @@ bool execute_sql(const std::string &sql, Thd1 *thd, bool force_sql_log_query) {
   return res;
 }
 
+static bool should_use_prepared_select() {
+  auto ps_prob = options->at(Option::PREPARED_STMT_PROB)->getInt();
+  return ps_prob > 0 && rand_int(100, 1) <= ps_prob;
+}
+
+static bool execute_prepared_select(
+    const Table::PreparedSelect &prepared_select, Thd1 *thd) {
+  static auto log_all = opt_bool(LOG_ALL_QUERIES);
+  static auto log_success = opt_bool(LOG_SUCCEDED_QUERIES);
+
+  std::string template_id;
+  unsigned long long execute_count = 0;
+  bool prepared_now = false;
+  auto res = thd->db->execute_prepared_query(
+      prepared_select.prepared_sql, prepared_select.params, &template_id,
+      &execute_count, &prepared_now);
+
+  if (!res) {
+    thd->thread_log << "PS_FALLBACK " << thd->db->get_error() << " "
+                    << prepared_select.printable_sql << std::endl;
+    return execute_sql(prepared_select.printable_sql, thd);
+  }
+
+  thd->performed_queries_total++;
+  thd->max_con_fail_count = 0;
+  thd->success = true;
+  if (prepared_now) {
+    thd->thread_log << "PS_PREPARE " << template_id << " "
+                    << prepared_select.prepared_sql << std::endl;
+  }
+  thd->thread_log << "PS_EXECUTE " << template_id << " reuse="
+                  << execute_count << " " << prepared_select.printable_sql
+                  << ", rows:" << thd->db->get_affected_rows() << std::endl;
+
+  if (log_all || log_success) {
+    thd->thread_log << "S [prepared] " << prepared_select.printable_sql
+                    << ", rows:" << thd->db->get_affected_rows()
+                    << std::endl;
+  } else {
+    thd->query_buffer.push("S [prepared] " + prepared_select.printable_sql);
+  }
+  return true;
+}
+
 
 void Table::EnforceRebuildInSecondary(Thd1 *thd) {
   std::string sql = " SET GLOBAL " +
@@ -3436,6 +3480,102 @@ std::string Table::GetRandomPartition() {
   return sql;
 }
 
+static PreparedStatementParam param_from_sql_literal(const std::string &value) {
+  PreparedStatementParam param;
+  if (value == "NULL") {
+    param.is_null = true;
+    return param;
+  }
+
+  if (value.size() >= 2 &&
+      ((value.front() == '\'' && value.back() == '\'') ||
+       (value.front() == '"' && value.back() == '"'))) {
+    param.value = value.substr(1, value.size() - 2);
+  } else {
+    param.value = value;
+  }
+  return param;
+}
+
+static bool is_preparable_select_column(Column *col) {
+  return col->is_col_string() || col->is_col_can_be_compared() ||
+         col->type_ == Column::DECIMAL;
+}
+
+bool Table::BuildPreparedWherePrecise(
+    std::string &prepared_where, std::string &printable_where,
+    std::vector<PreparedStatementParam> &params) {
+  auto col = GetRandomColumn();
+  if (!is_preparable_select_column(col) || col->type_ == Column::GENERATED)
+    return false;
+
+  auto value = col->rand_value();
+  if (value == "NULL")
+    return false;
+
+  prepared_where = " WHERE " + col->name_ + " = ?";
+  printable_where = " WHERE " + col->name_ + " = " + value;
+  params.push_back(param_from_sql_literal(value));
+  return true;
+}
+
+bool Table::BuildPreparedWhereBulk(
+    std::string &prepared_where, std::string &printable_where,
+    std::vector<PreparedStatementParam> &params) {
+  auto col = GetRandomColumn();
+  if (!is_preparable_select_column(col) || col->type_ == Column::GENERATED)
+    return false;
+
+  auto value = col->rand_value();
+  if (value == "NULL")
+    return false;
+
+  auto add_one_param = [&]() {
+    params.push_back(param_from_sql_literal(value));
+  };
+
+  std::string where = " WHERE " + col->name_;
+  if (col->is_col_can_be_compared() || col->type_ == Column::DECIMAL) {
+    int shape = rand_int(3);
+    if (shape == 0) {
+      prepared_where = where + " = ?";
+      printable_where = where + " = " + value;
+      add_one_param();
+      return true;
+    }
+    if (shape == 1) {
+      prepared_where = where + " >= ?";
+      printable_where = where + " >= " + value;
+      add_one_param();
+      return true;
+    }
+    if (shape == 2) {
+      prepared_where = where + " <= ?";
+      printable_where = where + " <= " + value;
+      add_one_param();
+      return true;
+    }
+
+    auto second_value = col->rand_value();
+    if (second_value == "NULL")
+      return false;
+    prepared_where = where + " BETWEEN ? AND ?";
+    printable_where = where + " BETWEEN " + value + " AND " + second_value;
+    add_one_param();
+    params.push_back(param_from_sql_literal(second_value));
+    return true;
+  }
+
+  if (col->is_col_string()) {
+    prepared_where = where + " = ?";
+    printable_where = where + " = " + value;
+    add_one_param();
+    return true;
+  }
+
+  return false;
+}
+
 std::string Table::GetWherePrecise() {
   auto col = GetRandomColumn();
   std::string where = " WHERE ";
@@ -3534,20 +3674,54 @@ std::string Table::GetWhereBulk() {
 
 void Table::SelectRandomRow(Thd1 *thd, bool select_for_update) {
   lock_table_mutex(thd->ddl_query);
+  PreparedSelect prepared_select;
+  bool use_prepared = false;
+  bool ps_requested = should_use_prepared_select();
+  std::string ps_fallback_reason;
   std::string where = GetWherePrecise();
+  std::string prepared_where;
+  std::string printable_where;
+  std::vector<PreparedStatementParam> params;
+  if (ps_requested) {
+    if (BuildPreparedWherePrecise(prepared_where, printable_where, params)) {
+      use_prepared = true;
+      where = printable_where;
+    } else {
+      ps_fallback_reason = "unsupported-select-shape";
+    }
+  }
   assert(where.size() > 4);
   auto select_column = SelectColumn();
-  std::string sql = "SELECT " + select_column + " FROM " + name_ +
-                    GetRandomPartition() + where;
+  auto partition = GetRandomPartition();
+  std::string sql =
+      "SELECT " + select_column + " FROM " + name_ + partition + where;
+  if (use_prepared) {
+    prepared_select.prepared_sql = "SELECT " + select_column + " FROM " +
+                                   name_ + partition + prepared_where;
+    prepared_select.printable_sql = sql;
+    prepared_select.params = std::move(params);
+  }
 
   if (options->at(Option::COMPARE_RESULT)->getBool()) {
     sql += " order by " + select_column;
+    if (use_prepared)
+      ps_fallback_reason = "compare-result";
+    use_prepared = false;
   }
   if (select_for_update &&
       options->at(Option::SECONDARY_ENGINE)->getString() == "")
     sql += " FOR UPDATE SKIP LOCKED";
+  if (use_prepared && select_for_update &&
+      options->at(Option::SECONDARY_ENGINE)->getString() == "") {
+    prepared_select.prepared_sql += " FOR UPDATE SKIP LOCKED";
+    prepared_select.printable_sql += " FOR UPDATE SKIP LOCKED";
+  }
 
   unlock_table_mutex();
+  if (!use_prepared && ps_requested && !ps_fallback_reason.empty()) {
+    thd->thread_log << "PS_FALLBACK " << ps_fallback_reason << " " << sql
+                    << std::endl;
+  }
   if (options->at(Option::COMPARE_RESULT)->getBool()) {
     Compare_between_engine(sql, thd);
   } else {
@@ -3555,7 +3729,11 @@ void Table::SelectRandomRow(Thd1 *thd, bool select_for_update) {
       execute_sql("COMMIT", thd);
       thd->trx_left = 0;
     }
-    execute_sql(sql, thd);
+    if (use_prepared) {
+      execute_prepared_select(prepared_select, thd);
+    } else {
+      execute_sql(sql, thd);
+    }
   }
 }
 
@@ -3668,17 +3846,54 @@ void Table::DeleteAllRows(Thd1 *thd) {
 
 void Table::SelectAllRow(Thd1 *thd, bool select_for_update) {
   lock_table_mutex(thd->ddl_query);
-  std::string sql = "SELECT " + SelectColumn() + " FROM " + name_ +
-                    GetRandomPartition() + GetWhereBulk();
+  PreparedSelect prepared_select;
+  bool use_prepared = false;
+  bool ps_requested = should_use_prepared_select();
+  std::string ps_fallback_reason;
+  std::string where = GetWhereBulk();
+  std::string prepared_where;
+  std::string printable_where;
+  std::vector<PreparedStatementParam> params;
+  if (ps_requested) {
+    if (BuildPreparedWhereBulk(prepared_where, printable_where, params)) {
+      use_prepared = true;
+      where = printable_where;
+    } else {
+      ps_fallback_reason = "unsupported-select-shape";
+    }
+  }
+  auto select_column = SelectColumn();
+  auto partition = GetRandomPartition();
+  std::string sql =
+      "SELECT " + select_column + " FROM " + name_ + partition + where;
+  if (use_prepared) {
+    prepared_select.prepared_sql = "SELECT " + select_column + " FROM " +
+                                   name_ + partition + prepared_where;
+    prepared_select.printable_sql = sql;
+    prepared_select.params = std::move(params);
+  }
   if (select_for_update &&
       options->at(Option::SECONDARY_ENGINE)->getString() == "")
     sql += " FOR UPDATE SKIP LOCKED";
+  if (use_prepared && select_for_update &&
+      options->at(Option::SECONDARY_ENGINE)->getString() == "") {
+    prepared_select.prepared_sql += " FOR UPDATE SKIP LOCKED";
+    prepared_select.printable_sql += " FOR UPDATE SKIP LOCKED";
+  }
   unlock_table_mutex();
+  if (!use_prepared && ps_requested && !ps_fallback_reason.empty()) {
+    thd->thread_log << "PS_FALLBACK " << ps_fallback_reason << " " << sql
+                    << std::endl;
+  }
   if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
     execute_sql("COMMIT", thd);
     thd->trx_left = 0;
   }
-  execute_sql(sql, thd);
+  if (use_prepared) {
+    execute_prepared_select(prepared_select, thd);
+  } else {
+    execute_sql(sql, thd);
+  }
 }
 
 std::string Table::SetClause() {

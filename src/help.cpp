@@ -916,6 +916,13 @@ void add_options() {
   opt->short_help = "SBU";
   opt->setSQL();
 
+  opt = newOption(Option::INT, Option::PREPARED_STMT_PROB, "ps-prob");
+  opt->help = "Probability of using cached MySQL C API prepared statements for "
+              "eligible generated SELECT statements";
+  opt->setInt(0);
+  opt->short_help = "PS";
+  opt->setSQL();
+
   opt = newOption(Option::INT, Option::NON_INT_PK, "non-int-pk-prob");
   opt->help = "Probability of primary key column being non integer";
   opt->setInt(25);

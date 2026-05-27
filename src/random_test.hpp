@@ -402,6 +402,17 @@ struct Table {
   void SetSecondaryEngine(Thd1 *thd);
   std::string GetRandomPartition();
   Column *GetRandomColumn();
+  struct PreparedSelect {
+    std::string prepared_sql;
+    std::string printable_sql;
+    std::vector<PreparedStatementParam> params;
+  };
+  bool BuildPreparedWherePrecise(std::string &prepared_where,
+                                 std::string &printable_where,
+                                 std::vector<PreparedStatementParam> &params);
+  bool BuildPreparedWhereBulk(std::string &prepared_where,
+                              std::string &printable_where,
+                              std::vector<PreparedStatementParam> &params);
   std::string GetWherePrecise();
   std::string GetWhereBulk();
   std::string ColumnValues(Thd1 *thd, int value_count = 1);
