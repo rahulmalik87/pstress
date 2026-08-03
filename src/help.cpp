@@ -1012,6 +1012,14 @@ void add_options() {
   opt->setArgs(no_argument);
   opt->short_help = "CHBackfill";
 
+  /* TLS for the ClickHouse native protocol (required by ClickHouse Cloud) */
+  opt = newOption(Option::BOOL, Option::SECURE, "secure");
+  opt->help = "Connect over TLS using the ClickHouse native protocol. "
+              "Required for ClickHouse Cloud. Changes the default port from "
+              "9000 to 9440.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
   /* Drop column */
   opt = newOption(Option::INT, Option::DROP_COLUMN, "drop-column");
   opt->help = "alter table drop some random column";
@@ -1140,7 +1148,14 @@ void add_options() {
 
   /* Address */
   opt = newOption(Option::STRING, Option::ADDRESS, "address");
-  opt->help = "IP address to connect to";
+  opt->help = "Hostname or IP address to connect to. Same as --host.";
+  opt->setString("");
+
+  /* Host — alias for --address, matching clickhouse-client's flag name.
+     Remapped to ADDRESS in the getopt switch in pstress.cpp, so this option
+     never holds a value of its own and the two are genuinely last-one-wins. */
+  opt = newOption(Option::STRING, Option::HOST, "host");
+  opt->help = "Hostname or IP address to connect to. Alias for --address.";
   opt->setString("");
 
   /* Infile */

@@ -179,6 +179,10 @@ int main(int argc, char *argv[]) {
       exit(EXIT_FAILURE);
       break;
     default:
+      /* --host is an alias for --address; remap before the lookup below so both
+         write the same option slot and the later ->cl checks see either one. */
+      if (c == Option::HOST)
+        c = Option::ADDRESS;
       if (c >= Option::MAX) {
         break;
       }
@@ -256,12 +260,17 @@ int main(int argc, char *argv[]) {
 #ifdef USE_CLICKHOUSE
   /* Apply ClickHouse defaults early — ch_verify_startup() runs before worker
      threads call sum_of_all_options(), so defaults must be set here too. */
-  if (options->at(Option::ADDRESS)->getString().empty())
+  if (!options->at(Option::ADDRESS)->cl)
     options->at(Option::ADDRESS)->setString("127.0.0.1");
-  if (options->at(Option::USER)->getString() == "root")
+  if (!options->at(Option::USER)->cl)
     options->at(Option::USER)->setString("default");
-  if (options->at(Option::DATABASE)->getString() == "test")
+  if (!options->at(Option::DATABASE)->cl)
     options->at(Option::DATABASE)->setString("test_db");
+  /* The global default is MySQL's 3306, which is never right for the
+     ClickHouse native protocol. 9440 is the TLS port, 9000 the plaintext one. */
+  if (!options->at(Option::PORT)->cl)
+    options->at(Option::PORT)->setString(
+        options->at(Option::SECURE)->getBool() ? "9440" : "9000");
 #endif
 
   /* Auto-detect step from logdir if --step was not explicitly given.

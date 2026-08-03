@@ -235,6 +235,8 @@ struct Option {
     CH_ALTER_DELETE,
     CH_MUTATIONS_SYNC,
     CH_ADD_COLUMN_BACKFILL,
+    SECURE,
+    HOST,
     MAX
   } option;
 

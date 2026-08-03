@@ -456,12 +456,15 @@ int sum_of_all_options(Thd1 *thd) {
 
   if (strcmp(FORK, "ClickHouse") == 0) {
     /* Convenient defaults for ClickHouse (only if not overridden on CLI) */
-    if (options->at(Option::ADDRESS)->getString().empty())
+    if (!options->at(Option::ADDRESS)->cl)
       options->at(Option::ADDRESS)->setString("127.0.0.1");
-    if (options->at(Option::USER)->getString() == "root")
+    if (!options->at(Option::USER)->cl)
       options->at(Option::USER)->setString("default");
-    if (options->at(Option::DATABASE)->getString() == "test")
+    if (!options->at(Option::DATABASE)->cl)
       options->at(Option::DATABASE)->setString("test_db");
+    if (!options->at(Option::PORT)->cl)
+      options->at(Option::PORT)->setString(
+          options->at(Option::SECURE)->getBool() ? "9440" : "9000");
     options->at(Option::NO_FK)->setBool(true);
     options->at(Option::NO_AUTO_INC)->setBool(true);
     options->at(Option::PK_COLUMN_AUTOINC)->setInt(0);

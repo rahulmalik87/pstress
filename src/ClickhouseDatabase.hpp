@@ -1,5 +1,6 @@
 #pragma once
 #include <clickhouse/client.h>
+#include "ch_client_options.hpp"
 #include "DatabaseInterface.hpp"
 #include "node.hpp"
 #include <iostream>
@@ -60,12 +61,17 @@ public:
   ClickHouseDatabase() = default;
 
   bool connect(const workerParams &myParams) override {
+    /* Outside the try so the catch below can name them in its hint. */
+    const bool secure = options->at(Option::SECURE)->getBool();
+    const int port =
+        myParams.port > 0 ? myParams.port : ch_default_port(secure);
     try {
       clickhouse::ClientOptions opts;
       opts.SetHost(myParams.address)
-          .SetPort(myParams.port > 0 ? myParams.port : 9000)
+          .SetPort(port)
           .SetUser(myParams.username)
           .SetPassword(myParams.password);
+      ch_apply_secure(opts, secure);
       /* Connect without default database first to create it if needed */
       client = std::make_unique<clickhouse::Client>(opts);
 
@@ -83,7 +89,9 @@ public:
       client = std::make_unique<clickhouse::Client>(opts);
       return true;
     } catch (const std::exception &e) {
-      std::cerr << "ClickHouse connect error: " << e.what() << std::endl;
+      std::cerr << "ClickHouse connect error [" << myParams.address << ":"
+                << port << "]: " << e.what()
+                << ch_connect_hint(myParams.address, port, secure) << std::endl;
       return false;
     }
   }

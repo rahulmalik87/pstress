@@ -1,6 +1,7 @@
 #ifdef USE_CLICKHOUSE
 /* clickhouse/client.h MUST come before any pstress headers (::Column collision) */
 #include <clickhouse/client.h>
+#include "ch_client_options.hpp"
 #include "ch_verify.hpp"
 #include "random_test.hpp"
 #include <chrono>
@@ -126,6 +127,7 @@ make_clients(const std::vector<std::string> &addrs,
     clickhouse::ClientOptions opts;
     opts.SetHost(host).SetPort(ports[i]).SetUser(user).SetPassword(pass)
         .SetDefaultDatabase(db);
+    ch_apply_secure(opts, options->at(Option::SECURE)->getBool());
     clients.push_back(std::make_unique<clickhouse::Client>(opts));
   }
   return clients;
@@ -136,10 +138,20 @@ void ch_verify_startup(const std::vector<std::string> &addrs,
                        const std::string &db, const std::string &user,
                        const std::string &pass) {
   std::cout << "\n==> [startup] Waiting for replication to catch up..." << std::endl;
-  auto clients = make_clients(addrs, ports, db, user, pass);
-  wait_for_replication(clients, db);
-  if (!do_verify(clients, db)) {
-    std::cerr << "ERROR: Replica mismatch at startup — aborting.\n";
+  try {
+    auto clients = make_clients(addrs, ports, db, user, pass);
+    wait_for_replication(clients, db);
+    if (!do_verify(clients, db)) {
+      std::cerr << "ERROR: Replica mismatch at startup — aborting.\n";
+      exit(EXIT_FAILURE);
+    }
+  } catch (const std::exception &e) {
+    /* Otherwise this escapes to terminate() from inside the std::call_once in
+       run_some_query() and prints a bare stack dump. */
+    std::cerr << "ERROR: [startup] ClickHouse verification failed: " << e.what()
+              << ch_connect_hint(addrs[0], ports.empty() ? 0 : ports[0],
+                                 options->at(Option::SECURE)->getBool())
+              << "\n";
     exit(EXIT_FAILURE);
   }
 }
@@ -172,7 +184,19 @@ bool ch_verify_schema(const std::vector<std::string> &addrs,
   clickhouse::ClientOptions opts;
   opts.SetHost(host).SetPort(port).SetUser(user).SetPassword(pass)
       .SetDefaultDatabase(db);
-  clickhouse::Client client(opts);
+  ch_apply_secure(opts, options->at(Option::SECURE)->getBool());
+  std::unique_ptr<clickhouse::Client> client_ptr;
+  try {
+    client_ptr = std::make_unique<clickhouse::Client>(opts);
+  } catch (const std::exception &e) {
+    std::cerr << "ERROR: cannot connect to " << host << ":" << port << " — "
+              << e.what()
+              << ch_connect_hint(host, port,
+                                 options->at(Option::SECURE)->getBool())
+              << "\n";
+    return false;
+  }
+  clickhouse::Client &client = *client_ptr;
 
   std::cout << "\n[" << now_str()
             << "] ==> Schema verification: metadata vs ClickHouse ("
