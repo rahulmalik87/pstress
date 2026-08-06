@@ -23,8 +23,10 @@ FILE(COPY ${SQL_FILES} DESTINATION .)
 FILE(GLOB TEXT_FILES "*.txt")
 FILE(COPY ${TEXT_FILES} DESTINATION .)
 
-# Install all .sql files to the bin directory
-INSTALL(FILES ${SQL_FILES} DESTINATION bin)
+# Install all .sql and .txt files to the bin directory. The .txt files are the
+# dictionary and the ClickHouse table settings pool, both looked up next to the
+# binary at runtime.
+INSTALL(FILES ${SQL_FILES} ${TEXT_FILES} DESTINATION bin)
 INSTALL(TARGETS ${BINARY_NAME}-${PSTRESS_EXT} DESTINATION bin)
 
 SET( CMAKE_EXPORT_COMPILE_COMMANDS ON )

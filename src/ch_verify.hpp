@@ -24,6 +24,16 @@ void ch_verify_replicas(const std::vector<std::string> &addrs,
                         const std::string &pass,
                         const std::vector<std::string> &table_names);
 
+/* Drop settings the server does not know from the pool loaded out of the
+   settings file, so a typo or a setting from another ClickHouse version does
+   not fail every CREATE TABLE. A setting at probability 100 was asked for on
+   every table, so an unknown name there aborts the run instead of quietly
+   leaving the feature untested. Does nothing if the pool is empty or if
+   system.merge_tree_settings cannot be read. */
+void ch_validate_table_settings(const std::string &addr, int port,
+                                const std::string &db, const std::string &user,
+                                const std::string &pass);
+
 /* Compare pstress in-memory metadata columns against actual ClickHouse schema.
    Connects to the first node and reports missing columns, extra columns, and
    nullability mismatches. Returns true if all tables match, false otherwise. */

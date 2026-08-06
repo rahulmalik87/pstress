@@ -237,6 +237,9 @@ struct Option {
     CH_ADD_COLUMN_BACKFILL,
     SECURE,
     HOST,
+    CH_TABLE_SETTINGS_FILE,
+    CH_TABLE_SETTINGS,
+    NO_TABLE_SETTINGS,
     MAX
   } option;
 

@@ -171,6 +171,65 @@ void ch_verify_replicas(const std::vector<std::string> &addrs,
   do_verify(clients, db);
 }
 
+/* Drop unknown settings from the pool read out of the settings file. Unknown at
+   probability 100 is fatal: it was asked for on every table, so silently
+   skipping it would make an experiment look like it ran when it never did. */
+void ch_validate_table_settings(const std::string &addr, int port,
+                                const std::string &db, const std::string &user,
+                                const std::string &pass) {
+  if (g_table_settings.empty())
+    return;
+
+  const bool secure = options->at(Option::SECURE)->getBool();
+  std::set<std::string> known;
+  try {
+    clickhouse::ClientOptions opts;
+    opts.SetHost(addr)
+        .SetPort(port > 0 ? port : ch_default_port(secure))
+        .SetUser(user)
+        .SetPassword(pass)
+        .SetDefaultDatabase(db);
+    ch_apply_secure(opts, secure);
+    clickhouse::Client client(opts);
+    client.Execute(
+        clickhouse::Query("SELECT name FROM system.merge_tree_settings")
+            .OnData([&](const clickhouse::Block &block) {
+              for (size_t r = 0; r < block.GetRowCount(); ++r)
+                known.insert(
+                    std::string(block[0]->As<clickhouse::ColumnString>()->At(r)));
+            }));
+  } catch (const std::exception &e) {
+    print_and_log("Cannot read system.merge_tree_settings (" +
+                      std::string(e.what()) +
+                      "), using the table settings pool unchecked",
+                  nullptr);
+    return;
+  }
+
+  if (known.empty())
+    return;
+
+  std::vector<SettingSpec> kept;
+  for (const auto &spec : g_table_settings) {
+    if (known.count(spec.name) > 0) {
+      kept.push_back(spec);
+      continue;
+    }
+    if (spec.prob == 100) {
+      print_and_log("Table setting " + spec.name +
+                        " was requested for every table but this ClickHouse "
+                        "does not have it — check the name in " +
+                        options->at(Option::CH_TABLE_SETTINGS_FILE)->getString(),
+                    nullptr);
+      exit(EXIT_FAILURE);
+    }
+    print_and_log("Skipping unknown table setting " + spec.name +
+                      ", this ClickHouse does not have it",
+                  nullptr);
+  }
+  g_table_settings = std::move(kept);
+}
+
 /* Compare pstress in-memory metadata columns against actual ClickHouse schema.
    Uses the first node. Reports missing/extra columns and nullability mismatches.
    Returns true if all tables match, false on any mismatch. */

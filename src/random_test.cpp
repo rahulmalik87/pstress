@@ -7,6 +7,9 @@
 #include "common.hpp"
 #include "json.hpp"
 #include "node.hpp"
+#ifdef USE_CLICKHOUSE
+#include "ch_verify.hpp"
+#endif
 #include <array>
 #include <document.h>
 #include <filesystem>
@@ -37,6 +40,9 @@ std::vector<std::string> g_tablespace;
 std::vector<std::string> locks;
 std::vector<std::string> algorithms;
 std::vector<int> g_key_block_size;
+std::vector<SettingSpec> g_table_settings;
+std::vector<std::string> g_session_settings;
+std::string g_fixed_table_settings;
 std::vector<std::string> random_strs;
 int g_innodb_page_size;
 int sum_of_all_opts = 0; // sum of all probablility
@@ -861,6 +867,230 @@ std::vector<std::string> random_strs_generator() {
   }
   file.close();
   return strs;
+}
+
+static std::string trim_ws(const std::string &str) {
+  auto begin = str.find_first_not_of(" \t\r");
+  if (begin == std::string::npos)
+    return "";
+  return str.substr(begin, str.find_last_not_of(" \t\r") - begin + 1);
+}
+
+/* split on delimiter keeping each piece whole. splitStringToArray() reads with
+   >> and so stops at the first space, which would turn "a = 1" into "a". */
+static std::vector<std::string> split_and_trim(const std::string &input,
+                                               char delimiter) {
+  std::vector<std::string> result;
+  std::istringstream iss(input);
+  std::string piece;
+  while (std::getline(iss, piece, delimiter)) {
+    auto trimmed = trim_ws(piece);
+    if (!trimmed.empty())
+      result.push_back(trimmed);
+  }
+  return result;
+}
+
+/* settings pstress emits itself — the lightweight mutation paths depend on
+   them, so the settings file is not allowed to override them */
+static bool is_reserved_setting(const std::string &name) {
+  return name == "enable_block_number_column" ||
+         name == "enable_block_offset_column";
+}
+
+[[noreturn]] static void settings_file_error(const std::string &file,
+                                            int line_no,
+                                            const std::string &line,
+                                            const std::string &why) {
+  std::cerr << "Invalid table setting at " << file << ":" << line_no << ": "
+            << why << "\n  " << line << std::endl;
+  exit(EXIT_FAILURE);
+}
+
+/* one value for a spec: a random element of the list, or a random integer
+   inside the range */
+static std::string resolve_setting_value(const SettingSpec &spec) {
+  if (spec.is_range)
+    return std::to_string(rand_int(spec.hi, spec.lo));
+  if (spec.values.empty())
+    return "";
+  return spec.values.at(rand_int(spec.values.size() - 1));
+}
+
+/* Read the settings pool. Table entries are kept for per-table rolling in
+   pick_table_settings(); session entries are rolled here, once, so that every
+   thread issues the same SET — threads disagreeing about an
+   allow_experimental_* flag would make CREATE TABLE fail on some of them. */
+void load_table_settings_pool() {
+  g_table_settings.clear();
+  g_session_settings.clear();
+  g_fixed_table_settings.clear();
+
+  if (options->at(Option::NO_TABLE_SETTINGS)->getBool())
+    return;
+
+  /* a fixed clause is used for every table, so normalize it here instead of
+     re-parsing it per table, and drop the settings pstress owns — ClickHouse
+     accepts a duplicated setting and lets the last one win, which would
+     silently turn off what the mutation paths need */
+  const auto fixed = opt_string(CH_TABLE_SETTINGS);
+  if (!fixed.empty()) {
+    for (const auto &setting : split_and_trim(fixed, ',')) {
+      auto eq = setting.find('=');
+      if (eq == std::string::npos) {
+        std::cerr << "Invalid --table-settings entry, expected <name> = <value>"
+                  << ":\n  " << setting << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      if (is_reserved_setting(trim_ws(setting.substr(0, eq)))) {
+        std::cout << "Ignoring " << trim_ws(setting.substr(0, eq))
+                  << " in --table-settings, pstress always sets it"
+                  << std::endl;
+        continue;
+      }
+      if (!g_fixed_table_settings.empty())
+        g_fixed_table_settings += ", ";
+      g_fixed_table_settings += setting;
+    }
+    return;
+  }
+
+  auto *file_opt = options->at(Option::CH_TABLE_SETTINGS_FILE);
+  const std::string file_name = file_opt->getString();
+  if (file_name.empty())
+    return;
+
+  /* the shipped pool sits next to the binary, like the dictionary file */
+  std::filesystem::path path(file_name);
+  if (path.is_relative())
+    path = std::filesystem::path(getExecutablePath()).parent_path() / path;
+  const std::string path_str = path.string();
+
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    /* only fatal when the user named this file themselves */
+    if (file_opt->cl) {
+      std::cerr << "Unable to open table settings file " << path_str
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    std::cout << "No table settings file at " << path_str
+              << ", tables will use server default settings" << std::endl;
+    return;
+  }
+
+  std::string line;
+  int line_no = 0;
+  while (std::getline(file, line)) {
+    line_no++;
+    std::string rest = trim_ws(line);
+    if (rest.empty() || rest[0] == '#')
+      continue;
+
+    bool is_session = false;
+    if (rest.rfind("session:", 0) == 0) {
+      is_session = true;
+      rest = trim_ws(rest.substr(strlen("session:")));
+    }
+
+    auto eq = rest.find('=');
+    if (eq == std::string::npos)
+      settings_file_error(path_str, line_no, line,
+                          "expected [session:][<prob>:]<name> = <values>");
+
+    SettingSpec spec;
+
+    /* optional probability prefix. A colon after the '=' belongs to an
+       int:<lo>..<hi> value, so only look before it. */
+    auto colon = rest.find(':');
+    if (colon != std::string::npos && colon < eq) {
+      auto prob_str = trim_ws(rest.substr(0, colon));
+      if (prob_str.empty() || prob_str.size() > 3 ||
+          prob_str.find_first_not_of("0123456789") != std::string::npos)
+        settings_file_error(path_str, line_no, line,
+                            "probability must be an integer 0-100");
+      spec.prob = std::stoi(prob_str);
+      if (spec.prob > 100)
+        settings_file_error(path_str, line_no, line,
+                            "probability must be an integer 0-100");
+      rest = trim_ws(rest.substr(colon + 1));
+      eq = rest.find('=');
+      if (eq == std::string::npos)
+        settings_file_error(path_str, line_no, line,
+                            "expected <name> = <values> after the probability");
+    }
+
+    spec.name = trim_ws(rest.substr(0, eq));
+    auto values = trim_ws(rest.substr(eq + 1));
+    if (spec.name.empty())
+      settings_file_error(path_str, line_no, line, "missing setting name");
+    if (values.empty())
+      settings_file_error(path_str, line_no, line, "missing value");
+
+    if (values.rfind("int:", 0) == 0) {
+      auto range = values.substr(strlen("int:"));
+      auto dots = range.find("..");
+      if (dots == std::string::npos)
+        settings_file_error(path_str, line_no, line,
+                            "integer range must be int:<lo>..<hi>");
+      try {
+        spec.lo = std::stol(trim_ws(range.substr(0, dots)));
+        spec.hi = std::stol(trim_ws(range.substr(dots + 2)));
+      } catch (const std::exception &) {
+        settings_file_error(path_str, line_no, line,
+                            "integer range must be int:<lo>..<hi>");
+      }
+      if (spec.hi < spec.lo)
+        settings_file_error(path_str, line_no, line,
+                            "integer range ends below where it starts");
+      spec.is_range = true;
+    } else {
+      spec.values = split_and_trim(values, '|');
+      if (spec.values.empty())
+        settings_file_error(path_str, line_no, line, "missing value");
+    }
+
+    if (is_reserved_setting(spec.name)) {
+      std::cout << "Ignoring " << spec.name << " at " << path_str << ":"
+                << line_no << ", pstress always sets it" << std::endl;
+      continue;
+    }
+
+    if (is_session) {
+      if (rand_int(99) < spec.prob)
+        g_session_settings.push_back(spec.name + " = " +
+                                     resolve_setting_value(spec));
+    } else {
+      g_table_settings.push_back(spec);
+    }
+  }
+  file.close();
+
+  std::cout << "Loaded " << g_table_settings.size() << " table settings from "
+            << path_str << std::endl;
+  for (const auto &setting : g_session_settings)
+    std::cout << "Session setting: SET " << setting << std::endl;
+}
+
+/* Settings for one table: the fixed clause if given, otherwise every pool
+   entry whose probability roll passes, with one of its values. */
+std::string pick_table_settings() {
+  if (options->at(Option::NO_TABLE_SETTINGS)->getBool())
+    return "";
+
+  if (!g_fixed_table_settings.empty())
+    return g_fixed_table_settings;
+
+  std::string clause;
+  for (const auto &spec : g_table_settings) {
+    /* rand_int(99) is 0-99, so prob 100 always fires and prob 0 never does */
+    if (rand_int(99) >= spec.prob)
+      continue;
+    if (!clause.empty())
+      clause += ", ";
+    clause += spec.name + " = " + resolve_setting_value(spec);
+  }
+  return clause;
 }
 
 PSTRESS_TARGET_CLONES
@@ -2464,6 +2694,12 @@ Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
   static auto engine = options->at(Option::ENGINE)->getString();
   table->engine = engine;
 
+#ifdef USE_CLICKHOUSE
+  /* rolled once per table and persisted, so DropCreate and the next step
+     recreate this table with the same settings */
+  table->settings = pick_table_settings();
+#endif
+
   table->CreateDefaultColumn();
   table->CreateDefaultIndex();
   if (type == FK) {
@@ -2641,6 +2877,9 @@ std::string Table::definition(bool with_index, bool with_fk,
     def += " ORDER BY (" + order_cols + ")"
            " SETTINGS enable_block_number_column = 1,"
            " enable_block_offset_column = 1";
+    /* per-table settings from --table-settings-file / --table-settings */
+    if (!settings.empty())
+      def += ", " + settings;
   }
 #endif
 
@@ -4233,6 +4472,14 @@ bool Thd1::load_metadata() {
   rng = std::mt19937(set_seed(nullptr));
 
   random_strs = random_strs_generator();
+
+#ifdef USE_CLICKHOUSE
+  /* drop settings this server does not have before any table rolls for them */
+  ch_validate_table_settings(myParam->address, myParam->port,
+                             options->at(Option::DATABASE)->getString(),
+                             options->at(Option::USER)->getString(),
+                             options->at(Option::PASSWORD)->getString());
+#endif
 
   if (options->at(Option::SECONDARY_ENGINE)->getString() != "") {
     validate_secondary_engine(this);

@@ -1012,6 +1012,32 @@ void add_options() {
   opt->setArgs(no_argument);
   opt->short_help = "CHBackfill";
 
+  /* Per-table ClickHouse MergeTree settings */
+  opt = newOption(Option::STRING, Option::CH_TABLE_SETTINGS_FILE,
+                  "table-settings-file");
+  opt->help = "File with the pool of ClickHouse table settings, one per line as "
+              "[session:][<prob>:]<name> = <v1>|<v2> or int:<lo>..<hi>. Each "
+              "table rolls every line against its probability, so prob 100 "
+              "puts a setting on every table and prob 5 on about one in "
+              "twenty. session: lines are applied as SET on each connection. "
+              "Looked up next to the pstress binary. Missing default file is "
+              "not an error; a missing file named on the command line is.";
+  opt->setString("clickhouse_table_settings.txt");
+
+  opt = newOption(Option::STRING, Option::CH_TABLE_SETTINGS, "table-settings");
+  opt->help = "Fixed ClickHouse table settings applied verbatim to every "
+              "table, e.g. --table-settings=\"index_granularity = 4096, "
+              "compress_marks = 1\". Nothing is randomized and the settings "
+              "file is not read.";
+  opt->setString("");
+
+  opt = newOption(Option::BOOL, Option::NO_TABLE_SETTINGS, "no-table-settings");
+  opt->help = "Do not add any table or session settings, ignoring both "
+              "--table-settings-file and --table-settings. Only the settings "
+              "pstress requires internally are emitted. Pass flag to enable.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
   /* TLS for the ClickHouse native protocol (required by ClickHouse Cloud) */
   opt = newOption(Option::BOOL, Option::SECURE, "secure");
   opt->help = "Connect over TLS using the ClickHouse native protocol. "

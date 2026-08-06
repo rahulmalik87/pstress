@@ -242,6 +242,12 @@ int main(int argc, char *argv[]) {
     read_option_prob_file(options->at(Option::OPTION_PROB_FILE)->getString());
   }
 
+#ifdef USE_CLICKHOUSE
+  /* after the seed is set so the session settings are reproducible, and before
+     any thread connects so the SETs are ready to apply */
+  load_table_settings_pool();
+#endif
+
 #ifdef USE_DUCKDB
   // if step=1 or prepare=true remove the duckdb file in logdir
   if (options->at(Option::STEP)->getInt() == 1 ||

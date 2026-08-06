@@ -377,6 +377,10 @@ template <typename Writer> void Table::Serialize(Writer &writer) const {
   writer.String("number_of_initial_records");
   writer.Int(number_of_initial_records);
 
+  /* ClickHouse per-table SETTINGS, empty when none were rolled */
+  writer.String("settings");
+  writer.String(settings.c_str(), static_cast<SizeType>(settings.length()));
+
   writer.String(("columns"));
   writer.StartArray();
 
@@ -670,6 +674,9 @@ std::string load_metadata_from_file() {
     table->key_block_size = tab["key_block_size"].GetInt();
     table->number_of_initial_records =
         tab["number_of_initial_records"].GetInt();
+
+    if (tab.HasMember("settings"))
+      table->settings = tab["settings"].GetString();
 
     /* save columns */
     for (auto &col : tab["columns"].GetArray()) {

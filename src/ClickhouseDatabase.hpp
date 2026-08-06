@@ -87,6 +87,15 @@ public:
 
       opts.SetDefaultDatabase(db);
       client = std::make_unique<clickhouse::Client>(opts);
+
+      /* session settings from the settings file, e.g. the allow_experimental_*
+         flags that gate experimental table settings. Applied to every
+         connection, including reconnects, since tryreconnet() comes back
+         through here. A bad name throws and is reported by the catch below —
+         failing loudly beats creating tables without the feature. */
+      for (const auto &setting : g_session_settings)
+        client->Execute("SET " + setting);
+
       return true;
     } catch (const std::exception &e) {
       std::cerr << "ClickHouse connect error [" << myParams.address << ":"

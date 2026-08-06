@@ -66,8 +66,8 @@ const std::string TABLE_PREFIX = "tt_";
 const std::string PARTITION_SUFFIX = "_p";
 const std::string FK_SUFFIX = "_fk";
 const std::string TEMP_SUFFIX = "_t";
-/* used to create metadata */
-const int version = 2;
+/* used to create metadata. Bumped to 3 when per-table settings were added. */
+const int version = 3;
 std::string add_ignore_clause();
 struct Thd1;
 
@@ -430,6 +430,10 @@ struct Table {
 
   std::string name_;
   std::string engine;
+  /* ClickHouse: extra SETTINGS for this table as "name = value, name = value".
+     Rolled once in table_id() and persisted, so DropCreate and later steps
+     recreate the table with the same settings. */
+  std::string settings;
   std::string row_format;
   std::string tablespace;
   std::string compression;
@@ -808,6 +812,28 @@ struct grammar_tables {
 void print_and_log(std::string &&str, Thd1 *thd = nullptr,
                    bool print_error = false, bool count_to_console = true);
 std::string getExecutablePath();
+
+/* One line of the ClickHouse settings pool file:
+     [session:][<prob>:]<name> = <v1>|<v2>|<v3>
+     [session:][<prob>:]<name> = int:<lo>..<hi>
+   Table entries stay in g_table_settings and are rolled independently for
+   every table in pick_table_settings(). Session entries are rolled once at
+   startup and land in g_session_settings as ready-to-run "name = value". */
+struct SettingSpec {
+  std::string name;
+  std::vector<std::string> values;
+  bool is_range = false;
+  long int lo = 0;
+  long int hi = 0;
+  int prob = 100;
+};
+extern std::vector<SettingSpec> g_table_settings;
+extern std::vector<std::string> g_session_settings;
+/* --table-settings, normalized once and used for every table */
+extern std::string g_fixed_table_settings;
+void load_table_settings_pool();
+std::string pick_table_settings();
+
 std::vector<std::string> random_strs_generator();
 std::vector<long int> generateUniqueRandomNumbers(long int number_of_records);
 
