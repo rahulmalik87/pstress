@@ -214,6 +214,32 @@ std::vector<long int> generateUniqueRandomNumbers(long int number_of_records) {
 static bool get_check_result(const std::string &sql, Thd1 *thd) {
 
   auto result = thd->db->get_query_result(sql);
+
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse CHECK TABLE returns one row per part as
+     (part_name, is_passed UInt8, message) — three columns, not MySQL's four
+     (Table, Op, Msg_type, Msg_text), and no "OK" anywhere. Judging it by the
+     MySQL shape below reports every successful check as a failure.
+     An empty result is not a failure either: a table with no active parts
+     (freshly truncated, or every part dropped) has nothing to check. */
+  if (!thd->db->get_error().empty()) {
+    print_and_log("CHECK TABLE FAILED " + sql + " " + thd->db->get_error(),
+                  thd);
+    return false;
+  }
+  for (const auto &row : result) {
+    /* single-value form (check_query_single_value_result=1) is one column */
+    const std::string &passed = row.size() > 1 ? row[1] : row[0];
+    if (passed != "1") {
+      print_and_log("Check table failed " + sql + " part " + row[0] + " -> " +
+                        (row.size() > 2 ? row[2] : passed),
+                    thd);
+      return false;
+    }
+  }
+  return true;
+#endif
+
   if (result.empty() || result.size() < 1 || result[0].size() < 4) {
     print_and_log("CHECK TABLE FAILED" + sql + thd->db->get_error(), thd);
     return false;

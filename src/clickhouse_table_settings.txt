@@ -58,3 +58,12 @@
 #
 # session:allow_experimental_<feature> = 1
 # 100:<feature_setting> = 1
+
+# ---- exclusive experiment: PR #111834 adaptive codec selection ----
+# https://github.com/ClickHouse/ClickHouse/pull/111834 — merges and mutations
+# pick the smallest-output codec per block for default-codec columns. Needs no
+# session: line: this is an EXPERIMENTAL-*tier* MergeTree setting, gated only by
+# the server-config allow_feature_tier, not by an allow_experimental_* session
+# flag. Merge/mutation only, so the run needs --optimize and --ch-alter-update
+# pressure to exercise it at all. Observe with mergeTreeCodecBlockCounts().
+100:allow_experimental_adaptive_codec_selection     = 1
