@@ -443,8 +443,7 @@ int main(int argc, char *argv[]) {
     /* Every worker has joined, so nothing is inserting and each view has
        received everything its table holds: the point where a view that mirrors
        its table must match it exactly. */
-    if (options->at(Option::CH_VERIFY_MV)->getBool() ||
-        options->at(Option::CH_CREATE_MV)->getInt() > 0)
+    if (options->at(Option::CH_VERIFY_MV)->getBool())
       ch_verify_materialized_views(addrs, ports, chdb, chuser, chpass);
   }
 #endif

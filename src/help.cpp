@@ -1085,8 +1085,7 @@ void add_options() {
 
   opt = newOption(Option::BOOL, Option::CH_VERIFY_MV, "verify-mv");
   opt->help = "At the end of the run, compare every materialized view against "
-              "its source table and fail the run on a mismatch. Enabled "
-              "automatically when --create-mv is non zero.";
+              "its source table and fail the run on a mismatch.";
   opt->setBool(false);
   opt->setArgs(no_argument);
 

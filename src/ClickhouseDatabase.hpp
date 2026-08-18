@@ -3,8 +3,10 @@
 #include "ch_client_options.hpp"
 #include "DatabaseInterface.hpp"
 #include "node.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -84,12 +86,77 @@ static std::string ch_col_to_string(const clickhouse::ColumnRef &col,
   }
 }
 
+/* How many rows of a workload query's result set are kept in memory. A bulk
+   SELECT over --records=12M rows returns millions of rows, and nothing in the
+   workload path reads them: execute_sql() only asks for the row count to put in
+   the thread log. Materialising them all cost ~90 bytes per row per thread
+   (a std::vector<std::string> plus its heap buffer), so a handful of range
+   scans across --threads=100 was enough to exhaust the box and get pstress
+   OOM-killed. The rows are still received and decoded, so the server side of
+   the query is exercised exactly as before, they are just no longer hoarded.
+
+   The oracles that diff two result sets are the one caller that genuinely needs
+   every row, so they lift the cap - see ch_result_row_limit(). */
+static const size_t CH_KEEP_ROWS_DEFAULT = 1000;
+
+/* Computed once: unlimited when a compare-result oracle is enabled, capped
+   otherwise. */
+static size_t ch_result_row_limit() {
+  static const size_t limit =
+      (options->at(Option::COMPARE_RESULT)->getBool() ||
+       options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool())
+          ? std::numeric_limits<size_t>::max()
+          : CH_KEEP_ROWS_DEFAULT;
+  return limit;
+}
+
 class ClickHouseDatabase : public DatabaseInterface {
 private:
   std::unique_ptr<clickhouse::Client> client;
   query_result last_result;
+  /* rows the server returned, which is not last_result.size() once the cap
+     above kicks in */
+  size_t last_row_count = 0;
   std::string last_error;
   int last_error_number = 0;
+
+  /* Run a query, keeping at most max_rows of its result set. */
+  bool run_query(const std::string &query, size_t max_rows) {
+    /* clear() keeps the outer vector's capacity, which after one 12M-row select
+       is 288MB per thread that is never handed back. Drop the buffer outright
+       once it has grown past anything worth reusing. */
+    if (last_result.capacity() > 4 * CH_KEEP_ROWS_DEFAULT)
+      query_result().swap(last_result);
+    else
+      last_result.clear();
+    last_row_count = 0;
+    last_error.clear();
+    last_error_number = 0;
+    try {
+      client->Execute(
+          clickhouse::Query(query).OnData([&](const clickhouse::Block &block) {
+            const size_t rows = block.GetRowCount();
+            const size_t cols = block.GetColumnCount();
+            const size_t keep =
+                std::min(rows, max_rows > last_result.size()
+                                   ? max_rows - last_result.size()
+                                   : size_t(0));
+            for (size_t row = 0; row < keep; ++row) {
+              std::vector<std::string> row_data;
+              row_data.reserve(cols);
+              for (size_t col = 0; col < cols; ++col)
+                row_data.push_back(ch_col_to_string(block[col], row));
+              last_result.push_back(std::move(row_data));
+            }
+            last_row_count += rows;
+          }));
+      return true;
+    } catch (const std::exception &e) {
+      last_error = e.what();
+      last_error_number = 1;
+      return false;
+    }
+  }
 
 public:
   ClickHouseDatabase() = default;
@@ -141,46 +208,31 @@ public:
 
   void disconnect() override { client.reset(); }
 
+  /* The workload path: nothing reads the rows, so only keep a bounded sample. */
   bool execute_query(const std::string &query) override {
-    last_result.clear();
-    last_error.clear();
-    last_error_number = 0;
-    try {
-      client->Execute(
-          clickhouse::Query(query).OnData([&](const clickhouse::Block &block) {
-            for (size_t row = 0; row < block.GetRowCount(); ++row) {
-              std::vector<std::string> row_data;
-              for (size_t col = 0; col < block.GetColumnCount(); ++col) {
-                row_data.push_back(ch_col_to_string(block[col], row));
-              }
-              last_result.push_back(row_data);
-            }
-          }));
-      return true;
-    } catch (const std::exception &e) {
-      last_error = e.what();
-      last_error_number = 1;
-      return false;
-    }
+    return run_query(query, ch_result_row_limit());
   }
 
   query_result get_result() override { return last_result; }
 
+  /* Callers here do read every row, but these are metadata queries against
+     system tables and CHECK TABLE, whose results are small. */
   query_result get_query_result(const std::string &query) override {
-    execute_query(query);
+    run_query(query, std::numeric_limits<size_t>::max());
     return last_result;
   }
 
   std::string get_single_value(const std::string &query) override {
-    if (!execute_query(query))
+    if (!run_query(query, 1))
       return "";
     if (!last_result.empty() && !last_result[0].empty())
       return last_result[0][0];
     return "";
   }
 
+  /* the rows the server returned, not the rows kept */
   int get_affected_rows() override {
-    return static_cast<int>(last_result.size());
+    return static_cast<int>(last_row_count);
   }
 
   std::string get_error() override { return last_error; }
