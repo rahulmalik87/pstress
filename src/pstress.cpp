@@ -277,6 +277,33 @@ int main(int argc, char *argv[]) {
   if (!options->at(Option::PORT)->cl)
     options->at(Option::PORT)->setString(
         options->at(Option::SECURE)->getBool() ? "9440" : "9000");
+  /* grammar.sql is MySQL syntax throughout (DIV, MOD, ELT, FIELD,
+     CONVERT USING) and every line of it would simply error on ClickHouse */
+  if (!options->at(Option::GRAMMAR_FILE)->cl)
+    options->at(Option::GRAMMAR_FILE)->setString("clickhouse_grammar.sql");
+
+  /* Check the comparison options before anything connects or creates a table,
+     a run that can never compare anything should not get that far. */
+  if (options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool()) {
+    if (options->at(Option::RUN_QUERY_SETTING)->getString().empty()) {
+      std::cerr << "--compare-result-with-setting needs a setting to compare "
+                   "against, pass --run-query-setting, for example "
+                   "--run-query-setting=\"join_algorithm='grace_hash'\""
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    if (options->at(Option::COMPARE_RESULT)->getBool()) {
+      std::cerr << "--compare-result-with-setting and --compare-result are two "
+                   "different oracles for the same grammar SQL, pick one"
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    /* the comparison only ever runs from the grammar SQL path */
+    if (options->at(Option::GRAMMAR_SQL)->getInt() == 0)
+      std::cout << "WARNING: --compare-result-with-setting does nothing with "
+                   "--grammar-sql=0, no query will be compared"
+                << std::endl;
+  }
 #endif
 
   /* Auto-detect step from logdir if --step was not explicitly given.
@@ -344,11 +371,19 @@ int main(int argc, char *argv[]) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (nodes_done.load(std::memory_order_relaxed)) return;
           }
-          ch_verify_replicas(addrs, ports,
-                             options->at(Option::DATABASE)->getString(),
-                             options->at(Option::USER)->getString(),
-                             options->at(Option::PASSWORD)->getString(),
-                             {});
+          /* An exception here would escape this thread and terminate the
+             process, taking the workload down over a failed verification
+             query. */
+          try {
+            ch_verify_replicas(addrs, ports,
+                               options->at(Option::DATABASE)->getString(),
+                               options->at(Option::USER)->getString(),
+                               options->at(Option::PASSWORD)->getString(),
+                               {});
+          } catch (const std::exception &e) {
+            std::cerr << "ERROR: replica verification failed: " << e.what()
+                      << "\n";
+          }
         }
       });
     }
@@ -404,6 +439,13 @@ int main(int argc, char *argv[]) {
 
     /* Always verify schema (metadata vs actual ClickHouse columns) */
     ch_verify_schema(addrs, ports, chdb, chuser, chpass);
+
+    /* Every worker has joined, so nothing is inserting and each view has
+       received everything its table holds: the point where a view that mirrors
+       its table must match it exactly. */
+    if (options->at(Option::CH_VERIFY_MV)->getBool() ||
+        options->at(Option::CH_CREATE_MV)->getInt() > 0)
+      ch_verify_materialized_views(addrs, ports, chdb, chuser, chpass);
   }
 #endif
 
@@ -416,6 +458,9 @@ int main(int argc, char *argv[]) {
                 << ", success=>" << op->success_queries << std::endl;
     }
   }
+#ifdef USE_CLICKHOUSE
+  print_compare_with_setting_stats();
+#endif
   delete_options();
   std::cout << "COMPLETED" << std::endl;
   if (run_query_failed)

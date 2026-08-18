@@ -66,8 +66,12 @@ const std::string TABLE_PREFIX = "tt_";
 const std::string PARTITION_SUFFIX = "_p";
 const std::string FK_SUFFIX = "_fk";
 const std::string TEMP_SUFFIX = "_t";
-/* used to create metadata. Bumped to 3 when per-table settings were added. */
-const int version = 3;
+/* used to create metadata. Bumped to 3 when per-table settings were added, and
+   to 4 when --engine started naming the MergeTree family member: metadata from
+   an older run stores "MergeTree()", which used to mean ReplacingMergeTree and
+   now means plain MergeTree, so such a file has to be rejected rather than
+   silently recreating tables with a different engine. */
+const int version = 4;
 std::string add_ignore_clause();
 struct Thd1;
 
@@ -423,6 +427,12 @@ struct Table {
   void UpdateAllRows(Thd1 *thd);
   void AlterTableUpdate(Thd1 *thd);
   void AlterTableDelete(Thd1 *thd);
+#ifdef USE_CLICKHOUSE
+  /* CREATE MATERIALIZED VIEW ... POPULATE over this table while the workload
+     keeps inserting into it, and the matching drop. */
+  void CreateMaterializedView(Thd1 *thd);
+  void DropMaterializedView(Thd1 *thd);
+#endif
   void ColumnRename(Thd1 *thd);
   void IndexRename(Thd1 *thd);
   template <typename Writer> void Serialize(Writer &writer) const;
@@ -438,6 +448,30 @@ struct Table {
   std::string tablespace;
   std::string compression;
   std::string encryption = "N";
+#ifdef USE_CLICKHOUSE
+  /* Set once this table has been changed in a way a materialized view over it
+     cannot mirror: a mutation, a truncate, a drop/rename of a column it
+     selects. The views on it are then reported as skipped rather than compared,
+     because they are legitimately out of sync. ADD COLUMN does not set this —
+     the views select an explicit column list, so a new column cannot affect
+     them. Never cleared: once a view has missed a change it stays behind. */
+  std::atomic<bool> mv_source_mutated{false};
+  /* what changed, so the report names it instead of listing everything it could
+     have been. Always a string literal, so there is no lifetime to manage. */
+  std::atomic<const char *> mv_mutation_reason{nullptr};
+  void mark_mv_source_mutated(const char *why) {
+    mv_source_mutated.store(true);
+    mv_mutation_reason.store(why);
+  }
+  /* the reason, or "" when this table can still be compared to its views */
+  std::string mv_skip_reason() const {
+    const char *why = mv_mutation_reason.load();
+    return why == nullptr ? "" : why;
+  }
+#else
+  /* so the callers do not need to be guarded one by one */
+  void mark_mv_source_mutated(const char *) {}
+#endif
   int key_block_size = 0;
   long int number_of_initial_records;
   size_t auto_inc_index;
@@ -813,6 +847,17 @@ void print_and_log(std::string &&str, Thd1 *thd = nullptr,
                    bool print_error = false, bool count_to_console = true);
 std::string getExecutablePath();
 
+#ifdef USE_CLICKHOUSE
+/* --compare-result-with-setting: run sql with and without
+   --run-query-setting and compare the two result sets */
+void compare_result_with_setting(const std::string &sql, Thd1 *thd);
+/* one line at the end of the run saying how much was really compared */
+void print_compare_with_setting_stats();
+extern std::atomic<long> g_compare_done;
+extern std::atomic<long> g_compare_baseline_failed;
+extern std::atomic<long> g_compare_setting_failed;
+#endif
+
 /* One line of the ClickHouse settings pool file:
      [session:][<prob>:]<name> = <v1>|<v2>|<v3>
      [session:][<prob>:]<name> = int:<lo>..<hi>
@@ -827,6 +872,44 @@ struct SettingSpec {
   long int hi = 0;
   int prob = 100;
 };
+#ifdef USE_CLICKHOUSE
+/* Resolve --engine into the ENGINE clause of a CREATE TABLE: a MergeTree family
+   name, matched case insensitively, gets the Replicated prefix when running
+   against more than one port and the _pstress_ver version column when it is a
+   ReplacingMergeTree. An unrecognised engine, or one written with its own
+   arguments, is returned unchanged. */
+std::string ch_resolve_engine(const std::string &engine);
+/* True when the engine merges rows sharing a sorting key, so an exact row for
+   row comparison of a table against a materialized view over it cannot hold. */
+bool ch_engine_collapses_rows(const std::string &engine);
+
+/* One materialized view pstress created, kept so the consistency check knows
+   what to compare against what. columns is the explicit list the view selects,
+   captured at CREATE time, so a later ADD COLUMN on the source does not change
+   what the view is expected to hold. target is empty for a view with its own
+   inner table and names the TO table otherwise. */
+struct MVInfo {
+  std::string name;
+  std::string target;
+  std::string src_table;
+  std::vector<std::string> columns;
+  /* the materialized_views_populate_atomically this view was created with. A
+     mismatch on a view created with false is the expected legacy behaviour and
+     must not fail the run. */
+  bool populate_atomically = true;
+};
+extern std::vector<MVInfo> g_materialized_views;
+extern std::mutex g_materialized_views_mutex;
+/* Views are named mv_<source table>_<id> and their TO targets mvt_<same>, with
+   id from a global counter so two threads creating a view on the same table at
+   the same time cannot pick the same name. */
+const std::string MV_PREFIX = "mv_";
+const std::string MV_TARGET_PREFIX = "mvt_";
+unsigned long next_mv_id();
+/* How many views currently exist on this table. */
+size_t mv_count_for_table(const std::string &table_name);
+#endif
+
 extern std::vector<SettingSpec> g_table_settings;
 extern std::vector<std::string> g_session_settings;
 /* --table-settings, normalized once and used for every table */

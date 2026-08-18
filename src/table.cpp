@@ -276,7 +276,13 @@ void Table::InsertRandomRow(Thd1 *thd) {
   unlock_table_mutex();
 
   std::shared_lock lock(dml_mutex);
-  execute_sql(sql, thd);
+  /* An INSERT commits to the table first and only then pushes to each
+     materialized view, so one that did not succeed - killed by --kill-transaction
+     most of the time - can leave the row in the table and out of a view. The
+     table is then legitimately ahead of its views and cannot be compared with
+     them any more. */
+  if (!execute_sql(sql, thd))
+    mark_mv_source_mutated("an INSERT that did not succeed");
 }
 void Table::InsertRandomRowBulk(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
@@ -289,7 +295,10 @@ void Table::InsertRandomRowBulk(Thd1 *thd) {
   /* Hold shared dml_mutex during execute so DROP COLUMN (exclusive dml_mutex)
      cannot remove a column between SQL build and execution. */
   std::shared_lock<std::shared_mutex> lock(dml_mutex);
-  execute_sql(sql, thd, false);
+  /* see InsertRandomRow() on why a failed insert stops the views being
+     comparable */
+  if (!execute_sql(sql, thd, false))
+    mark_mv_source_mutated("a bulk INSERT that did not succeed");
 }
 
 template <typename Writer> void Table::Serialize(Writer &writer) const {

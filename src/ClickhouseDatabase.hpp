@@ -3,6 +3,7 @@
 #include "ch_client_options.hpp"
 #include "DatabaseInterface.hpp"
 #include "node.hpp"
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -35,10 +36,39 @@ static std::string ch_col_to_string(const clickhouse::ColumnRef &col,
     return std::to_string(col->As<ColumnFloat32>()->At(row));
   case Type::Float64:
     return std::to_string(col->As<ColumnFloat64>()->At(row));
+  case Type::Bool:
+    return col->As<ColumnBool>()->At(row) ? "1" : "0";
   case Type::Date:
     return std::to_string(col->As<ColumnDate>()->At(row));
+  case Type::Date32:
+    return std::to_string(col->As<ColumnDate32>()->At(row));
   case Type::DateTime:
     return std::to_string(col->As<ColumnDateTime>()->At(row));
+  case Type::DateTime64:
+    return std::to_string(col->As<ColumnDateTime64>()->At(row));
+  /* one ColumnDecimal backs every Decimal width; StringAt() renders the value
+     with its scale so we never have to format an Int128 by hand */
+  case Type::Decimal:
+  case Type::Decimal32:
+  case Type::Decimal64:
+  case Type::Decimal128:
+    return col->As<ColumnDecimal>()->StringAt(row);
+  case Type::Enum8:
+    return std::string(col->As<ColumnEnum8>()->NameAt(row));
+  case Type::Enum16:
+    return std::string(col->As<ColumnEnum16>()->NameAt(row));
+  case Type::UUID: {
+    /* not the canonical 8-4-4-4-12 spelling, but stable and comparable, which
+       is all any caller needs it for */
+    auto uuid = col->As<ColumnUUID>()->At(row);
+    char buf[33];
+    snprintf(buf, sizeof(buf), "%016llx%016llx",
+             static_cast<unsigned long long>(uuid.first),
+             static_cast<unsigned long long>(uuid.second));
+    return std::string(buf);
+  }
+  case Type::JSON:
+    return std::string(col->As<ColumnJSON>()->At(row));
   case Type::Nullable: {
     auto nullable = col->As<ColumnNullable>();
     if (nullable->IsNull(row))
@@ -46,7 +76,11 @@ static std::string ch_col_to_string(const clickhouse::ColumnRef &col,
     return ch_col_to_string(nullable->Nested(), row);
   }
   default:
-    return "";
+    /* Array/Tuple/Map/LowCardinality and friends land here. Returning "" made
+       two different values compare equal, which silently passed the
+       --compare-result-with-setting oracle; a visible marker at least shows up
+       in the dumped result sets. */
+    return "<unsupported:" + col->Type()->GetName() + ">";
   }
 }
 

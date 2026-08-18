@@ -275,6 +275,15 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
   sql = std::regex_replace(sql, std::regex("RAND_INT"),
                            std::to_string(rand_int(100)));
 
+#ifdef USE_CLICKHOUSE
+  /* Not COMPARE_RESULT, so the enforce_table override above does not kick in
+     and a T1 JOIN T2 keeps hitting two independently picked tables. */
+  if (options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool()) {
+    compare_result_with_setting(sql, thd);
+    return;
+  }
+#endif
+
   if (options->at(Option::COMPARE_RESULT)->getBool()) {
     enforce_table->Compare_between_engine(sql, thd);
     return;
@@ -727,6 +736,28 @@ bool Thd1::run_some_query() {
     case Option::CH_ALTER_DELETE:
       table->AlterTableDelete(this);
       break;
+#ifdef USE_CLICKHOUSE
+    case Option::CH_CREATE_MV:
+      table->CreateMaterializedView(this);
+      break;
+    case Option::CH_DROP_MV:
+      if (options->at(Option::CH_VERIFY_MV_BEFORE_DROP)->getBool()) {
+        /* Checking a view against its table compares row counts, which only
+           means anything when nothing is inserting, so pause every worker the
+           way the replica verifier does. This iteration already holds the same
+           mutex shared and a shared_mutex cannot be upgraded, so the shared lock
+           has to go first — taking the exclusive one while still holding it
+           would deadlock against ourselves. The exclusive lock then waits out
+           every other worker's current iteration, after which no insert is in
+           flight and the view has received everything the table has. */
+        _verify_lk.unlock();
+        std::unique_lock<std::shared_mutex> pause_lk(g_ch_verify_mutex);
+        table->DropMaterializedView(this);
+      } else {
+        table->DropMaterializedView(this);
+      }
+      break;
+#endif
     case Option::OPTIMIZE:
       table->Optimize(this);
       break;

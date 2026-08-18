@@ -77,11 +77,17 @@ void add_options() {
   opt->setInt(0);
   opt->help = "Number of default undo tablespaces ";
 
-  /* Engine */
+  /* Engine. For ClickHouse this names the MergeTree family member used for
+     every table: MergeTree, ReplacingMergeTree, SummingMergeTree or
+     AggregatingMergeTree (a Replicated prefix is added when --port names more
+     than one port). The default is ReplacingMergeTree, which is what pstress
+     used unconditionally before the engine was honoured; pass
+     --engine=MergeTree for a source that never collapses rows, which is what
+     the materialized view consistency check needs to catch duplicates. */
   opt = newOption(Option::STRING, Option::ENGINE, "engine");
   opt->help = "Engine used ";
   opt->setString(strcmp(FORK, "MySQL") == 0 ? "INNODB" :
-                 strcmp(FORK, "ClickHouse") == 0 ? "MergeTree()" : "");
+                 strcmp(FORK, "ClickHouse") == 0 ? "ReplacingMergeTree" : "");
 
   /* Just Load DDL*/
   opt = newOption(Option::BOOL, Option::JUST_LOAD_DDL, "jlddl");
@@ -1012,6 +1018,78 @@ void add_options() {
   opt->setArgs(no_argument);
   opt->short_help = "CHBackfill";
 
+  /* ClickHouse materialized views. --create-mv fires CREATE MATERIALIZED VIEW
+     ... POPULATE against a random table while the load keeps inserting into it,
+     which is the race the atomicity of POPULATE has to survive. */
+  opt = newOption(Option::INT, Option::CH_CREATE_MV, "create-mv");
+  opt->help = "Create a ClickHouse materialized view with POPULATE over a "
+              "random table while the workload runs. The view mirrors the "
+              "table, so once inserts stop it must hold exactly the table's "
+              "rows; --verify-mv checks that at the end of the run.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "CreateMV";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_DROP_MV, "drop-mv");
+  opt->help = "Drop a random existing materialized view. With "
+              "--verify-mv-before-drop (the default) the view is checked "
+              "against its table first, which pauses all workers for the "
+              "duration of the check, so keep this probability low.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "DropMV";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_MAX_MV_PER_TABLE,
+                  "max-mv-per-table");
+  opt->help = "Maximum number of materialized views on a single table. Every "
+              "view adds work to every insert into that table.";
+  opt->setInt(2);
+
+  opt = newOption(Option::INT, Option::CH_MV_SNAPSHOT_SLEEP_MS,
+                  "mv-snapshot-sleep-ms");
+  opt->help = "Appended as SETTINGS merge_tree_storage_snapshot_sleep_ms=N to "
+              "CREATE MATERIALIZED VIEW ... POPULATE, widening the window in "
+              "which the source snapshot is taken so concurrent inserts "
+              "actually collide with it. 0 disables. If a run with "
+              "--mv-populate-atomically=off reports no mismatch at all, this "
+              "is the first thing to raise.";
+  opt->setInt(1000);
+
+  opt = newOption(Option::STRING, Option::CH_MV_POPULATE_ATOMICALLY,
+                  "mv-populate-atomically");
+  opt->help = "on|off|random. Appended as SETTINGS "
+              "materialized_views_populate_atomically=1/0 to each CREATE "
+              "MATERIALIZED VIEW, and recorded per view. off forces the legacy "
+              "non-atomic population, which is expected to lose or duplicate "
+              "rows and so acts as a negative control proving the check "
+              "actually detects the bug; mismatches on off views are reported "
+              "but never fail the run. random rolls per view.";
+  opt->setString("on");
+
+  opt = newOption(Option::INT, Option::CH_MV_TO_PROB, "mv-to-prob");
+  opt->help = "Percent chance that a materialized view writes into a freshly "
+              "created TO target table instead of its own inner table. "
+              "POPULATE together with TO was a syntax error before ClickHouse "
+              "PR 108715.";
+  opt->setInt(30);
+
+  opt = newOption(Option::BOOL, Option::CH_VERIFY_MV_BEFORE_DROP,
+                  "verify-mv-before-drop");
+  opt->help = "Check a materialized view against its table before --drop-mv "
+              "drops it, so every view that ever existed is checked instead of "
+              "only the ones alive at the end of the run. Pauses all workers "
+              "for the check. Pass off for stall free create/drop churn.";
+  opt->setBool(true);
+
+  opt = newOption(Option::BOOL, Option::CH_VERIFY_MV, "verify-mv");
+  opt->help = "At the end of the run, compare every materialized view against "
+              "its source table and fail the run on a mismatch. Enabled "
+              "automatically when --create-mv is non zero.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
   /* Per-table ClickHouse MergeTree settings */
   opt = newOption(Option::STRING, Option::CH_TABLE_SETTINGS_FILE,
                   "table-settings-file");
@@ -1037,6 +1115,29 @@ void add_options() {
               "pstress requires internally are emitted. Pass flag to enable.";
   opt->setBool(false);
   opt->setArgs(no_argument);
+
+  /* Compare a grammar SQL run with and without a query setting */
+  opt = newOption(Option::BOOL, Option::COMPARE_RESULT_WITH_SETTING,
+                  "compare-result-with-setting");
+  opt->help = "Run every grammar SQL twice, once as it is and once with "
+              "SETTINGS <--run-query-setting> appended, and compare the two "
+              "result sets. Aborts on a mismatch, dumping both sets to "
+              "default_result.csv and with_setting_result.csv in the log dir. "
+              "Requires --run-query-setting. The comparison is order "
+              "sensitive and takes no locks, so the workload has to be "
+              "deterministic: use a single thread or an insert only workload, "
+              "and give every grammar line an ORDER BY. Pass flag to enable.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  opt = newOption(Option::STRING, Option::RUN_QUERY_SETTING,
+                  "run-query-setting");
+  opt->help = "Setting clause appended as SETTINGS <clause> to the second run "
+              "of each query compared by --compare-result-with-setting, e.g. "
+              "--run-query-setting=\"join_algorithm='grace_hash'\". "
+              "Comma separate to set more than one. Only use settings that "
+              "are not supposed to change query results.";
+  opt->setString("");
 
   /* TLS for the ClickHouse native protocol (required by ClickHouse Cloud) */
   opt = newOption(Option::BOOL, Option::SECURE, "secure");

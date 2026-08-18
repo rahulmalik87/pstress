@@ -43,6 +43,16 @@ std::vector<int> g_key_block_size;
 std::vector<SettingSpec> g_table_settings;
 std::vector<std::string> g_session_settings;
 std::string g_fixed_table_settings;
+#ifdef USE_CLICKHOUSE
+std::vector<MVInfo> g_materialized_views;
+std::mutex g_materialized_views_mutex;
+#endif
+#ifdef USE_CLICKHOUSE
+/* --compare-result-with-setting bookkeeping, reported at the end of the run */
+std::atomic<long> g_compare_done(0);
+std::atomic<long> g_compare_baseline_failed(0);
+std::atomic<long> g_compare_setting_failed(0);
+#endif
 std::vector<std::string> random_strs;
 int g_innodb_page_size;
 int sum_of_all_opts = 0; // sum of all probablility
@@ -122,11 +132,14 @@ static bool save_query_result_in_file(const query_result &result,
 
 /* compare the result set of two queries and return true if successsful else
  * false and also print the result of queries to afile */
-static bool compare_query_result(const query_result &r1, const query_result &r2,
-                                 Thd1 *thd, bool case_insensitive = false) {
-  auto print_query_result = [r1, r2]() {
-    save_query_result_in_file(r1, "secondary_result.csv");
-    save_query_result_in_file(r2, "mysql_result.csv");
+static bool
+compare_query_result(const query_result &r1, const query_result &r2, Thd1 *thd,
+                     bool case_insensitive = false,
+                     const std::string &r1_file = "secondary_result.csv",
+                     const std::string &r2_file = "mysql_result.csv") {
+  auto print_query_result = [&]() {
+    save_query_result_in_file(r1, r1_file);
+    save_query_result_in_file(r2, r2_file);
     return false;
   };
   if (r1.size() != r2.size()) {
@@ -623,6 +636,33 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::FK_PROB)->setInt(0);
   }
 
+#ifdef USE_CLICKHOUSE
+  {
+    const std::string mode =
+        options->at(Option::CH_MV_POPULATE_ATOMICALLY)->getString();
+    if (mode != "on" && mode != "off" && mode != "random") {
+      print_and_log("--mv-populate-atomically must be on, off or random, not " +
+                    mode);
+      exit(EXIT_FAILURE);
+    }
+    /* The exact view check needs a source that never merges rows sharing a
+       sorting key, otherwise the duplicates a non-atomic populate leaves behind
+       are collapsed away before anyone can see them. Say so once at startup
+       instead of leaving a weaker check looking like a full one. */
+    if (options->at(Option::CH_CREATE_MV)->getInt() > 0 &&
+        ch_engine_collapses_rows(options->at(Option::ENGINE)->getString()))
+      print_and_log("--engine=" +
+                    options->at(Option::ENGINE)->getString() +
+                    " merges rows sharing a sorting key, so materialized views "
+                    "can only be checked for lost rows, not duplicated ones. "
+                    "Use --engine=MergeTree for the exact check.");
+  }
+#else
+  /* the create/drop view actions only exist in the ClickHouse build */
+  opt_int_set(CH_CREATE_MV, 0);
+  opt_int_set(CH_DROP_MV, 0);
+#endif
+
   if (options->at(Option::ONLY_PARTITION)->getBool())
     options->at(Option::NO_TEMPORARY)->setBool("true");
 
@@ -901,6 +941,45 @@ static std::string trim_ws(const std::string &str) {
     return "";
   return str.substr(begin, str.find_last_not_of(" \t\r") - begin + 1);
 }
+
+#ifdef USE_CLICKHOUSE
+/* Append "SETTINGS <setting>" to a query. Only compare_result_with_setting()
+   uses this, and -Wall -Werror rejects an unused static in a MySQL build. */
+static std::string add_settings_clause(const std::string &sql,
+                                       const std::string &setting) {
+  auto stripped = trim_ws(sql);
+  /* load_grammar_sql_from() only strips trailing whitespace, so a grammar line
+     can still end in ';' and we would emit "... ; SETTINGS x = 1" */
+  while (!stripped.empty() && stripped.back() == ';')
+    stripped = trim_ws(stripped.substr(0, stripped.size() - 1));
+
+  /* ClickHouse takes one SETTINGS clause per query level and it has to come
+     last, so join the query's own clause rather than emit a second one.
+     "settings" only reads as the keyword when an assignment follows it, which
+     keeps a column or a string literal of that name from matching. A match
+     inside a subquery does not count either: that clause belongs to the
+     subquery and the outer query still needs its own, so only a match that is
+     not closed off by a ')' before the end of the string is ours to extend. */
+  static const std::regex settings_clause(
+      R"(\bsettings\s+[A-Za-z_][A-Za-z0-9_]*\s*=)", std::regex::icase);
+  bool has_settings = false;
+  for (auto it = std::sregex_iterator(stripped.begin(), stripped.end(),
+                                      settings_clause);
+       it != std::sregex_iterator(); ++it) {
+    int depth = 0;
+    for (auto c = stripped.cbegin() + it->position(); c != stripped.cend(); ++c) {
+      if (*c == '(')
+        depth++;
+      else if (*c == ')')
+        depth--;
+    }
+    if (depth >= 0)
+      has_settings = true;
+  }
+
+  return stripped + (has_settings ? ", " : " SETTINGS ") + setting;
+}
+#endif
 
 /* split on delimiter keeping each piece whole. splitStringToArray() reads with
    >> and so stops at the first space, which would turn "a = 1" into "a". */
@@ -2121,6 +2200,7 @@ void Table::DropCreate(Thd1 *thd) {
   if (!execute_sql("DROP TABLE " + name_, thd)) {
     return;
   }
+  mark_mv_source_mutated("the table was dropped and recreated");
 
   if (set_session_nbo) {
     execute_sql("SET SESSION wsrep_osu_method=DEFAULT ", thd);
@@ -2197,9 +2277,11 @@ void Table::Truncate(Thd1 *thd) {
       sql += GetRandomPartition();
       unlock_table_mutex();
     }
-    execute_sql(sql, thd);
+    if (execute_sql(sql, thd))
+      mark_mv_source_mutated("TRUNCATE PARTITION");
   } else {
-    execute_sql("TRUNCATE TABLE " + name_, thd);
+    if (execute_sql("TRUNCATE TABLE " + name_, thd))
+      mark_mv_source_mutated("TRUNCATE TABLE");
   }
 }
 
@@ -2215,6 +2297,7 @@ void Partition::AddDrop(Thd1 *thd) {
       if (execute_sql("ALTER TABLE " + name_ + " ADD PARTITION PARTITIONS " +
                           std::to_string(new_partition),
                       thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         number_of_part += new_partition;
         unlock_table_mutex();
@@ -2224,6 +2307,7 @@ void Partition::AddDrop(Thd1 *thd) {
                           ", COALESCE PARTITION " +
                           std::to_string(new_partition),
                       thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         number_of_part -= new_partition;
         unlock_table_mutex();
@@ -2239,6 +2323,7 @@ void Partition::AddDrop(Thd1 *thd) {
 
       if (execute_sql("ALTER TABLE " + name_ + " DROP PARTITION " + part_name,
                       thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         number_of_part--;
         for (auto i = positions.begin(); i != positions.end(); i++) {
@@ -2260,6 +2345,7 @@ void Partition::AddDrop(Thd1 *thd) {
                         std::to_string(new_range) + "))";
 
       if (execute_sql(sql, thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         positions.emplace_back(new_part_name, new_range);
         number_of_part++;
@@ -2277,6 +2363,7 @@ void Partition::AddDrop(Thd1 *thd) {
       unlock_table_mutex();
       if (execute_sql("ALTER TABLE " + name_ + " DROP PARTITION " + part_name,
                       thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         number_of_part--;
         for (auto i = lists.begin(); i != lists.end(); i++) {
@@ -2314,6 +2401,7 @@ void Partition::AddDrop(Thd1 *thd) {
       }
       sql += "))";
       if (execute_sql(sql, thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         number_of_part++;
         lists.emplace_back(new_part_name);
@@ -2759,6 +2847,85 @@ bool Table::has_auto_inc_col() const {
   return false;
 }
 
+#ifdef USE_CLICKHOUSE
+/* Uppercase copy, for the case insensitive engine name matching below. */
+static std::string to_upper(const std::string &s) {
+  std::string u = s;
+  std::transform(u.begin(), u.end(), u.begin(), ::toupper);
+  return u;
+}
+
+/* Base name of a MergeTree family engine with any Replicated prefix removed. */
+static std::string ch_engine_base(const std::string &engine) {
+  std::string name = engine;
+  /* an empty argument list carries no information, drop it */
+  if (name.size() >= 2 && name.compare(name.size() - 2, 2, "()") == 0)
+    name.erase(name.size() - 2);
+  if (to_upper(name).rfind("REPLICATED", 0) == 0)
+    name.erase(0, strlen("Replicated"));
+  return name;
+}
+
+/* Turn --engine into the engine clause of a CREATE TABLE.
+
+   Recognises the MergeTree family members pstress knows how to drive, case
+   insensitively and with an optional empty "()"; ReplacingMergeTree is given
+   _pstress_ver as its version column so duplicate primary keys resolve
+   deterministically, which is what pstress relied on before --engine was
+   honoured. A Replicated prefix is added when --port names more than one port.
+
+   An engine spelled with its own arguments, or one not in the list, is passed
+   through exactly as written, so an engine pstress has not been taught about
+   can still be tried without a code change. */
+std::string ch_resolve_engine(const std::string &engine) {
+  std::string name = engine;
+  if (name.size() >= 2 && name.compare(name.size() - 2, 2, "()") == 0)
+    name.erase(name.size() - 2);
+  /* the user spelled out arguments, they know what they want */
+  if (name.find('(') != std::string::npos)
+    return engine;
+
+  const bool already_replicated = to_upper(name).rfind("REPLICATED", 0) == 0;
+  const std::string base = ch_engine_base(name);
+  const std::string base_upper = to_upper(base);
+
+  if (base_upper != "MERGETREE" && base_upper != "REPLACINGMERGETREE" &&
+      base_upper != "SUMMINGMERGETREE" && base_upper != "AGGREGATINGMERGETREE")
+    return engine;
+
+  const bool replicated =
+      already_replicated ||
+      options->at(Option::PORT)->getString().find(',') != std::string::npos;
+
+  std::string resolved = replicated ? "Replicated" : "";
+  resolved += base;
+  if (base_upper == "REPLACINGMERGETREE")
+    resolved += "(_pstress_ver)";
+  return resolved;
+}
+
+/* The type ClickHouse actually stores behind a pstress column clause.
+   VARCHAR(n), CHAR(n), TEXT and BLOB are all aliases for String whatever the
+   length, so the length pstress randomizes in MODIFY COLUMN is a no-op there and
+   must not count as retyping the column. DECIMAL(p,s) genuinely changes. */
+static std::string ch_stored_type(const std::string &clause) {
+  const std::string upper = to_upper(clause);
+  if (upper.rfind("VARCHAR", 0) == 0 || upper.rfind("CHAR", 0) == 0 ||
+      upper.rfind("TEXT", 0) == 0 || upper.rfind("BLOB", 0) == 0)
+    return "String";
+  return clause;
+}
+
+/* True when the engine merges rows sharing a sorting key into one, which makes
+   an exact row for row comparison against a materialized view meaningless: the
+   duplicate rows a non atomic POPULATE would leave behind are exactly what
+   these engines collapse away. */
+bool ch_engine_collapses_rows(const std::string &engine) {
+  const std::string base = to_upper(ch_engine_base(engine));
+  return base != "MERGETREE";
+}
+#endif
+
 /* prepare table definition */
 std::string Table::definition(bool with_index, bool with_fk,
                               bool with_forced_secondary) {
@@ -2871,25 +3038,16 @@ std::string Table::definition(bool with_index, bool with_fk,
   if (row_format.size() > 0)
     def += " ROW_FORMAT=" + row_format;
 
-  if (!engine.empty())
+  if (!engine.empty()) {
+#ifdef USE_CLICKHOUSE
+    def += " ENGINE=" + ch_resolve_engine(engine);
+#else
     def += " ENGINE=" + engine;
+#endif
+  }
 
 #ifdef USE_CLICKHOUSE
   if (!engine.empty() && !columns_->empty()) {
-    /* Always use ReplacingMergeTree(_pstress_ver) so the version column
-       resolves duplicate primary keys deterministically.
-       Use the Replicated variant when running against multiple ports. */
-    bool replicated = options->at(Option::PORT)->getString().find(',') != std::string::npos;
-    {
-      auto pos = def.rfind("ENGINE=MergeTree()");
-      if (pos != std::string::npos) {
-        std::string replacement = replicated
-            ? "ENGINE=ReplicatedReplacingMergeTree(_pstress_ver)"
-            : "ENGINE=ReplacingMergeTree(_pstress_ver)";
-        def.replace(pos, strlen("ENGINE=MergeTree()"), replacement);
-      }
-    }
-
     /* ORDER BY must be a superset of PRIMARY KEY (PK must be a prefix).
        Use pk_cols which captured every column added to PRIMARY KEY above,
        including composite key extras whose primary_key flag is not set. */
@@ -3087,6 +3245,81 @@ void Table::Compare_between_engine(const std::string &sql, Thd1 *thd) {
 
   set_default();
 }
+
+#ifdef USE_CLICKHOUSE
+/* Run the same SQL twice, once as it is and once with SETTINGS
+   <--run-query-setting> appended, and compare the two result sets. A setting
+   that is not meant to change results has to return exactly the same rows,
+   which makes this a cheap oracle for things like join_algorithm.
+
+   Unlike Compare_between_engine() this is not a Table method, because a
+   grammar join spans more than one table and there is no single table to lock.
+   Nothing is locked at all, so it is on the caller's workload to be
+   deterministic: one thread, or insert only, and an ORDER BY on every grammar
+   line. */
+void compare_result_with_setting(const std::string &sql, Thd1 *thd) {
+  static const auto setting = opt_string(RUN_QUERY_SETTING);
+
+  /* A query the server rejects is not a result mismatch, and both sides can
+     legitimately fail: an algorithm may not serve a given join, or the setting
+     may be what makes the query runnable in the first place. execute_sql() has
+     already logged the SQL and the error, so note only which side it was, and
+     to the thread log rather than through print_and_log() — that counts every
+     console message and kills the run after 300, which an expected failure
+     must not do. */
+  bool baseline_ok = execute_sql(sql, thd);
+  query_result without_setting;
+  if (baseline_ok) {
+    /* copy the rows out now, the next execute_query() clears the buffer */
+    without_setting = thd->db->get_result();
+  } else {
+    g_compare_baseline_failed++;
+    thd->thread_log << "compare-with-setting: failed without the setting"
+                    << std::endl;
+  }
+
+  /* Run the variant even when the baseline failed. A setting can enable a query
+     shape the server otherwise rejects, e.g. an inequality FULL JOIN needs
+     join_algorithm='ie_join', and that run is still worth making: it exercises
+     the code under test. There is just nothing to compare it against. */
+  auto sql_with_setting = add_settings_clause(sql, setting);
+  if (!execute_sql(sql_with_setting, thd)) {
+    g_compare_setting_failed++;
+    thd->thread_log << "compare-with-setting: failed with the setting"
+                    << std::endl;
+    return;
+  }
+  if (!baseline_ok)
+    return;
+  auto with_setting = thd->db->get_result();
+
+  g_compare_done++;
+  if (!compare_query_result(
+          with_setting, without_setting, thd,
+          options->at(Option::COMPARE_CASE_INSENSTIVE)->getBool(),
+          "with_setting_result.csv", "default_result.csv")) {
+    print_and_log("result set mismatch with SETTINGS " + setting + " for " + sql,
+                  thd);
+    exit(EXIT_FAILURE);
+  }
+}
+
+/* How much of the run actually got compared. Without this a run where every
+   query failed on one side looks exactly like a clean pass. */
+void print_compare_with_setting_stats() {
+  if (!options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool())
+    return;
+  std::cout << "CompareWithSetting, compared=>" << g_compare_done
+            << ", not compared (failed without the setting)=>"
+            << g_compare_baseline_failed
+            << ", not compared (failed with the setting)=>"
+            << g_compare_setting_failed << std::endl;
+  if (g_compare_done == 0)
+    std::cout << "WARNING: not a single query was compared, the oracle never "
+                 "ran. Check the grammar file and --run-query-setting."
+              << std::endl;
+}
+#endif
 
 bool execute_sql(const std::string &sql, Thd1 *thd, bool force_sql_log_query) {
   static auto log_all = opt_bool(LOG_ALL_QUERIES);
@@ -3292,6 +3525,11 @@ void Table::ModifyColumn(Thd1 *thd) {
   if (col == nullptr)
     return;
 
+#ifdef USE_CLICKHOUSE
+  /* to tell a real retype from a length change that ClickHouse ignores */
+  const std::string ch_type_before = ch_stored_type(col->clause());
+#endif
+
   if (col->length != 0) {
     if (col->type_ != Column::DECIMAL)
       col->length =
@@ -3329,6 +3567,15 @@ void Table::ModifyColumn(Thd1 *thd) {
     col->auto_increment = auto_increment;
     col->compressed = compressed;
   } else {
+#ifdef USE_CLICKHOUSE
+    /* Only a real retype matters: the column then has a different type in the
+       table while every view over it keeps the type it was created with, so the
+       same value can serialise differently on the two sides. A VARCHAR length
+       change reaches the server but leaves the stored String alone, and treating
+       it as a retype would strand every view on the table for nothing. */
+    if (ch_stored_type(col->clause()) != ch_type_before)
+      mark_mv_source_mutated("MODIFY COLUMN retyped a column");
+#endif
     if (col->type_ == Column::DECIMAL) {
       static_cast<Decimal_Column *>(col)->update_max_precision();
     }
@@ -3373,6 +3620,7 @@ void Table::DropColumn(Thd1 *thd) {
   unlock_table_mutex();
 
   if (execute_sql(sql, thd)) {
+    mark_mv_source_mutated("DROP COLUMN");
     lock_table_mutex(thd->ddl_query);
 
     std::vector<int> indexes_to_drop;
@@ -3787,6 +4035,7 @@ void Table::ColumnRename(Thd1 *thd) {
   sql += pick_algorithm_lock();
   unlock_table_mutex();
   if (execute_sql(sql, thd)) {
+    mark_mv_source_mutated("RENAME COLUMN");
     lock_table_mutex(thd->ddl_query);
     for (auto &col : *columns_) {
       if (col->name_.compare(name) == 0)
@@ -4121,7 +4370,8 @@ void Table::UpdateRandomROW(Thd1 *thd) {
   unlock_table_mutex();
 
   std::shared_lock<std::shared_mutex> lock(dml_mutex);
-  execute_sql(sql, thd);
+  if (execute_sql(sql, thd))
+    mark_mv_source_mutated("UPDATE");
 }
 
 void Table::DeleteRandomRow(Thd1 *thd) {
@@ -4130,7 +4380,8 @@ void Table::DeleteRandomRow(Thd1 *thd) {
                     GetRandomPartition() + GetWherePrecise();
   unlock_table_mutex();
   std::shared_lock lock(dml_mutex);
-  execute_sql(sql, thd);
+  if (execute_sql(sql, thd))
+    mark_mv_source_mutated("DELETE");
 }
 
 void Table::UpdateAllRows(Thd1 *thd) {
@@ -4140,7 +4391,8 @@ void Table::UpdateAllRows(Thd1 *thd) {
                     GetWhereBulk();
   unlock_table_mutex();
   std::shared_lock lock(dml_mutex);
-  execute_sql(sql, thd);
+  if (execute_sql(sql, thd))
+    mark_mv_source_mutated("a bulk UPDATE");
 }
 
 void Table::DeleteAllRows(Thd1 *thd) {
@@ -4149,7 +4401,8 @@ void Table::DeleteAllRows(Thd1 *thd) {
                     GetRandomPartition() + GetWhereBulk();
   unlock_table_mutex();
   std::shared_lock lock(dml_mutex);
-  execute_sql(sql, thd);
+  if (execute_sql(sql, thd))
+    mark_mv_source_mutated("a bulk DELETE");
 }
 
 #ifdef USE_CLICKHOUSE
@@ -4193,7 +4446,8 @@ void Table::AlterTableUpdate(Thd1 *thd) {
   if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
     sql += " SETTINGS mutations_sync = 2";
   unlock_table_mutex();
-  execute_sql(sql, thd);
+  if (execute_sql(sql, thd))
+    mark_mv_source_mutated("ALTER TABLE UPDATE");
 }
 
 /* ALTER TABLE t DELETE WHERE ... SETTINGS mutations_sync=2 */
@@ -4204,7 +4458,161 @@ void Table::AlterTableDelete(Thd1 *thd) {
   if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
     sql += " SETTINGS mutations_sync = 2";
   unlock_table_mutex();
-  execute_sql(sql, thd);
+  if (execute_sql(sql, thd))
+    mark_mv_source_mutated("ALTER TABLE DELETE");
+}
+
+unsigned long next_mv_id() {
+  static std::atomic<unsigned long> counter{0};
+  return counter++;
+}
+
+size_t mv_count_for_table(const std::string &table_name) {
+  std::lock_guard<std::mutex> lk(g_materialized_views_mutex);
+  size_t count = 0;
+  for (const auto &mv : g_materialized_views)
+    if (mv.src_table == table_name)
+      count++;
+  return count;
+}
+
+/* Comma separated column list the views select. */
+static std::string mv_column_list(const std::vector<std::string> &columns) {
+  std::string list;
+  for (const auto &col : columns) {
+    if (!list.empty())
+      list += ", ";
+    list += col;
+  }
+  return list;
+}
+
+/* CREATE MATERIALIZED VIEW ... POPULATE over this table, while other threads
+   keep inserting into it. That race is the point: POPULATE has to subscribe the
+   view to new inserts and snapshot the existing rows as one cut, so every row
+   inserted concurrently ends up in the view exactly once. Once inserts stop the
+   view must therefore hold exactly the table's rows, which is what
+   ch_verify_one_mv() checks. */
+void Table::CreateMaterializedView(Thd1 *thd) {
+  if (mv_count_for_table(name_) >=
+      (size_t)options->at(Option::CH_MAX_MV_PER_TABLE)->getInt())
+    return;
+
+  /* Build the statement under the table lock so the column list cannot change
+     while we read it, then release the lock before executing. Holding it across
+     the CREATE would lock out pstress's own inserts into this table and there
+     would be no race left to test. */
+  lock_table_mutex(thd->ddl_query);
+  std::vector<std::string> columns;
+  for (auto col : *columns_)
+    columns.push_back(col->name_);
+  /* definition() appends the version column by hand, so it is a real column of
+     the table but never appears in columns_. DropColumn refuses to drop it, so
+     it is safe for the view to select it. */
+  columns.push_back("_pstress_ver");
+  unlock_table_mutex();
+
+  /* An explicit column list, never SELECT *, pins the view's shape at creation:
+     a later ADD COLUMN then cannot change what the view is expected to hold. */
+  const std::string col_list = mv_column_list(columns);
+  const std::string id = std::to_string(next_mv_id());
+  const std::string mv_name = MV_PREFIX + name_ + "_" + id;
+
+  bool atomically = true;
+  const std::string mode =
+      options->at(Option::CH_MV_POPULATE_ATOMICALLY)->getString();
+  if (mode == "off")
+    atomically = false;
+  else if (mode == "random")
+    atomically = rand_int(1) == 1;
+
+  std::string settings = "materialized_views_populate_atomically = ";
+  settings += atomically ? "1" : "0";
+  auto sleep_ms = options->at(Option::CH_MV_SNAPSHOT_SLEEP_MS)->getInt();
+  if (sleep_ms > 0)
+    settings += ", merge_tree_storage_snapshot_sleep_ms = " +
+                std::to_string(sleep_ms);
+
+  /* Shared dml_mutex so a DROP COLUMN, which takes it exclusively, cannot land
+     between building the column list and running the statement. */
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
+
+  std::string target;
+  if (rand_int(100) < options->at(Option::CH_MV_TO_PROB)->getInt()) {
+    /* POPULATE together with TO was a syntax error before the atomic populate
+       work. LIMIT 0 gives the target the exact structure of the selected
+       columns and no rows, so everything it ends up holding arrived through the
+       view and the comparison against the source still holds. */
+    target = MV_TARGET_PREFIX + name_ + "_" + id;
+    if (!execute_sql("CREATE TABLE " + target +
+                         " ENGINE = MergeTree ORDER BY tuple() AS SELECT " +
+                         col_list + " FROM " + name_ + " LIMIT 0",
+                     thd))
+      return;
+  }
+
+  std::string sql = "CREATE MATERIALIZED VIEW " + mv_name + " ";
+  if (target.empty()) {
+    /* ORDER BY tuple() keeps the view side from ever merging rows together, so
+       a duplicate a non atomic populate leaves behind stays visible, and it
+       avoids putting a Nullable column in a sorting key. */
+    sql += "ENGINE = MergeTree ORDER BY tuple() ";
+  } else {
+    sql += "TO " + target + " ";
+  }
+  sql += "POPULATE AS SELECT " + col_list + " FROM " + name_ + " SETTINGS " +
+         settings;
+
+  if (!execute_sql(sql, thd)) {
+    /* The server rolls the view back on a failed population; the target we
+       created for it is ours to clean up. */
+    if (!target.empty())
+      execute_sql("DROP TABLE IF EXISTS " + target, thd);
+    return;
+  }
+
+  MVInfo mv;
+  mv.name = mv_name;
+  mv.target = target;
+  mv.src_table = name_;
+  mv.columns = std::move(columns);
+  mv.populate_atomically = atomically;
+  std::lock_guard<std::mutex> lk(g_materialized_views_mutex);
+  g_materialized_views.push_back(std::move(mv));
+}
+
+/* Drop one of this table's materialized views, checking it against the table
+   first unless --verify-mv-before-drop is off. Checking here rather than only at
+   the end of the run means every view that ever existed gets compared, not just
+   the ones still alive when the run finishes.
+
+   The caller must already have quiesced the workload when the check is enabled:
+   count(view) against count(table) only holds when nothing is inserting. */
+void Table::DropMaterializedView(Thd1 *thd) {
+  MVInfo mv;
+  {
+    std::lock_guard<std::mutex> lk(g_materialized_views_mutex);
+    std::vector<size_t> mine;
+    for (size_t i = 0; i < g_materialized_views.size(); i++)
+      if (g_materialized_views[i].src_table == name_)
+        mine.push_back(i);
+    if (mine.empty())
+      return;
+    const size_t pick = mine[rand_int(mine.size() - 1)];
+    mv = g_materialized_views[pick];
+    g_materialized_views.erase(g_materialized_views.begin() + pick);
+  }
+
+  if (options->at(Option::CH_VERIFY_MV_BEFORE_DROP)->getBool()) {
+    auto query_one = [thd](const std::string &sql) {
+      return thd->db->get_single_value(sql);
+    };
+    ch_report_mv_check(mv, mv_skip_reason(), engine, query_one, thd);
+  }
+
+  execute_sql("DROP VIEW IF EXISTS " + mv.name, thd);
+  if (!mv.target.empty())
+    execute_sql("DROP TABLE IF EXISTS " + mv.target, thd);
 }
 #else
 void Table::AlterTableUpdate(Thd1 *) {}
@@ -4489,6 +4897,72 @@ void create_database_tablespace(Thd1 *thd) {
   }
 }
 
+#ifdef USE_CLICKHOUSE
+/* Run once per run, before any table is created.
+
+   Drops materialized views and TO targets left behind by an earlier run. pstress
+   drops and recreates its own tables at step 1 but knows nothing about views, and
+   a view left pointing at a recreated table re-binds to it by name and then fails
+   every insert whose columns do not match the ones the view was created with.
+
+   Also refuses to start when this connection would insert asynchronously without
+   waiting for the flush: the INSERT would return before the views have the rows,
+   so every comparison would report a difference that is not a bug. Asked of the
+   worker's own connection rather than a fresh one, because the session settings
+   pstress applies are what actually decide this. */
+static void ch_prepare_materialized_views(Thd1 *thd) {
+  if (options->at(Option::CH_CREATE_MV)->getInt() > 0) {
+    auto truthy = [](const std::string &v) {
+      return !v.empty() && v != "0" && v != "false";
+    };
+    std::string async_insert = "0", wait_for_async = "1";
+    for (const auto &row : thd->db->get_query_result(
+             "SELECT name, value FROM system.settings WHERE name IN "
+             "('async_insert', 'wait_for_async_insert')")) {
+      if (row.size() < 2)
+        continue;
+      if (row[0] == "async_insert")
+        async_insert = row[1];
+      else
+        wait_for_async = row[1];
+    }
+    if (truthy(async_insert) && !truthy(wait_for_async)) {
+      print_and_log("--create-mv needs an INSERT to have reached the views by "
+                    "the time it returns, but this connection has "
+                    "async_insert=" + async_insert + " with "
+                    "wait_for_async_insert=" + wait_for_async +
+                    ", so it returns before the data is flushed. Set "
+                    "wait_for_async_insert=1 or async_insert=0.",
+                    thd);
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  /* only when the tables themselves are being recreated, matching Table::load */
+  if (options->at(Option::STEP)->getInt() != 1 &&
+      !options->at(Option::PREPARE)->getBool())
+    return;
+
+  const std::string db = options->at(Option::DATABASE)->getString();
+  /* views before targets, so dropping a target has no dependant left */
+  auto leftovers = thd->db->get_query_result(
+      "SELECT name, engine FROM system.tables WHERE database = '" + db +
+      "' AND (startsWith(name, '" + MV_PREFIX + "') OR startsWith(name, '" +
+      MV_TARGET_PREFIX + "')) ORDER BY engine = 'MaterializedView' DESC");
+  for (const auto &row : leftovers) {
+    if (row.size() < 2)
+      continue;
+    const bool is_view = row[1] == "MaterializedView";
+    print_and_log("Dropping " + std::string(is_view ? "view " : "view target ") +
+                      row[0] + " left behind by an earlier run",
+                  thd, false, false);
+    execute_sql((is_view ? "DROP VIEW IF EXISTS " : "DROP TABLE IF EXISTS ") +
+                    row[0],
+                thd, false);
+  }
+}
+#endif
+
 /* load metadata */
 bool Thd1::load_metadata() {
   /* Serialize initialization: both nodes share global all_tables/options */
@@ -4505,6 +4979,21 @@ bool Thd1::load_metadata() {
                              options->at(Option::DATABASE)->getString(),
                              options->at(Option::USER)->getString(),
                              options->at(Option::PASSWORD)->getString());
+  /* fail once here rather than on every CREATE TABLE */
+  ch_validate_engine(myParam->address, myParam->port,
+                     options->at(Option::DATABASE)->getString(),
+                     options->at(Option::USER)->getString(),
+                     options->at(Option::PASSWORD)->getString());
+  /* and once here rather than on every CREATE MATERIALIZED VIEW */
+  ch_validate_mv_support(myParam->address, myParam->port,
+                         options->at(Option::DATABASE)->getString(),
+                         options->at(Option::USER)->getString(),
+                         options->at(Option::PASSWORD)->getString());
+  /* clear views left by an earlier run before any table is recreated */
+  static std::once_flag mv_prepare_once;
+  std::call_once(mv_prepare_once, [this]() {
+    ch_prepare_materialized_views(this);
+  });
 #endif
 
   if (options->at(Option::SECONDARY_ENGINE)->getString() != "") {
