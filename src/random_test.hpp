@@ -66,12 +66,13 @@ const std::string TABLE_PREFIX = "tt_";
 const std::string PARTITION_SUFFIX = "_p";
 const std::string FK_SUFFIX = "_fk";
 const std::string TEMP_SUFFIX = "_t";
-/* used to create metadata. Bumped to 3 when per-table settings were added, and
-   to 4 when --engine started naming the MergeTree family member: metadata from
-   an older run stores "MergeTree()", which used to mean ReplacingMergeTree and
-   now means plain MergeTree, so such a file has to be rejected rather than
-   silently recreating tables with a different engine. */
-const int version = 4;
+/* used to create metadata. Bumped to 3 when per-table settings were added, to 4
+   when --engine started naming the MergeTree family member (metadata from an
+   older run stores "MergeTree()", which used to mean ReplacingMergeTree and now
+   means plain MergeTree, so such a file has to be rejected rather than silently
+   recreating tables with a different engine), and to 5 when the materialized
+   view registry started being persisted so a view survives a step restart. */
+const int version = 5;
 std::string add_ignore_clause();
 struct Thd1;
 
@@ -471,6 +472,7 @@ struct Table {
 #else
   /* so the callers do not need to be guarded one by one */
   void mark_mv_source_mutated(const char *) {}
+  std::string mv_skip_reason() const { return ""; }
 #endif
   int key_block_size = 0;
   long int number_of_initial_records;
@@ -906,6 +908,13 @@ extern std::mutex g_materialized_views_mutex;
 const std::string MV_PREFIX = "mv_";
 const std::string MV_TARGET_PREFIX = "mvt_";
 unsigned long next_mv_id();
+/* Raise the id counter above one already in use, so a view created after a step
+   restart cannot collide with a surviving view from the previous step. */
+void bump_mv_id_floor(unsigned long id);
+/* Give a reason read back from the metadata file the process-lifetime storage
+   that mark_mv_source_mutated() expects, so a table stays uncomparable across a
+   step restart for the reason it originally became uncomparable. */
+const char *intern_mv_reason(const std::string &why);
 /* How many views currently exist on this table. */
 size_t mv_count_for_table(const std::string &table_name);
 #endif

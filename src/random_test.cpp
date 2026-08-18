@@ -11,6 +11,7 @@
 #include "ch_verify.hpp"
 #endif
 #include <array>
+#include <deque>
 #include <document.h>
 #include <filesystem>
 #include <iomanip>
@@ -4462,9 +4463,24 @@ void Table::AlterTableDelete(Thd1 *thd) {
     mark_mv_source_mutated("ALTER TABLE DELETE");
 }
 
-unsigned long next_mv_id() {
-  static std::atomic<unsigned long> counter{0};
-  return counter++;
+/* deque, not vector: the strings must never be reallocated, because the char*
+   handed to mark_mv_source_mutated() has to stay valid for the whole run. Only
+   touched while loading metadata, which is single threaded. */
+const char *intern_mv_reason(const std::string &why) {
+  static std::deque<std::string> interned;
+  interned.push_back(why);
+  return interned.back().c_str();
+}
+
+static std::atomic<unsigned long> g_mv_id_counter{0};
+
+unsigned long next_mv_id() { return g_mv_id_counter++; }
+
+void bump_mv_id_floor(unsigned long id) {
+  unsigned long current = g_mv_id_counter.load();
+  while (current <= id &&
+         !g_mv_id_counter.compare_exchange_weak(current, id + 1)) {
+  }
 }
 
 size_t mv_count_for_table(const std::string &table_name) {

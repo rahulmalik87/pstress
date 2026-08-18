@@ -390,6 +390,15 @@ template <typename Writer> void Table::Serialize(Writer &writer) const {
   writer.String("settings");
   writer.String(settings.c_str(), static_cast<SizeType>(settings.length()));
 
+  /* Why this table can no longer be compared against its materialized views,
+     empty while it still can. Persisted because a view created in an earlier
+     step outlives the process that knows what happened to its source: without
+     this, step 2 would compare a view against a table that was mutated in step
+     1 and report a difference that is not a bug. */
+  const std::string mv_reason = mv_skip_reason();
+  writer.String("mv_mutation_reason");
+  writer.String(mv_reason.c_str(), static_cast<SizeType>(mv_reason.length()));
+
   writer.String(("columns"));
   writer.StartArray();
 
@@ -590,6 +599,36 @@ void save_metadata_to_file() {
     table->Serialize(writer);
   }
   writer.EndArray();
+
+  /* The materialized views this run created, so the next step can go on
+     checking them instead of skipping everything it did not create itself. */
+  writer.String("materialized_views");
+  writer.StartArray();
+#ifdef USE_CLICKHOUSE
+  {
+    std::lock_guard<std::mutex> lk(g_materialized_views_mutex);
+    for (const auto &mv : g_materialized_views) {
+      writer.StartObject();
+      writer.String("name");
+      writer.String(mv.name.c_str(), static_cast<SizeType>(mv.name.length()));
+      writer.String("target");
+      writer.String(mv.target.c_str(),
+                    static_cast<SizeType>(mv.target.length()));
+      writer.String("src_table");
+      writer.String(mv.src_table.c_str(),
+                    static_cast<SizeType>(mv.src_table.length()));
+      writer.String("populate_atomically");
+      writer.Bool(mv.populate_atomically);
+      writer.String("columns");
+      writer.StartArray();
+      for (const auto &col : mv.columns)
+        writer.String(col.c_str(), static_cast<SizeType>(col.length()));
+      writer.EndArray();
+      writer.EndObject();
+    }
+  }
+#endif
+  writer.EndArray();
   writer.EndObject();
   std::ofstream of(file);
   of << sb.GetString();
@@ -687,6 +726,14 @@ std::string load_metadata_from_file() {
     if (tab.HasMember("settings"))
       table->settings = tab["settings"].GetString();
 
+#ifdef USE_CLICKHOUSE
+    if (tab.HasMember("mv_mutation_reason")) {
+      const std::string why = tab["mv_mutation_reason"].GetString();
+      if (!why.empty())
+        table->mark_mv_source_mutated(intern_mv_reason(why));
+    }
+#endif
+
     /* save columns */
     for (auto &col : tab["columns"].GetArray()) {
       Column *a;
@@ -758,6 +805,37 @@ std::string load_metadata_from_file() {
 
     all_tables->push_back(table);
   }
+
+#ifdef USE_CLICKHOUSE
+  /* Restore the views an earlier step created. They still exist on the server -
+     step >= 2 recreates neither the tables nor the views - so putting them back
+     in the registry is what lets them be checked instead of skipped. */
+  if (d.HasMember("materialized_views")) {
+    std::lock_guard<std::mutex> lk(g_materialized_views_mutex);
+    for (auto &mvj : d["materialized_views"].GetArray()) {
+      MVInfo mv;
+      mv.name = mvj["name"].GetString();
+      mv.target = mvj["target"].GetString();
+      mv.src_table = mvj["src_table"].GetString();
+      mv.populate_atomically = mvj["populate_atomically"].GetBool();
+      for (auto &col : mvj["columns"].GetArray())
+        mv.columns.push_back(col.GetString());
+      /* mv_<table>_<id>: keep this step's ids clear of the restored ones */
+      const auto last_us = mv.name.rfind('_');
+      if (last_us != std::string::npos) {
+        try {
+          bump_mv_id_floor(std::stoul(mv.name.substr(last_us + 1)));
+        } catch (const std::exception &) {
+        }
+      }
+      g_materialized_views.push_back(std::move(mv));
+    }
+    if (!g_materialized_views.empty())
+      print_and_log("restored " + std::to_string(g_materialized_views.size()) +
+                        " materialized views from the previous step",
+                    nullptr);
+  }
+#endif
 
   fclose(fp);
   print_and_log("metadata loaded from file " + file, nullptr);
