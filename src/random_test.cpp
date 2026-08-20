@@ -441,7 +441,7 @@ int sum_of_all_options(Thd1 *thd) {
   }
 
   /* check if keyring component is installed */
-  if (strcmp(FORK, "DuckDB") != 0 &&
+  if (strcmp(FORK, "MySQL") == 0 &&
       thd->db->get_single_value(
           "SELECT status_value FROM performance_schema.keyring_component_status WHERE \
     status_key='component_status'") == "Active")
@@ -2047,7 +2047,7 @@ std::string Index::definition() {
 }
 
 static void validate_secondary_engine(Thd1 *thd) {
-  if (strcmp(FORK, "Duckdb") == 0) {
+  if (strcmp(FORK, "Duckdb") || strcmp(FORK, "ClickHouse") == 0) {
     return;
   }
   if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {

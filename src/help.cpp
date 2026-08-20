@@ -638,7 +638,7 @@ void add_options() {
 
   opt = newOption(Option::INT, Option::PKEY_IN_SET, "pk-in-set");
   opt->help = "USE PKEY IN SET tt_N set col=";
-  opt->setInt(1);
+  opt->setInt(0);
 
   /* disable char columns*/
   opt = newOption(Option::BOOL, Option::NO_CHAR, "no-char");
