@@ -564,10 +564,12 @@ int sum_of_all_options(Thd1 *thd) {
     g_encryption = {enc_type};
 
   /* feature not supported by oracle */
-  /* CH_ALTER_UPDATE/DELETE are ClickHouse-only mutations */
+  /* CH_ALTER_UPDATE/DELETE are ClickHouse-only mutations, and so is the
+     KILL MUTATION that cancels them */
   if (strcmp(FORK, "ClickHouse") != 0) {
     options->at(Option::CH_ALTER_UPDATE)->setInt(0);
     options->at(Option::CH_ALTER_DELETE)->setInt(0);
+    options->at(Option::CH_KILL_MUTATION)->setInt(0);
   }
 
   if (strcmp(FORK, "MySQL") == 0) {
@@ -659,9 +661,11 @@ int sum_of_all_options(Thd1 *thd) {
                     "Use --engine=MergeTree for the exact check.");
   }
 #else
-  /* the create/drop view actions only exist in the ClickHouse build */
+  /* the create/drop view and kill mutation actions only exist in the
+     ClickHouse build */
   opt_int_set(CH_CREATE_MV, 0);
   opt_int_set(CH_DROP_MV, 0);
+  opt_int_set(CH_KILL_MUTATION, 0);
 #endif
 
   if (options->at(Option::ONLY_PARTITION)->getBool())
@@ -4438,6 +4442,15 @@ std::string Table::GetWhereLargeRange() {
          " AND " + std::to_string(hi);
 }
 
+/* A killed mutation fails the ALTER that was waiting on it (--ch-mutations-sync)
+   after some parts have already been rewritten, so the source is out of step
+   with its materialized views whether the statement succeeded or not. Only
+   widen the skip when kills are actually enabled — otherwise a rejected ALTER
+   really did change nothing and its views stay checkable. */
+static bool mutation_may_have_applied(bool executed) {
+  return executed || options->at(Option::CH_KILL_MUTATION)->getInt() > 0;
+}
+
 /* ALTER TABLE t UPDATE col=val WHERE ... SETTINGS mutations_sync=2
    mutations_sync=2 waits for the mutation to complete on all replicas. */
 void Table::AlterTableUpdate(Thd1 *thd) {
@@ -4447,7 +4460,7 @@ void Table::AlterTableUpdate(Thd1 *thd) {
   if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
     sql += " SETTINGS mutations_sync = 2";
   unlock_table_mutex();
-  if (execute_sql(sql, thd))
+  if (mutation_may_have_applied(execute_sql(sql, thd)))
     mark_mv_source_mutated("ALTER TABLE UPDATE");
 }
 
@@ -4459,7 +4472,7 @@ void Table::AlterTableDelete(Thd1 *thd) {
   if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
     sql += " SETTINGS mutations_sync = 2";
   unlock_table_mutex();
-  if (execute_sql(sql, thd))
+  if (mutation_may_have_applied(execute_sql(sql, thd)))
     mark_mv_source_mutated("ALTER TABLE DELETE");
 }
 

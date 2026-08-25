@@ -75,6 +75,42 @@ static void kill_query(Thd1 *thd) {
 #endif
 }
 
+#ifdef USE_CLICKHOUSE
+/* ClickHouse: cancel a random mutation that has not finished yet.
+
+   A mutation is a background rewrite of every part, tracked in
+   system.mutations until is_done. More of the workload produces one than the
+   --ch-alter-update/--ch-alter-delete options it was written for: DELETE FROM is
+   rewritten into ALTER TABLE ... UPDATE _row_exists = 0 while
+   lightweight_delete_mode is at its alter_update default, and DROP COLUMN and a
+   retyping MODIFY COLUMN are mutations too. A lightweight UPDATE is not one --
+   it writes patch parts, which never appear in system.mutations -- so no roll
+   ever targets it.
+
+   Killing a mutation mid-flight leaves the table with some parts rewritten and
+   some not, and fails the statement still waiting on it (any ALTER under
+   --ch-mutations-sync, and every DELETE FROM, which waits by default under
+   lightweight_deletes_sync = 2) — which is exactly the state we want the server,
+   the replication queue and the next mutation over the same parts to survive.
+
+   Any unfinished mutation in this run's database is a candidate, including ones
+   stuck retrying after a failure, which is the case KILL MUTATION exists for. */
+static void kill_mutation(Thd1 *thd) {
+  const std::string db = options->at(Option::DATABASE)->getString();
+  auto result = thd->db->get_query_result(
+      "SELECT table, mutation_id FROM system.mutations "
+      "WHERE database = '" + db + "' AND is_done = 0");
+  if (result.empty())
+    return;
+  const auto &row = result[rand_int(result.size() - 1)];
+  if (row.size() < 2)
+    return;
+  execute_sql("KILL MUTATION WHERE database = '" + db + "' AND table = '" +
+                  row[0] + "' AND mutation_id = '" + row[1] + "'",
+              thd);
+}
+#endif
+
 std::string getExecutablePath() {
   char buffer[PATH_MAX];
 #ifdef _WIN32
@@ -819,6 +855,11 @@ bool Thd1::run_some_query() {
     case Option::KILL_TRANSACTION:
       kill_query(this);
       break;
+#ifdef USE_CLICKHOUSE
+    case Option::CH_KILL_MUTATION:
+      kill_mutation(this);
+      break;
+#endif
     case Option::RANDOM_TIMEZONE:
       random_timezone(this);
       break;

@@ -1009,6 +1009,20 @@ void add_options() {
   opt->setArgs(no_argument);
   opt->short_help = "CHMutationsSync";
 
+  /* ClickHouse KILL MUTATION. A mutation is a background part rewrite, so
+     cancelling one mid-flight leaves the table half-mutated and any ALTER that
+     was waiting on it (--ch-mutations-sync) failing — both states the server
+     has to survive. */
+  opt = newOption(Option::INT, Option::CH_KILL_MUTATION, "ch-kill-mutation");
+  opt->help = "Probability weight for KILL MUTATION: pick a random unfinished "
+              "mutation of this run's database out of system.mutations and "
+              "cancel it. Rolls blind and does nothing when there is no "
+              "unfinished mutation.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "CHKillMutation";
+  opt->setDDL();
+
   opt = newOption(Option::BOOL, Option::CH_ADD_COLUMN_BACKFILL,
                   "ch-add-column-backfill");
   opt->help = "After ADD COLUMN succeeds, fire an ALTER TABLE UPDATE to "

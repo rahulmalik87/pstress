@@ -207,6 +207,7 @@ cmake .. -DCLICKHOUSE=ON \
 | `--ch-alter-delete=N` | `0` | Probability weight for ALTER TABLE DELETE mutations |
 | `--ch-mutations-sync` | off | Append `SETTINGS mutations_sync=2` to all mutations (ADD/DROP COLUMN, ALTER UPDATE/DELETE) |
 | `--ch-add-column-backfill` | off | After ADD COLUMN, fire a synchronous mutation to fill existing rows with random values instead of leaving them at the ClickHouse zero-default (`''` / `0`) |
+| `--ch-kill-mutation=N` | `0` | Probability weight for `KILL MUTATION` — cancels a random unfinished mutation |
 | `--threads N` | `10` | Threads per node |
 | `--tables N` | `10` | Number of tables to create |
 | `--seconds N` | `100` | How long to run the workload |
@@ -235,6 +236,31 @@ Pass `--ch-mutations-sync` to append `SETTINGS mutations_sync = 2`, which makes 
 # asynchronous (default, no flag needed):
 ./bld/src/pstress-ch --ch-alter-update 5 --ch-alter-delete 3 ...
 ```
+
+### Killing mutations
+
+`--ch-kill-mutation=N` adds a `KILL MUTATION` action to the workload. Each time it is rolled, pstress reads `system.mutations` for this run's database, picks one entry with `is_done = 0` at random and cancels it:
+
+```sql
+KILL MUTATION WHERE database = 'test_db' AND table = 'tt_3' AND mutation_id = '0000000004'
+```
+
+```bash
+./bld/src/pstress-ch --port 9000 --tables 10 --threads 5 --seconds 300 \
+  --logdir /tmp/pstress-ch \
+  --ch-alter-update 5 --ch-alter-delete 3 --ch-mutations-sync \
+  --ch-kill-mutation 2
+```
+
+It only does something when the run also produces mutations, so pair it with `--ch-alter-update`, `--ch-alter-delete` or `--ch-add-column-backfill`. More of the workload feeds it than those options alone: `DELETE FROM` is rewritten into `ALTER TABLE ... UPDATE _row_exists = 0` while `lightweight_delete_mode` is at its `alter_update` default, and `DROP COLUMN` and a retyping `MODIFY COLUMN` are mutations too. A lightweight `UPDATE` is not one — it writes patch parts, which never appear in `system.mutations` — so no roll can target it. The roll is blind: when nothing is unfinished it is a silent no-op, and pstress does not warn about it.
+
+What this exercises:
+
+* a mutation cancelled after it has rewritten some parts but not others, leaving the table half-mutated, and the next mutation over the same parts having to cope with that
+* the statement waiting on the killed mutation fails — any `ALTER` under `--ch-mutations-sync`, and every `DELETE FROM`, which waits by default under `lightweight_deletes_sync = 2`. That is expected: the failed query is logged as `F <sql>` in the thread log and does not fail the run
+* stuck mutations that keep retrying after a failure are candidates too — the case `KILL MUTATION` exists for
+
+A killed mutation puts a table out of step with its materialized views the same way a completed one does, so with `--ch-kill-mutation` set the MV check skips a mutated source whether its `ALTER` reported success or not.
 
 ## Schema verification
 
