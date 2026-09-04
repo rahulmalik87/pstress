@@ -1160,6 +1160,16 @@ void add_options() {
   opt->setBool(false);
   opt->setArgs(no_argument);
 
+  opt = newOption(Option::INT, Option::CH_SOCKET_TIMEOUT, "ch-socket-timeout");
+  opt->help = "Seconds a worker waits for a reply on an established connection "
+              "before giving up on it (SO_RCVTIMEO/SO_SNDTIMEO). Only catches a "
+              "server that holds the connection open and stops answering — a "
+              "dropped connection is caught by TCP keepalive instead. Must stay "
+              "clear of legitimately slow queries: a synchronous mutation on a "
+              "busy service can take 20+ minutes. 0 waits forever, which is how "
+              "a finished run can hang until it is killed.";
+  opt->setInt(1800);
+
   /* Drop column */
   opt = newOption(Option::INT, Option::DROP_COLUMN, "drop-column");
   opt->help = "alter table drop some random column";

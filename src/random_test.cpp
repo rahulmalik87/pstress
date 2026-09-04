@@ -21,10 +21,6 @@
 #include <thread>
 #include <unistd.h>
 
-#define CR_SERVER_GONE_ERROR 2006
-#define CR_SERVER_LOST 2013
-#define CR_WSREP_NOT_PREPARED 1047
-#define CR_SECONDARY_NOT_READY 6000
 extern thread_local std::mt19937 rng;
 
 size_t number_of_records;

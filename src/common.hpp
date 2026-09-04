@@ -251,6 +251,7 @@ struct Option {
     CH_MV_TO_PROB,
     CH_VERIFY_MV_BEFORE_DROP,
     CH_VERIFY_MV,
+    CH_SOCKET_TIMEOUT,
     MAX
   } option;
 

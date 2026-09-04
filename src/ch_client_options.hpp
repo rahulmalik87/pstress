@@ -1,21 +1,50 @@
 #pragma once
-/* Shared TLS setup for every clickhouse-cpp client pstress creates.
+/* Shared socket and TLS setup for every clickhouse-cpp client pstress creates.
    MUST be included after <clickhouse/client.h> and before the pstress headers
    that declare ::Column — see the note at the top of ch_verify.cpp. */
 #include <clickhouse/client.h>
 #include <chrono>
 #include <string>
 
-/* Apply --secure to a ClientOptions. The SSLOptions defaults verify the
-   server certificate against the system CA store and send SNI, which is what
-   ClickHouse Cloud requires. SetSSLOptions throws if the linked clickhouse-cpp
-   was built without -DWITH_OPENSSL=ON.
+/* Settings every clickhouse-cpp client pstress creates needs: how the socket
+   behaves, plus the TLS setup for --secure.
 
    Every client must go through this: pstress opens connections from three
    places (worker threads in ClickhouseDatabase.hpp, plus make_clients() and
    ch_verify_schema() in ch_verify.cpp), and a plaintext handshake against a
-   TLS port fails as "can't receive string data: Connection reset by peer". */
-inline void ch_apply_secure(clickhouse::ClientOptions &opts, bool secure) {
+   TLS port fails as "can't receive string data: Connection reset by peer".
+
+   socket_timeout_secs comes from --ch-socket-timeout; 0 leaves the read
+   blocking forever, which is clickhouse-cpp's default. The option is read by
+   the callers rather than here because this header is included before the
+   pstress headers that declare Option - see the note at the top of
+   ch_verify.cpp. */
+inline void ch_apply_client_options(clickhouse::ClientOptions &opts,
+                                    bool secure, int socket_timeout_secs) {
+  /* Keepalive is what stops a worker from waiting forever on a reply that can
+     no longer arrive. A query that takes minutes server-side - a lightweight
+     DELETE waiting for its mutation on every replica is the usual one - leaves
+     the connection with no traffic on it, and an idle flow crossing a NAT or
+     load-balancer hop is dropped silently: no FIN, no RST, both ends still
+     ESTABLISHED. The server's reply then goes nowhere and the read never
+     returns, so a run whose --seconds expired sits in pthread_join until it is
+     killed. Probing keeps the flow from going idle at all, and when the peer
+     really is gone the failed probes make the read fail in ~75s. */
+  opts.TcpKeepAlive(true)
+      .SetTcpKeepAliveIdle(std::chrono::seconds(60))
+      .SetTcpKeepAliveInterval(std::chrono::seconds(5))
+      .SetTcpKeepAliveCount(3);
+
+  /* Backstop for the case keepalive cannot see: a server that keeps the
+     connection healthy but stops answering. */
+  if (socket_timeout_secs > 0) {
+    opts.SetConnectionRecvTimeout(std::chrono::seconds(socket_timeout_secs));
+    opts.SetConnectionSendTimeout(std::chrono::seconds(socket_timeout_secs));
+  }
+
+  /* The SSLOptions defaults verify the server certificate against the system CA
+     store and send SNI, which is what ClickHouse Cloud requires. SetSSLOptions
+     throws if the linked clickhouse-cpp was built without -DWITH_OPENSSL=ON. */
   if (!secure)
     return;
   opts.SetSSLOptions(clickhouse::ClientOptions::SSLOptions());

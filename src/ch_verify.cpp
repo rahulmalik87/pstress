@@ -130,7 +130,8 @@ make_clients(const std::vector<std::string> &addrs,
     clickhouse::ClientOptions opts;
     opts.SetHost(host).SetPort(ports[i]).SetUser(user).SetPassword(pass)
         .SetDefaultDatabase(db);
-    ch_apply_secure(opts, options->at(Option::SECURE)->getBool());
+    ch_apply_client_options(opts, options->at(Option::SECURE)->getBool(),
+                            options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
     clients.push_back(std::make_unique<clickhouse::Client>(opts));
   }
   return clients;
@@ -481,7 +482,8 @@ void ch_validate_table_settings(const std::string &addr, int port,
         .SetUser(user)
         .SetPassword(pass)
         .SetDefaultDatabase(db);
-    ch_apply_secure(opts, secure);
+    ch_apply_client_options(opts, secure,
+                            options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
     clickhouse::Client client(opts);
     client.Execute(
         clickhouse::Query("SELECT name FROM system.merge_tree_settings")
@@ -544,7 +546,8 @@ void ch_validate_engine(const std::string &addr, int port,
         .SetUser(user)
         .SetPassword(pass)
         .SetDefaultDatabase(db);
-    ch_apply_secure(opts, secure);
+    ch_apply_client_options(opts, secure,
+                            options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
     clickhouse::Client client(opts);
     client.Execute(
         clickhouse::Query("SELECT name FROM system.table_engines")
@@ -593,7 +596,8 @@ void ch_validate_mv_support(const std::string &addr, int port,
         .SetUser(user)
         .SetPassword(pass)
         .SetDefaultDatabase(db);
-    ch_apply_secure(opts, secure);
+    ch_apply_client_options(opts, secure,
+                            options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
     clickhouse::Client client(opts);
     client.Execute(
         clickhouse::Query("SELECT name FROM system.settings")
@@ -642,7 +646,8 @@ bool ch_verify_schema(const std::vector<std::string> &addrs,
   clickhouse::ClientOptions opts;
   opts.SetHost(host).SetPort(port).SetUser(user).SetPassword(pass)
       .SetDefaultDatabase(db);
-  ch_apply_secure(opts, options->at(Option::SECURE)->getBool());
+  ch_apply_client_options(opts, options->at(Option::SECURE)->getBool(),
+                          options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
   std::unique_ptr<clickhouse::Client> client_ptr;
   try {
     client_ptr = std::make_unique<clickhouse::Client>(opts);

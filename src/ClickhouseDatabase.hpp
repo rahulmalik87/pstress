@@ -119,6 +119,9 @@ private:
   size_t last_row_count = 0;
   std::string last_error;
   int last_error_number = 0;
+  /* A copy of what connect() was handed, so a connection that dies mid-run can
+     be rebuilt from run_query() without going back out to Thd1. */
+  std::unique_ptr<workerParams> conn_params;
 
   /* Run a query, keeping at most max_rows of its result set. */
   bool run_query(const std::string &query, size_t max_rows) {
@@ -132,6 +135,12 @@ private:
     last_row_count = 0;
     last_error.clear();
     last_error_number = 0;
+    /* Only reachable when the reconnect below also failed. */
+    if (!client) {
+      last_error = "not connected";
+      last_error_number = CR_SERVER_LOST;
+      return false;
+    }
     try {
       client->Execute(
           clickhouse::Query(query).OnData([&](const clickhouse::Block &block) {
@@ -151,9 +160,24 @@ private:
             last_row_count += rows;
           }));
       return true;
-    } catch (const std::exception &e) {
+    } catch (const clickhouse::ServerException &e) {
+      /* The server answered, and the answer was an error. Nothing is wrong with
+         the connection, so the worker keeps using it. */
       last_error = e.what();
       last_error_number = 1;
+      return false;
+    } catch (const std::exception &e) {
+      /* Anything else came from the socket or the protocol decoder, both of
+         which leave the stream mid-packet: every later query on this client
+         would be reading the tail of this one. Throw the connection away and
+         build a fresh one so the worker can carry on with its next query -
+         this query stays failed, it is not retried. CR_SERVER_LOST is what
+         gets the loss logged and the run's exit status failed. */
+      last_error = e.what();
+      last_error_number = CR_SERVER_LOST;
+      client.reset();
+      if (conn_params)
+        connect(*conn_params);
       return false;
     }
   }
@@ -172,7 +196,8 @@ public:
           .SetPort(port)
           .SetUser(myParams.username)
           .SetPassword(myParams.password);
-      ch_apply_secure(opts, secure);
+      ch_apply_client_options(
+          opts, secure, options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
       /* Connect without default database first to create it if needed */
       client = std::make_unique<clickhouse::Client>(opts);
 
@@ -197,6 +222,7 @@ public:
       for (const auto &setting : g_session_settings)
         client->Execute("SET " + setting);
 
+      conn_params = std::make_unique<workerParams>(myParams);
       return true;
     } catch (const std::exception &e) {
       std::cerr << "ClickHouse connect error [" << myParams.address << ":"
