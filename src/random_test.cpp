@@ -48,6 +48,7 @@ std::vector<std::string> algorithms;
 std::vector<int> g_key_block_size;
 std::vector<SettingSpec> g_table_settings;
 std::vector<std::string> g_session_settings;
+std::vector<SettingSpec> g_alterable_table_settings;
 std::string g_fixed_table_settings;
 #ifdef USE_CLICKHOUSE
 std::vector<MVInfo> g_materialized_views;
@@ -712,12 +713,54 @@ int sum_of_all_options(Thd1 *thd) {
           exit(EXIT_FAILURE);
         }
 
+      /* the same trap, reached at run time instead of at CREATE TABLE: an
+         alter: entry can put the 0 there later, and a range starting at 0 can
+         resolve to it without ever spelling it out */
+      for (const auto &spec : g_alterable_table_settings)
+        if (spec.name == "index_granularity_bytes" &&
+            (spec.is_range ? spec.lo == 0
+                           : std::find(spec.values.begin(), spec.values.end(),
+                                       "0") != spec.values.end())) {
+          print_and_log("alter:index_granularity_bytes in the table settings "
+                        "pool lets --modify-table-setting turn off adaptive "
+                        "granularity mid-run, which makes every projection "
+                        "index_granularity override fail with "
+                        "SUPPORT_IS_DISABLED. Drop the alter: prefix from that "
+                        "line while projections are on.");
+          exit(EXIT_FAILURE);
+        }
+
       if (prob(Option::CH_MODIFY_PROJECTION) > 0 &&
           prob(Option::CH_DROP_PROJECTION) > prob(Option::CH_MODIFY_PROJECTION))
         print_and_log("WARNING: --drop-projection is more likely than "
                       "--modify-projection, so most MODIFYs will find their "
                       "target already dropped.");
     }
+  }
+
+  /* ---- table settings altered while the run is going ---- */
+  {
+    auto prob = [](Option::Opt o) { return options->at(o)->getInt(); };
+
+    if ((prob(Option::CH_MODIFY_TABLE_SETTING) > 0 ||
+         prob(Option::CH_RESET_TABLE_SETTING) > 0) &&
+        g_alterable_table_settings.empty()) {
+      print_and_log("--modify-table-setting and --reset-table-setting only act "
+                    "on settings the pool marked alterable, and there is not "
+                    "one: prefix a line of --table-settings-file with alter:. "
+                    "Without it both would roll and do nothing and the run "
+                    "would look healthy while testing nothing. Note that "
+                    "--no-table-settings and --table-settings both bypass the "
+                    "pool entirely.");
+      exit(EXIT_FAILURE);
+    }
+
+    if (prob(Option::CH_RESET_TABLE_SETTING) > 0 &&
+        prob(Option::CH_MODIFY_TABLE_SETTING) == 0)
+      print_and_log("WARNING: --reset-table-setting without "
+                    "--modify-table-setting can only reset what a table rolled "
+                    "at CREATE TABLE, so it goes quiet once every table is "
+                    "back to the server defaults.");
   }
 #else
   /* the create/drop view, kill mutation and projection actions only exist in
@@ -730,6 +773,8 @@ int sum_of_all_options(Thd1 *thd) {
   opt_int_set(CH_DROP_PROJECTION, 0);
   opt_int_set(CH_MODIFY_PROJECTION, 0);
   opt_int_set(CH_MATERIALIZE_PROJECTION, 0);
+  opt_int_set(CH_MODIFY_TABLE_SETTING, 0);
+  opt_int_set(CH_RESET_TABLE_SETTING, 0);
 #endif
 
   if (options->at(Option::ONLY_PARTITION)->getBool())
@@ -1104,6 +1149,7 @@ static std::string resolve_setting_value(const SettingSpec &spec) {
 void load_table_settings_pool() {
   g_table_settings.clear();
   g_session_settings.clear();
+  g_alterable_table_settings.clear();
   g_fixed_table_settings.clear();
 
   if (options->at(Option::NO_TABLE_SETTINGS)->getBool())
@@ -1168,15 +1214,22 @@ void load_table_settings_pool() {
       continue;
 
     bool is_session = false;
+    bool is_alterable = false;
     if (rest.rfind("session:", 0) == 0) {
       is_session = true;
       rest = trim_ws(rest.substr(strlen("session:")));
+    } else if (rest.rfind("alter:", 0) == 0) {
+      /* a session setting is not a table setting, so there is nothing an
+         ALTER TABLE could do with it */
+      is_alterable = true;
+      rest = trim_ws(rest.substr(strlen("alter:")));
     }
 
     auto eq = rest.find('=');
     if (eq == std::string::npos)
-      settings_file_error(path_str, line_no, line,
-                          "expected [session:][<prob>:]<name> = <values>");
+      settings_file_error(
+          path_str, line_no, line,
+          "expected [session:|alter:][<prob>:]<name> = <values>");
 
     SettingSpec spec;
 
@@ -1241,13 +1294,21 @@ void load_table_settings_pool() {
         g_session_settings.push_back(spec.name + " = " +
                                      resolve_setting_value(spec));
     } else {
+      spec.alterable = is_alterable;
       g_table_settings.push_back(spec);
+      /* an alter: entry is still rolled onto CREATE TABLE at its probability,
+         so a table can start out with the setting; on top of that it is what
+         --modify-table-setting picks from, and MODIFY SETTING can set one the
+         table never rolled */
+      if (is_alterable)
+        g_alterable_table_settings.push_back(spec);
     }
   }
   file.close();
 
   std::cout << "Loaded " << g_table_settings.size() << " table settings from "
-            << path_str << std::endl;
+            << path_str << ", " << g_alterable_table_settings.size()
+            << " of them alterable" << std::endl;
   for (const auto &setting : g_session_settings)
     std::cout << "Session setting: SET " << setting << std::endl;
 }
@@ -1271,6 +1332,75 @@ std::string pick_table_settings() {
     clause += spec.name + " = " + resolve_setting_value(spec);
   }
   return clause;
+}
+
+/* Table::settings is a flat "name = value, name = value" clause rather than a
+   map: it is what CREATE TABLE emits and what the metadata file stores, so
+   keeping it as the single copy of the truth means MODIFY/RESET SETTING need no
+   new persisted state and no metadata version bump. These three keep it in step
+   with the ALTERs that succeeded. */
+std::vector<std::string> ch_settings_names(const std::string &clause) {
+  std::vector<std::string> names;
+  for (const auto &setting : split_and_trim(clause, ',')) {
+    auto eq = setting.find('=');
+    if (eq == std::string::npos)
+      continue;
+    auto name = trim_ws(setting.substr(0, eq));
+    if (!name.empty())
+      names.push_back(name);
+  }
+  return names;
+}
+
+void ch_settings_upsert(std::string &clause, const std::string &name,
+                        const std::string &value) {
+  std::string rebuilt;
+  bool replaced = false;
+  for (const auto &setting : split_and_trim(clause, ',')) {
+    auto eq = setting.find('=');
+    const bool same =
+        eq != std::string::npos && trim_ws(setting.substr(0, eq)) == name;
+    if (!rebuilt.empty())
+      rebuilt += ", ";
+    if (same) {
+      rebuilt += name + " = " + value;
+      replaced = true;
+    } else {
+      rebuilt += setting;
+    }
+  }
+  if (!replaced) {
+    if (!rebuilt.empty())
+      rebuilt += ", ";
+    rebuilt += name + " = " + value;
+  }
+  clause = rebuilt;
+}
+
+void ch_settings_erase(std::string &clause, const std::string &name) {
+  std::string rebuilt;
+  for (const auto &setting : split_and_trim(clause, ',')) {
+    auto eq = setting.find('=');
+    if (eq != std::string::npos && trim_ws(setting.substr(0, eq)) == name)
+      continue;
+    if (!rebuilt.empty())
+      rebuilt += ", ";
+    rebuilt += setting;
+  }
+  clause = rebuilt;
+}
+
+/* One alter: entry of the pool with a fresh value for it. The value is rolled
+   the same way CREATE TABLE rolls it, so the ALTER can only ever set something
+   the table could have been created with. */
+bool ch_roll_alterable_setting(std::string &name, std::string &value) {
+  if (g_alterable_table_settings.empty())
+    return false;
+  const auto &spec = g_alterable_table_settings.at(
+      rand_int(g_alterable_table_settings.size() - 1));
+  name = spec.name;
+  value = resolve_setting_value(spec);
+  return !value.empty();
 }
 
 PSTRESS_TARGET_CLONES
@@ -3301,9 +3431,17 @@ std::string Table::definition(bool with_index, bool with_fk,
          column, so nothing else changes. */
       def += ", allow_nullable_key = 1";
     }
-    /* per-table settings from --table-settings-file / --table-settings */
-    if (!settings.empty())
-      def += ", " + settings;
+    /* per-table settings from --table-settings-file / --table-settings.
+       Copied under the lock rather than read in place: --modify-table-setting
+       rewrites this string while the run is going, and none of definition()'s
+       three callers holds table_mutex. */
+    std::string current_settings;
+    {
+      std::shared_lock<std::shared_mutex> lock(table_mutex);
+      current_settings = settings;
+    }
+    if (!current_settings.empty())
+      def += ", " + current_settings;
   }
 #endif
 
@@ -5021,6 +5159,64 @@ void Table::MaterializeProjection(Thd1 *thd) {
   if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
     sql += " SETTINGS mutations_sync = 2";
   execute_sql(sql, thd);
+}
+
+/* ALTER TABLE t MODIFY SETTING <name> = <value>, with both taken from an alter:
+   line of the settings pool.
+
+   Emitted on its own and never folded into another ALTER: MODIFY SETTING is a
+   non replicated alter, and a Replicated database - which is what pstress
+   creates as soon as --port names more than one server - rejects a statement
+   mixing replicated and non replicated alters with QUERY_IS_PROHIBITED.
+
+   No mutations_sync and no dml_mutex: this changes metadata only and names no
+   column, so there is nothing to wait for and nothing a concurrent DROP COLUMN
+   could invalidate. Not a data mutation either, so the materialized views over
+   this table stay comparable. */
+void Table::ModifyTableSetting(Thd1 *thd) {
+  std::string setting, value;
+  if (!ch_roll_alterable_setting(setting, value))
+    return;
+
+  if (!execute_sql("ALTER TABLE " + name_ + " MODIFY SETTING " + setting +
+                       " = " + value,
+                   thd))
+    return;
+
+  /* the table now differs from the clause it was created with, so record it:
+     DropCreate and the next step both rebuild from Table::settings */
+  lock_table_mutex(thd->ddl_query);
+  ch_settings_upsert(settings, setting, value);
+  unlock_table_mutex();
+}
+
+/* ALTER TABLE t RESET SETTING <name> — put a setting back to the server
+   default. Only a setting the table actually carries is reset, and only one the
+   pool marked alterable: resetting a setting pstress owns, or one the table
+   never had, would either break the mutation paths or do nothing. */
+void Table::ResetTableSetting(Thd1 *thd) {
+  std::string setting;
+  {
+    std::vector<std::string> candidates;
+    lock_table_mutex(thd->ddl_query);
+    for (const auto &name : ch_settings_names(settings))
+      for (const auto &spec : g_alterable_table_settings)
+        if (spec.name == name) {
+          candidates.push_back(name);
+          break;
+        }
+    unlock_table_mutex();
+    if (candidates.empty())
+      return;
+    setting = candidates.at(rand_int(candidates.size() - 1));
+  }
+
+  if (!execute_sql("ALTER TABLE " + name_ + " RESET SETTING " + setting, thd))
+    return;
+
+  lock_table_mutex(thd->ddl_query);
+  ch_settings_erase(settings, setting);
+  unlock_table_mutex();
 }
 
 /* Drop every projection that names this column, before an ALTER that would

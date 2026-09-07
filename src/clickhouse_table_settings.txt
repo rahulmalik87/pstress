@@ -2,7 +2,7 @@
 #
 # Line format:
 #
-#   [session:][<prob>:]<name> = <values>
+#   [session:|alter:][<prob>:]<name> = <values>
 #
 #   <prob>    0-100, the chance this setting is applied. Omitted means 100.
 #             Table lines are rolled independently for every table, so a run
@@ -14,6 +14,14 @@
 #             DDL runs. Needed for the allow_experimental_* flags that gate
 #             experimental table settings — without the session flag the server
 #             rejects the CREATE TABLE outright.
+#   alter:    a normal table line that is ALSO a candidate for
+#             --modify-table-setting (ALTER TABLE ... MODIFY SETTING) and
+#             --reset-table-setting (RESET SETTING) while the run is going, so
+#             the value the table was created with is not the value it keeps.
+#             Only mark settings that MergeTree accepts in an ALTER: several are
+#             read only after create, and nothing in system.merge_tree_settings
+#             says which, so this list is the allowlist. Both options refuse to
+#             start when no line carries the prefix.
 #
 # Blank lines and lines starting with # are ignored.
 #
@@ -80,3 +88,12 @@ session:select_sequential_consistency = 1
 #
 # Uncomment the line matching the server under test when running that campaign.
 # 100:enable_adaptive_codec_selection               = 1
+
+# ---- exclusive experiment: PR #115069 max table size ----
+# The max_table_size_rows / max_table_size_bytes_compressed /
+# max_table_size_bytes_uncompressed campaign lives in its own pool file rather
+# than here, because this file is read by DEFAULT and those settings DO change
+# what a SELECT returns, which the WARNING above rules out. Run it with
+#
+#   --table-settings-file=clickhouse_max_table_size_settings.txt
+#   --modify-table-setting=20 --reset-table-setting=10

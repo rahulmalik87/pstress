@@ -257,6 +257,11 @@ struct Option {
     CH_DROP_PROJECTION,
     CH_MODIFY_PROJECTION,
     CH_MATERIALIZE_PROJECTION,
+    /* ClickHouse table settings changed while the run is going: MODIFY sets an
+       alterable pool entry to a fresh value, RESET takes the override away
+       again. See the alter: prefix in the table settings pool file. */
+    CH_MODIFY_TABLE_SETTING,
+    CH_RESET_TABLE_SETTING,
     CH_SOCKET_TIMEOUT,
     MAX
   } option;

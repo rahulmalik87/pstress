@@ -1152,14 +1152,47 @@ void add_options() {
   opt->short_help = "MaterializeProjection";
   opt->setDDL();
 
+  /* ClickHouse table settings changed while the run is going. The pool file
+     decides what may be altered: only its alter: lines are candidates, because
+     a MergeTree setting can be read only after create and nothing in
+     system.merge_tree_settings says which ones are. */
+  opt = newOption(Option::INT, Option::CH_MODIFY_TABLE_SETTING,
+                  "modify-table-setting");
+  opt->help = "ALTER TABLE t MODIFY SETTING <name> = <value> on a random "
+              "table, with the name and the value taken from the alter: lines "
+              "of --table-settings-file. The new value replaces the one the "
+              "table was created with, so a later DROP/CREATE and the next "
+              "step recreate the table with it. Needs at least one alter: "
+              "line in the pool.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "ModifySetting";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_RESET_TABLE_SETTING,
+                  "reset-table-setting");
+  opt->help = "ALTER TABLE t RESET SETTING <name> — take away an override the "
+              "table currently carries and go back to the server default. "
+              "Only names from the alter: lines of --table-settings-file are "
+              "reset, and only when the table has one set, so this does "
+              "nothing until --modify-table-setting or a roll at CREATE TABLE "
+              "has put one there.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "ResetSetting";
+  opt->setDDL();
+
   /* Per-table ClickHouse MergeTree settings */
   opt = newOption(Option::STRING, Option::CH_TABLE_SETTINGS_FILE,
                   "table-settings-file");
   opt->help = "File with the pool of ClickHouse table settings, one per line as "
-              "[session:][<prob>:]<name> = <v1>|<v2> or int:<lo>..<hi>. Each "
-              "table rolls every line against its probability, so prob 100 "
-              "puts a setting on every table and prob 5 on about one in "
+              "[session:|alter:][<prob>:]<name> = <v1>|<v2> or int:<lo>..<hi>. "
+              "Each table rolls every line against its probability, so prob "
+              "100 puts a setting on every table and prob 5 on about one in "
               "twenty. session: lines are applied as SET on each connection. "
+              "alter: lines are also rolled onto CREATE TABLE and, on top of "
+              "that, are the pool --modify-table-setting and "
+              "--reset-table-setting pick from at run time. "
               "Looked up next to the pstress binary. Missing default file is "
               "not an error; a missing file named on the command line is.";
   opt->setString("clickhouse_table_settings.txt");

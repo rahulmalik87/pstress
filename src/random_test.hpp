@@ -502,6 +502,11 @@ struct Table {
   void DropProjection(Thd1 *thd);
   void ModifyProjection(Thd1 *thd);
   void MaterializeProjection(Thd1 *thd);
+  /* ALTER TABLE ... MODIFY SETTING / RESET SETTING one of the settings the pool
+     marked alterable, keeping Table::settings in step so a later DROP/CREATE
+     and the next step rebuild the table the way it is now. */
+  void ModifyTableSetting(Thd1 *thd);
+  void ResetTableSetting(Thd1 *thd);
 #endif
   mutable std::shared_mutex table_mutex;
   void lock_table_mutex(bool ddl_query) const {
@@ -884,11 +889,13 @@ extern std::atomic<long> g_compare_setting_failed;
 #endif
 
 /* One line of the ClickHouse settings pool file:
-     [session:][<prob>:]<name> = <v1>|<v2>|<v3>
-     [session:][<prob>:]<name> = int:<lo>..<hi>
+     [session:|alter:][<prob>:]<name> = <v1>|<v2>|<v3>
+     [session:|alter:][<prob>:]<name> = int:<lo>..<hi>
    Table entries stay in g_table_settings and are rolled independently for
    every table in pick_table_settings(). Session entries are rolled once at
-   startup and land in g_session_settings as ready-to-run "name = value". */
+   startup and land in g_session_settings as ready-to-run "name = value".
+   An alter: entry is a table entry as well, and additionally goes into
+   g_alterable_table_settings for --modify-table-setting to pick from. */
 struct SettingSpec {
   std::string name;
   std::vector<std::string> values;
@@ -896,6 +903,8 @@ struct SettingSpec {
   long int lo = 0;
   long int hi = 0;
   int prob = 100;
+  /* the pool said this one may also be changed by ALTER TABLE MODIFY SETTING */
+  bool alterable = false;
 };
 #ifdef USE_CLICKHOUSE
 /* Resolve --engine into the ENGINE clause of a CREATE TABLE: a MergeTree family
@@ -963,10 +972,24 @@ size_t mv_count_for_table(const std::string &table_name);
 
 extern std::vector<SettingSpec> g_table_settings;
 extern std::vector<std::string> g_session_settings;
+/* the alter: subset of g_table_settings, in the same order. Copies rather than
+   pointers so a spec stays valid however g_table_settings is later touched. */
+extern std::vector<SettingSpec> g_alterable_table_settings;
 /* --table-settings, normalized once and used for every table */
 extern std::string g_fixed_table_settings;
 void load_table_settings_pool();
 std::string pick_table_settings();
+/* Helpers over the flat "name = value, name = value" clause a table carries in
+   Table::settings, used by the MODIFY/RESET SETTING actions. upsert replaces
+   the value of a setting already there and appends it otherwise; erase drops it
+   if present; names lists what the clause currently sets. */
+void ch_settings_upsert(std::string &clause, const std::string &name,
+                        const std::string &value);
+void ch_settings_erase(std::string &clause, const std::string &name);
+std::vector<std::string> ch_settings_names(const std::string &clause);
+/* One alterable setting with a fresh value for it, or false when the pool has
+   no alter: entry at all. */
+bool ch_roll_alterable_setting(std::string &name, std::string &value);
 
 std::vector<std::string> random_strs_generator();
 std::vector<long int> generateUniqueRandomNumbers(long int number_of_records);

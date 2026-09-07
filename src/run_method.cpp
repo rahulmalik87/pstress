@@ -805,6 +805,12 @@ bool Thd1::run_some_query() {
     case Option::CH_MATERIALIZE_PROJECTION:
       table->MaterializeProjection(this);
       break;
+    case Option::CH_MODIFY_TABLE_SETTING:
+      table->ModifyTableSetting(this);
+      break;
+    case Option::CH_RESET_TABLE_SETTING:
+      table->ResetTableSetting(this);
+      break;
 #endif
     case Option::OPTIMIZE:
       table->Optimize(this);
