@@ -67,6 +67,21 @@ static std::string now_str() {
   return oss.str();
 }
 
+/* Appended to every query these checks run.
+
+   Replica verification exists to catch replication divergence, and the
+   materialized view check exists to catch a view falling behind its source. A
+   projection can answer count() and other aggregates, so leaving the optimizer
+   free to use one turns both checks into checks of the projection instead: a
+   stale projection reads as a data mismatch, and — worse — a projection bug that
+   is identical on both replicas makes both wrong in the same way and the
+   comparison reports OK. These checks are about the base table, so pin the
+   optimizer away from projections. use_query_cache is off for the same reason
+   it always was. */
+static const char *const CH_VERIFY_SETTINGS =
+    " SETTINGS use_query_cache = 0, optimize_use_projections = 0,"
+    " optimize_use_implicit_projections = 0";
+
 /* Core verification: compare count+checksum on all replicas for every table. */
 static bool do_verify(std::vector<std::unique_ptr<clickhouse::Client>> &clients,
                       const std::string &db) {
@@ -89,11 +104,12 @@ static bool do_verify(std::vector<std::unique_ptr<clickhouse::Client>> &clients,
 
   bool all_ok = true;
   for (const auto &tname : table_names) {
-    std::string cnt_sql  = "SELECT count() FROM " + tname;
+    std::string cnt_sql =
+        "SELECT count() FROM " + tname + CH_VERIFY_SETTINGS;
     /* toString(tuple(*)) serialises every column including NULLs to a String,
        so cityHash64(String) always returns UInt64 (never Nullable). */
     std::string csum_sql = "SELECT sum(cityHash64(toString(tuple(*)))) FROM " +
-                           tname + " SETTINGS use_query_cache=0";
+                           tname + CH_VERIFY_SETTINGS;
 
     std::vector<std::string> counts, checksums;
     bool ok = true;
@@ -221,7 +237,7 @@ static std::string mv_diff_rows(const std::string &view, const std::string &src,
       "      SELECT " + row + " AS r, 0 AS in_view, 1 AS in_src FROM " + src +
       "    ) GROUP BY r HAVING delta != 0 ORDER BY r LIMIT 20"
       "  )"
-      ") SETTINGS use_query_cache = 0");
+      ")" + CH_VERIFY_SETTINGS);
 }
 
 void ch_report_mv_check(
@@ -264,7 +280,7 @@ void ch_report_mv_check(
     const std::string missing = query_one(
         "SELECT count() FROM (SELECT " + row + " AS r FROM " + mv.src_table +
         ") WHERE r NOT IN (SELECT " + row + " FROM " + view +
-        ") SETTINGS use_query_cache = 0");
+        ")" + CH_VERIFY_SETTINGS);
     if (missing.empty()) {
       g_mv_inconclusive++;
       print_and_log("  MV " + label + ": could not be checked, query failed",
@@ -291,15 +307,15 @@ void ch_report_mv_check(
   const std::string csum = "sum(cityHash64(toString(tuple(" + cols + "))))";
   const std::string cnt_src =
       query_one("SELECT count() FROM " + mv.src_table +
-                " SETTINGS use_query_cache = 0");
+                CH_VERIFY_SETTINGS);
   const std::string cnt_view =
-      query_one("SELECT count() FROM " + view + " SETTINGS use_query_cache = 0");
+      query_one("SELECT count() FROM " + view + CH_VERIFY_SETTINGS);
   const std::string csum_src =
       query_one("SELECT " + csum + " FROM " + mv.src_table +
-                " SETTINGS use_query_cache = 0");
+                CH_VERIFY_SETTINGS);
   const std::string csum_view =
       query_one("SELECT " + csum + " FROM " + view +
-                " SETTINGS use_query_cache = 0");
+                CH_VERIFY_SETTINGS);
 
   if (cnt_src.empty() || cnt_view.empty() || csum_src.empty() ||
       csum_view.empty()) {

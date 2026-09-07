@@ -793,6 +793,18 @@ bool Thd1::run_some_query() {
         table->DropMaterializedView(this);
       }
       break;
+    case Option::CH_ADD_PROJECTION:
+      table->AddProjection(this);
+      break;
+    case Option::CH_DROP_PROJECTION:
+      table->DropProjection(this);
+      break;
+    case Option::CH_MODIFY_PROJECTION:
+      table->ModifyProjection(this);
+      break;
+    case Option::CH_MATERIALIZE_PROJECTION:
+      table->MaterializeProjection(this);
+      break;
 #endif
     case Option::OPTIMIZE:
       table->Optimize(this);

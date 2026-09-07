@@ -77,6 +77,10 @@ std::string add_ignore_clause();
 struct Thd1;
 
 struct Table;
+#ifdef USE_CLICKHOUSE
+/* defined further down, next to MVInfo; Table only holds pointers to it */
+struct Projection;
+#endif
 struct Column {
 public:
   enum COLUMN_TYPES {
@@ -480,6 +484,25 @@ struct Table {
   // std::string data_directory; todo add corressponding code
   std::vector<Column *> *columns_;
   std::vector<Index *> *indexes_;
+#ifdef USE_CLICKHOUSE
+  /* Projections live on the table, not in a global registry like MVInfo: a
+     projection is a clause inside the table's own DDL and dies with the table.
+     Guarded by table_mutex, exactly like indexes_. */
+  std::vector<Projection *> *projections_;
+  /* a random projection over this table, or nullptr when it has no column a
+     projection can be built from. Caller must hold table_mutex. */
+  Projection *MakeRandomProjection();
+  /* Drop every projection that names this column, before an ALTER ClickHouse
+     would otherwise reject. Caller must hold table_mutex; false when a drop
+     failed, so the caller can leave the column alone. */
+  bool DropProjectionsOnColumn(Thd1 *thd, const std::string &column);
+  /* forget them all, for when the table itself is recreated */
+  void ForgetProjections();
+  void AddProjection(Thd1 *thd);
+  void DropProjection(Thd1 *thd);
+  void ModifyProjection(Thd1 *thd);
+  void MaterializeProjection(Thd1 *thd);
+#endif
   mutable std::shared_mutex table_mutex;
   void lock_table_mutex(bool ddl_query) const {
     /* if option no ddl then do not lock mutex */
@@ -900,6 +923,25 @@ struct MVInfo {
      must not fail the run. */
   bool populate_atomically = true;
 };
+/* One projection pstress put on a table.
+
+   body is the exact text pstress emitted between the parentheses, kept verbatim
+   because ALTER TABLE ... MODIFY PROJECTION requires the whole definition to be
+   restated and rejects anything whose query body formats differently. Replaying
+   our own text is the only way to be sure it round trips.
+
+   columns is every column the body names, so a DROP or RENAME COLUMN can drop
+   the projections that would otherwise make the ALTER fail. */
+struct Projection {
+  std::string name;
+  std::string body; /* "SELECT i1, v2 ORDER BY (i1, v2)" */
+  std::vector<std::string> columns;
+};
+
+/* True when --add-projection is on, so Table::definition() knows to emit the
+   MergeTree settings a projection needs. Set once in sum_of_all_options(). */
+extern bool g_projections_enabled;
+
 extern std::vector<MVInfo> g_materialized_views;
 extern std::mutex g_materialized_views_mutex;
 /* Views are named mv_<source table>_<id> and their TO targets mvt_<same>, with

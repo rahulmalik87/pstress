@@ -12,6 +12,8 @@
 #endif
 #include <array>
 #include <deque>
+#include <functional>
+#include <map>
 #include <document.h>
 #include <filesystem>
 #include <iomanip>
@@ -22,6 +24,13 @@
 #include <unistd.h>
 
 extern thread_local std::mt19937 rng;
+
+#ifdef USE_CLICKHOUSE
+/* defined further down with the rest of the ClickHouse helpers, needed up here
+   by the option validation in sum_of_all_options() */
+static std::string to_upper(const std::string &s);
+static std::string ch_engine_base(const std::string &engine);
+#endif
 
 size_t number_of_records;
 
@@ -656,12 +665,71 @@ int sum_of_all_options(Thd1 *thd) {
                     "can only be checked for lost rows, not duplicated ones. "
                     "Use --engine=MergeTree for the exact check.");
   }
+
+  /* ---- projections ---- */
+  {
+    auto prob = [](Option::Opt o) { return options->at(o)->getInt(); };
+    /* only ADD creates one; the other two act on what it made */
+    g_projections_enabled = prob(Option::CH_ADD_PROJECTION) > 0;
+
+    if (!g_projections_enabled &&
+        (prob(Option::CH_MODIFY_PROJECTION) > 0 ||
+         prob(Option::CH_DROP_PROJECTION) > 0 ||
+         prob(Option::CH_MATERIALIZE_PROJECTION) > 0)) {
+      print_and_log("--modify-projection, --drop-projection and "
+                    "--materialize-projection need a projection to act on. "
+                    "Pass --add-projection=N, otherwise they would roll and do "
+                    "nothing and the run would look healthy while testing "
+                    "nothing.");
+      exit(EXIT_FAILURE);
+    }
+
+    if (g_projections_enabled) {
+      /* Projections only exist on the MergeTree family, and ch_resolve_engine
+         passes an engine it does not recognise through verbatim, so say so once
+         here instead of failing every CREATE TABLE. */
+      const std::string base_upper =
+          to_upper(ch_engine_base(options->at(Option::ENGINE)->getString()));
+      if (base_upper != "MERGETREE" && base_upper != "REPLACINGMERGETREE" &&
+          base_upper != "SUMMINGMERGETREE" &&
+          base_upper != "AGGREGATINGMERGETREE") {
+        print_and_log("--engine=" + options->at(Option::ENGINE)->getString() +
+                      " is not a MergeTree family engine pstress knows, so it "
+                      "cannot carry projections.");
+        exit(EXIT_FAILURE);
+      }
+
+      /* A projection index_granularity override needs the parent table to keep
+         adaptive granularity, so index_granularity_bytes = 0 in the pool would
+         turn every projection ALTER on that table into SUPPORT_IS_DISABLED. */
+      for (const auto &spec : g_table_settings)
+        if (spec.name == "index_granularity_bytes" &&
+            std::find(spec.values.begin(), spec.values.end(), "0") !=
+                spec.values.end()) {
+          print_and_log("index_granularity_bytes = 0 in the table settings pool "
+                        "makes every projection index_granularity override fail "
+                        "with SUPPORT_IS_DISABLED. Remove the 0 value.");
+          exit(EXIT_FAILURE);
+        }
+
+      if (prob(Option::CH_MODIFY_PROJECTION) > 0 &&
+          prob(Option::CH_DROP_PROJECTION) > prob(Option::CH_MODIFY_PROJECTION))
+        print_and_log("WARNING: --drop-projection is more likely than "
+                      "--modify-projection, so most MODIFYs will find their "
+                      "target already dropped.");
+    }
+  }
 #else
-  /* the create/drop view and kill mutation actions only exist in the
-     ClickHouse build */
+  /* the create/drop view, kill mutation and projection actions only exist in
+     the ClickHouse build. Every one of them has to be zeroed: an option with a
+     probability but no case in the dispatch switch aborts the run. */
   opt_int_set(CH_CREATE_MV, 0);
   opt_int_set(CH_DROP_MV, 0);
   opt_int_set(CH_KILL_MUTATION, 0);
+  opt_int_set(CH_ADD_PROJECTION, 0);
+  opt_int_set(CH_DROP_PROJECTION, 0);
+  opt_int_set(CH_MODIFY_PROJECTION, 0);
+  opt_int_set(CH_MATERIALIZE_PROJECTION, 0);
 #endif
 
   if (options->at(Option::ONLY_PARTITION)->getBool())
@@ -1001,7 +1069,13 @@ static std::vector<std::string> split_and_trim(const std::string &input,
    them, so the settings file is not allowed to override them */
 static bool is_reserved_setting(const std::string &name) {
   return name == "enable_block_number_column" ||
-         name == "enable_block_offset_column";
+         name == "enable_block_offset_column" ||
+         /* the three the projection workload owns; see Table::definition() on
+            why a probabilistic roll would make a run look healthy while
+            testing nothing */
+         name == "deduplicate_merge_projection_mode" ||
+         name == "lightweight_mutation_projection_mode" ||
+         name == "allow_nullable_key";
 }
 
 [[noreturn]] static void settings_file_error(const std::string &file,
@@ -2102,6 +2176,9 @@ void wait_till_sync(const std::string &name, Thd1 *thd) {
 Table::Table(std::string n) : name_(n), indexes_() {
   columns_ = new std::vector<Column *>;
   indexes_ = new std::vector<Index *>;
+#ifdef USE_CLICKHOUSE
+  projections_ = new std::vector<Projection *>;
+#endif
 }
 
 bool Table::load_secondary_indexes(Thd1 *thd) {
@@ -2207,6 +2284,16 @@ void Table::DropCreate(Thd1 *thd) {
     execute_sql("SET SESSION wsrep_osu_method=DEFAULT ", thd);
   }
   std::string def = definition(true, true, true);
+#ifdef USE_CLICKHOUSE
+  /* The projections went with the table and definition() does not re-emit
+     them, so drop them from the registry too; --add-projection makes new
+     ones. */
+  {
+    lock_table_mutex(thd->ddl_query);
+    ForgetProjections();
+    unlock_table_mutex();
+  }
+#endif
   if (!execute_sql(def, thd) && tablespace.size() > 0) {
     std::string tbs = " TABLESPACE=" + tablespace + "_rename";
 
@@ -2424,6 +2511,11 @@ Table::~Table() {
   }
   delete columns_;
   delete indexes_;
+#ifdef USE_CLICKHOUSE
+  for (auto proj : *projections_)
+    delete proj;
+  delete projections_;
+#endif
 }
 
 /* create default column */
@@ -2817,6 +2909,7 @@ Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
 
   table->CreateDefaultColumn();
   table->CreateDefaultIndex();
+
   if (type == FK) {
     static_cast<FK_table *>(table)->pickRefrence(table);
   }
@@ -2925,6 +3018,129 @@ bool ch_engine_collapses_rows(const std::string &engine) {
   const std::string base = to_upper(ch_engine_base(engine));
   return base != "MERGETREE";
 }
+
+bool g_projections_enabled = false;
+
+
+/* Columns a projection may put in its SELECT list.
+
+   JSON is out because pstress reads it back through randomized accessor
+   expressions rather than as a value, and BLOB/TEXT are out because wide values
+   make index_granularity_bytes rather than index_granularity the binding
+   constraint on granule size, which is exactly the signal the laziness oracle
+   reads out of system.projection_parts. GENERATED columns are already disabled
+   on the ClickHouse build; excluded here anyway so a future change cannot
+   silently start emitting them. */
+static bool ch_projection_usable(const Column *c) {
+  switch (c->type_) {
+  case Column::JSON:
+  case Column::BLOB:
+  case Column::TEXT:
+  case Column::GENERATED:
+    return false;
+  default:
+    return true;
+  }
+}
+
+/* Columns a projection may sort by. Same set: everything usable is orderable
+   once allow_nullable_key is on, which Table::definition() always emits when
+   projections are enabled. */
+static bool ch_projection_keyable(const Column *c) {
+  return ch_projection_usable(c);
+}
+
+/* Build a random projection over this table, or nullptr when the table has
+   nothing to build one from. Caller must hold table_mutex.
+
+   Never SELECT *: enable_block_number_column and enable_block_offset_column are
+   always on, so a star would drag _block_number and _block_offset into the
+   projection and make its contents depend on which part a row landed in. An
+   explicit list pins the projection's shape at creation, the same reason
+   CreateMaterializedView captures its column list by hand. */
+Projection *Table::MakeRandomProjection() {
+  std::vector<Column *> usable, keyable;
+  for (auto col : *columns_) {
+    if (ch_projection_usable(col))
+      usable.push_back(col);
+    if (ch_projection_keyable(col))
+      keyable.push_back(col);
+  }
+  if (usable.empty() || keyable.empty())
+    return nullptr;
+
+  /* The table's own ORDER BY is the primary key column, so a projection keyed on
+     it alone reorders nothing and the optimizer will never prefer it. Reroll
+     once; a table whose only keyable column is the pk gets no projection rather
+     than a useless one. */
+  std::vector<Column *> keys;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    keys.clear();
+    const int want = rand_int(std::min<size_t>(3, keyable.size()), 1);
+    std::vector<Column *> pool = keyable;
+    for (int i = 0; i < want && !pool.empty(); i++) {
+      const size_t pick = rand_int(pool.size() - 1);
+      keys.push_back(pool[pick]);
+      pool.erase(pool.begin() + pick);
+    }
+    if (!(keys.size() == 1 && keys[0]->primary_key))
+      break;
+  }
+  if (keys.size() == 1 && keys[0]->primary_key)
+    return nullptr;
+
+  auto *proj = new Projection();
+  /* A counter, so two threads can never pick the same name — a random suffix
+     collides often enough to be visible at this rate. The run's seed goes in
+     too: nothing about projections is persisted, so at --step >= 2 the counter
+     restarts at zero while the projections an earlier step created are still
+     on the server, and only the seed keeps the two apart. */
+  static std::atomic<unsigned long> next_id{0};
+  proj->name = "p_" + name_ + "_" +
+               std::to_string(options->at(Option::INITIAL_SEED)->getInt()) +
+               "_" + std::to_string(next_id++);
+
+  /* The select list is the keys plus a few more columns, so the projection is
+     worth reading from rather than just a differently sorted key. */
+  std::vector<Column *> selected = keys;
+  for (auto col : usable) {
+    if (selected.size() >= keys.size() + 4)
+      break;
+    if (std::find(selected.begin(), selected.end(), col) != selected.end())
+      continue;
+    if (rand_int(100) < 50)
+      selected.push_back(col);
+  }
+
+  std::string select_list;
+  for (auto col : selected) {
+    if (!select_list.empty())
+      select_list += ", ";
+    select_list += col->name_;
+    proj->columns.push_back(col->name_);
+  }
+
+  /* assumeNotNull() some of the time: it keeps expression keyed projections
+     covered, and it is the shape that still works on a server where
+     allow_nullable_key is unavailable. */
+  std::string order_list;
+  for (auto col : keys) {
+    const bool wrap = col->null_val && rand_int(100) < 20;
+    const std::string key =
+        wrap ? "assumeNotNull(" + col->name_ + ")" : col->name_;
+    if (!order_list.empty())
+      order_list += ", ";
+    order_list += key;
+    if (std::find(proj->columns.begin(), proj->columns.end(), col->name_) ==
+        proj->columns.end())
+      proj->columns.push_back(col->name_);
+  }
+
+  proj->body = "SELECT " + select_list + " ORDER BY " +
+               (keys.size() == 1 ? order_list : "(" + order_list + ")");
+  return proj;
+}
+
 #endif
 
 /* prepare table definition */
@@ -2994,6 +3210,7 @@ std::string Table::definition(bool with_index, bool with_fk,
     }
   }
 
+
   if (with_fk) {
     if (type == FK) {
       auto fk = static_cast<FK_table *>(this);
@@ -3062,6 +3279,28 @@ std::string Table::definition(bool with_index, bool with_fk,
     def += " ORDER BY (" + order_cols + ")"
            " SETTINGS enable_block_number_column = 1,"
            " enable_block_offset_column = 1";
+    if (g_projections_enabled) {
+      /* ReplacingMergeTree, which is pstress's default --engine, rejects a
+         projection outright under the default throw mode, and a lightweight
+         DELETE on a projected table fails the same way. rebuild is the only
+         mode that keeps the projection agreeing with the base table: drop makes
+         it vanish behind pstress's back and ignore leaves it stale, and either
+         would land as a replica checksum or projection oracle mismatch that is
+         not a bug.
+
+         Rolled here rather than in the settings pool on purpose. The pool rolls
+         per table against a probability, so some tables would reject every
+         projection statement and the run would look healthy while testing
+         nothing. */
+      def += ", deduplicate_merge_projection_mode = 'rebuild'";
+      def += ", lightweight_mutation_projection_mode = 'rebuild'";
+      /* --null-prob defaults to 1, so every column but the primary key is
+         Nullable. Without this a projection could only ever sort by the primary
+         key, which is the table's own ORDER BY, and would be a projection the
+         optimizer never prefers. The table's own ORDER BY never uses a nullable
+         column, so nothing else changes. */
+      def += ", allow_nullable_key = 1";
+    }
     /* per-table settings from --table-settings-file / --table-settings */
     if (!settings.empty())
       def += ", " + settings;
@@ -3609,6 +3848,11 @@ void Table::DropColumn(Thd1 *thd) {
     unlock_table_mutex();
     return;
   }
+  /* a projection over this column would make the DROP fail outright */
+  if (!DropProjectionsOnColumn(thd, name)) {
+    unlock_table_mutex();
+    return;
+  }
 #endif
 
   std::string sql = "ALTER TABLE " + name_ + " DROP COLUMN " + name;
@@ -4031,6 +4275,17 @@ void Table::ColumnRename(Thd1 *thd) {
     new_name = name.substr(0, name.length() - s);
   else
     new_name = name + new_name;
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse rejects a rename of a column a projection references. Drop those
+     projections rather than rewriting the stored body text: the body is kept
+     verbatim so MODIFY PROJECTION can restate it byte for byte, and a textual
+     substitution would have to reproduce ClickHouse's own formatting exactly.
+     --add-projection makes fresh ones over the renamed column. */
+  if (!DropProjectionsOnColumn(thd, name)) {
+    unlock_table_mutex();
+    return;
+  }
+#endif
   std::string sql =
       "ALTER TABLE " + name_ + " RENAME COLUMN " + name + " To " + new_name;
   sql += pick_algorithm_lock();
@@ -4639,6 +4894,174 @@ void Table::DropMaterializedView(Thd1 *thd) {
   if (!mv.target.empty())
     execute_sql("DROP TABLE IF EXISTS " + mv.target, thd);
 }
+
+/* ---------------------------------------------------------------------------
+   Projections. ClickHouse PR 113343 added ALTER TABLE ... MODIFY PROJECTION,
+   a metadata only alter that changes a projection's settings and leaves every
+   existing part alone. Three actions put it under load: ADD to create one,
+   MODIFY to change its settings, DROP to take it away again.
+
+   MODIFY restates the whole definition and rejects anything whose query body
+   formats differently, which is the only reason Projection::body exists: the
+   text pstress emitted has to be replayed verbatim.
+   ------------------------------------------------------------------------- */
+
+/* the server caps projections per table at max_projections = 25 */
+static const size_t CH_MAX_PROJECTIONS_PER_TABLE = 5;
+
+/* Only index_granularity is rolled. It is on ClickHouse's allow list for
+   projection settings in every version that has the feature, so there is no
+   need to probe the server for what it accepts. */
+static std::string ch_roll_projection_granularity() {
+  static const char *const values[] = {"512", "1024", "4096", "8192", "16384"};
+  return values[rand_int(4)];
+}
+
+/* ALTER TABLE t ADD PROJECTION p (SELECT ... ORDER BY ...) WITH SETTINGS (...) */
+void Table::AddProjection(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  if (projections_->size() >= CH_MAX_PROJECTIONS_PER_TABLE) {
+    unlock_table_mutex();
+    return;
+  }
+  Projection *proj = MakeRandomProjection();
+  if (proj == nullptr) {
+    unlock_table_mutex();
+    return;
+  }
+  const std::string sql = "ALTER TABLE " + name_ + " ADD PROJECTION " +
+                          proj->name + " (" + proj->body +
+                          ") WITH SETTINGS (index_granularity = " +
+                          ch_roll_projection_granularity() + ")";
+  unlock_table_mutex();
+
+  /* Shared dml_mutex so a DROP COLUMN, which takes it exclusively, cannot
+     remove one of the projection's columns between building the statement and
+     running it. */
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
+  if (!execute_sql(sql, thd)) {
+    delete proj;
+    return;
+  }
+
+  lock_table_mutex(thd->ddl_query);
+  projections_->push_back(proj);
+  unlock_table_mutex();
+}
+
+/* Copy out one of this table's projections. Returns false when it has none.
+   A copy rather than the pointer, because a concurrent DropProjection deletes
+   it the moment the table lock is released. */
+static bool ch_pick_projection(Table *table, Thd1 *thd, Projection *out) {
+  table->lock_table_mutex(thd->ddl_query);
+  if (table->projections_->empty()) {
+    table->unlock_table_mutex();
+    return false;
+  }
+  *out = *table->projections_->at(rand_int(table->projections_->size() - 1));
+  table->unlock_table_mutex();
+  return true;
+}
+
+void Table::DropProjection(Thd1 *thd) {
+  Projection picked;
+  if (!ch_pick_projection(this, thd, &picked))
+    return;
+
+  if (!execute_sql("ALTER TABLE " + name_ + " DROP PROJECTION IF EXISTS " +
+                       picked.name,
+                   thd))
+    return;
+
+  lock_table_mutex(thd->ddl_query);
+  for (auto it = projections_->begin(); it != projections_->end(); it++)
+    if ((*it)->name == picked.name) {
+      delete *it;
+      projections_->erase(it);
+      break;
+    }
+  unlock_table_mutex();
+}
+
+/* ALTER TABLE t MODIFY PROJECTION p (<the stored body>) WITH SETTINGS (...)
+   — ClickHouse PR 113343.
+
+   Deliberately no mutations_sync: this is a metadata alter, never a mutation,
+   so there is nothing to wait for. */
+void Table::ModifyProjection(Thd1 *thd) {
+  Projection picked;
+  if (!ch_pick_projection(this, thd, &picked))
+    return;
+
+  std::string sql = "ALTER TABLE " + name_ + " MODIFY PROJECTION ";
+  /* IF EXISTS some of the time: racing --drop-projection is how the "already
+     gone" path gets exercised without being an error. */
+  if (rand_int(100) < 30)
+    sql += "IF EXISTS ";
+  sql += picked.name + " (" + picked.body +
+         ") WITH SETTINGS (index_granularity = " +
+         ch_roll_projection_granularity() + ")";
+
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
+  execute_sql(sql, thd);
+}
+
+/* ALTER TABLE t MATERIALIZE PROJECTION p — rebuild the projection on the parts
+   that do not carry it yet, which after an ADD is all of them.
+
+   A mutation, unlike MODIFY PROJECTION, so it takes mutations_sync. IF EXISTS
+   because --drop-projection may have removed it between the pick and here. */
+void Table::MaterializeProjection(Thd1 *thd) {
+  Projection picked;
+  if (!ch_pick_projection(this, thd, &picked))
+    return;
+
+  std::string sql = "ALTER TABLE " + name_ +
+                    " MATERIALIZE PROJECTION IF EXISTS " + picked.name;
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+  execute_sql(sql, thd);
+}
+
+/* Drop every projection that names this column, before an ALTER that would
+   otherwise be rejected.
+
+   ClickHouse refuses to rename a column a projection references, and refuses to
+   drop one the projection could not be rebuilt without. Without this pre-pass
+   --drop-column and --rename-column would become silent permanent no-ops on
+   every projected table. Caller must hold table_mutex; returns false when a
+   drop failed, so the caller can leave the column alone rather than leave the
+   registry disagreeing with the server. */
+bool Table::DropProjectionsOnColumn(Thd1 *thd, const std::string &column) {
+  std::vector<std::string> doomed;
+  for (const auto *proj : *projections_)
+    if (std::find(proj->columns.begin(), proj->columns.end(), column) !=
+        proj->columns.end())
+      doomed.push_back(proj->name);
+
+  for (const auto &name : doomed) {
+    if (!execute_sql("ALTER TABLE " + name_ + " DROP PROJECTION IF EXISTS " +
+                         name,
+                     thd))
+      return false;
+    for (auto it = projections_->begin(); it != projections_->end(); it++)
+      if ((*it)->name == name) {
+        delete *it;
+        projections_->erase(it);
+        break;
+      }
+  }
+  return true;
+}
+
+/* Forget every projection on this table. Called when the table itself is
+   dropped and recreated, which takes its projections with it. */
+void Table::ForgetProjections() {
+  for (auto *proj : *projections_)
+    delete proj;
+  projections_->clear();
+}
+
 #else
 void Table::AlterTableUpdate(Thd1 *) {}
 void Table::AlterTableDelete(Thd1 *) {}
@@ -5019,6 +5442,7 @@ bool Thd1::load_metadata() {
   std::call_once(mv_prepare_once, [this]() {
     ch_prepare_materialized_views(this);
   });
+
 #endif
 
   if (options->at(Option::SECONDARY_ENGINE)->getString() != "") {

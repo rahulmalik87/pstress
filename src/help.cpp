@@ -582,7 +582,7 @@ void add_options() {
   opt = newOption(Option::INT, Option::NULL_PROB, "null-prob");
   opt->help = "Probability that a column would have null value. It is used for "
               "insert, update, delete and also in where clause";
-  opt->setInt(1);
+  opt->setInt(0);
 
   opt = newOption(Option::FLOAT, Option::UNIQUE_RANGE, "range");
   opt->help = "Sets the range for random number generation (integers, floats, "
@@ -1103,6 +1103,55 @@ void add_options() {
   opt->setBool(false);
   opt->setArgs(no_argument);
 
+  /* ClickHouse projections. PR 113343 added ALTER TABLE ... MODIFY PROJECTION,
+     a metadata only alter whose new settings apply lazily through later inserts
+     and merges. Exercising it needs a projection to exist first, so --add- and
+     --drop-projection are here too. */
+  opt = newOption(Option::INT, Option::CH_ADD_PROJECTION, "add-projection");
+  opt->help = "ALTER TABLE t ADD PROJECTION p (SELECT ... ORDER BY ...) WITH "
+              "SETTINGS (index_granularity = N) on a random table. Up to 5 per "
+              "table. Also switches on the MergeTree settings a projection "
+              "needs: without deduplicate_merge_projection_mode = rebuild a "
+              "ReplacingMergeTree refuses projections outright, and without "
+              "lightweight_mutation_projection_mode = rebuild a lightweight "
+              "DELETE on a projected table fails.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "AddProjection";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_DROP_PROJECTION, "drop-projection");
+  opt->help = "ALTER TABLE t DROP PROJECTION p. Keep this below "
+              "--modify-projection or most MODIFYs will find their target "
+              "already gone.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "DropProjection";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_MODIFY_PROJECTION,
+                  "modify-projection");
+  opt->help = "ALTER TABLE t MODIFY PROJECTION p (<the same body>) WITH "
+              "SETTINGS (index_granularity = N) — ClickHouse PR 113343. "
+              "Restates the stored definition verbatim and changes only the "
+              "settings, which is the one thing the statement allows. Needs "
+              "--add-projection to have something to act on.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "ModifyProjection";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_MATERIALIZE_PROJECTION,
+                  "materialize-projection");
+  opt->help = "ALTER TABLE t MATERIALIZE PROJECTION p — rebuilds the "
+              "projection on parts that do not have it yet. Unlike MODIFY this "
+              "is a mutation, so it honours --ch-mutations-sync and can be "
+              "cancelled mid-flight by --ch-kill-mutation.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "MaterializeProjection";
+  opt->setDDL();
+
   /* Per-table ClickHouse MergeTree settings */
   opt = newOption(Option::STRING, Option::CH_TABLE_SETTINGS_FILE,
                   "table-settings-file");
@@ -1168,7 +1217,7 @@ void add_options() {
               "clear of legitimately slow queries: a synchronous mutation on a "
               "busy service can take 20+ minutes. 0 waits forever, which is how "
               "a finished run can hang until it is killed.";
-  opt->setInt(1800);
+  opt->setInt(600);
 
   /* Drop column */
   opt = newOption(Option::INT, Option::DROP_COLUMN, "drop-column");

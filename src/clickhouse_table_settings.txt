@@ -57,6 +57,7 @@
 # rather than silently leaving the feature untested.
 #
 # session:allow_experimental_<feature> = 1
+session:select_sequential_consistency = 1
 # 100:<feature_setting> = 1
 
 # ---- exclusive experiment: PR #111834 adaptive codec selection ----
@@ -66,4 +67,16 @@
 # the server-config allow_feature_tier, not by an allow_experimental_* session
 # flag. Merge/mutation only, so the run needs --optimize and --ch-alter-update
 # pressure to exercise it at all. Observe with mergeTreeCodecBlockCounts().
-100:allow_experimental_adaptive_codec_selection     = 1
+#
+# Left commented out because it is an exclusive experiment for a DIFFERENT PR,
+# and at prob 100 an unknown name aborts the run — which is the point, but it
+# means whichever spelling is written here breaks every run on the servers that
+# use the other one. The setting was renamed when the feature graduated out of
+# the allow_experimental_* naming (it is still Experimental *tier*, so it stays
+# gated by the server-config allow_feature_tier, not by a session flag):
+#
+#   ClickHouse <= 26.8   100:allow_experimental_adaptive_codec_selection = 1
+#   ClickHouse >= 26.9   100:enable_adaptive_codec_selection             = 1
+#
+# Uncomment the line matching the server under test when running that campaign.
+# 100:enable_adaptive_codec_selection               = 1

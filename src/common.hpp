@@ -251,6 +251,12 @@ struct Option {
     CH_MV_TO_PROB,
     CH_VERIFY_MV_BEFORE_DROP,
     CH_VERIFY_MV,
+    /* ClickHouse projections: ADD to create one, MODIFY to change its
+       settings (ClickHouse PR 113343), DROP to take it away again. */
+    CH_ADD_PROJECTION,
+    CH_DROP_PROJECTION,
+    CH_MODIFY_PROJECTION,
+    CH_MATERIALIZE_PROJECTION,
     CH_SOCKET_TIMEOUT,
     MAX
   } option;
