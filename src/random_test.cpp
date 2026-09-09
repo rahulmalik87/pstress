@@ -1600,8 +1600,20 @@ static std::string rand_timezone() {
 }
 static std::string rand_date() {
   std::ostringstream out;
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse Date range is 1970-01-01 .. 2149-06-06. Out-of-range values are
+     silently clamped to the boundary (date_time_overflow_behavior defaults to
+     "ignore"), so a 1000..9999 year range makes ~99% of generated dates land
+     on 2149-06-06. That collapses the column to a single value: every
+     "WHERE dt = <date>" predicate then matches the whole table and each
+     lightweight UPDATE becomes a full-table patch part. Stay in range. */
+  int year = rand_int(2149, 1970);
+  int month = (year == 2149) ? rand_int(6, 1) : rand_int(12, 1);
+#else
+  /* MySQL DATE range is 1000-01-01 .. 9999-12-31. */
   int year = rand_int(9999, 1000); // Year from 1000 to 9999
   int month = rand_int(12, 1);     // Month from 1 to 12
+#endif
   int max_day = 28;                // Default to 28 for February
   if (month == 4 || month == 6 || month == 9 || month == 11) {
     max_day = 30; // April, June, September, November
@@ -1610,6 +1622,11 @@ static std::string rand_date() {
   } else if (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
     max_day = 29; // Leap year February
   }
+#ifdef USE_CLICKHOUSE
+  if (year == 2149 && month == 6) {
+    max_day = 6; // Date tops out at 2149-06-06
+  }
+#endif
   int day = rand_int(max_day, 1); // Day based on month and leap year
   out << std::setfill('0') << std::setw(4) << year << "-" << std::setw(2)
       << month << "-" << std::setw(2) << day;
@@ -1618,8 +1635,16 @@ static std::string rand_date() {
 
 static std::string rand_datetime() {
   std::ostringstream out;
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse DateTime range is 1970-01-01 00:00:00 .. 2106-02-07 06:28:15
+     (UTC). Same clamping problem as rand_date() -- see the comment there. */
+  int year = rand_int(2106, 1970);
+  int month = (year == 2106) ? rand_int(2, 1) : rand_int(12, 1);
+#else
+  /* MySQL DATETIME range is 1000-01-01 .. 9999-12-31. */
   int year = rand_int(9999, 1000); // Year from 1000 to 9999
   int month = rand_int(12, 1);     // Month from 1 to 12
+#endif
   int max_day = 28;                // Default to 28 for February
   if (month == 4 || month == 6 || month == 9 || month == 11) {
     max_day = 30; // April, June, September, November
@@ -1628,10 +1653,26 @@ static std::string rand_datetime() {
   } else if (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
     max_day = 29; // Leap year February
   }
+#ifdef USE_CLICKHOUSE
+  if (year == 2106 && month == 2) {
+    max_day = 7; // DateTime tops out on 2106-02-07
+  }
+#endif
   int day = rand_int(max_day, 1); // Day based on month and leap year
   int hour = rand_int(23, 0);     // Hour from 0 to 23
   int minute = rand_int(59, 0);   // Minute from 0 to 59
   int second = rand_int(59, 0);   // Second from 0 to 59
+#ifdef USE_CLICKHOUSE
+  if (year == 2106 && month == 2 && day == 7) {
+    hour = rand_int(6, 0); // DateTime tops out at 2106-02-07 06:28:15
+    if (hour == 6) {
+      minute = rand_int(28, 0);
+      if (minute == 28) {
+        second = rand_int(15, 0);
+      }
+    }
+  }
+#endif
 
   out << std::setfill('0') << std::setw(4) << year << "-" << std::setw(2)
       << month << "-" << std::setw(2) << day << " " << std::setw(2) << hour
@@ -3406,7 +3447,7 @@ std::string Table::definition(bool with_index, bool with_fk,
     }
     if (order_cols.empty())
       order_cols = columns_->at(0)->name_;
-    def += " ORDER BY (" + order_cols + ")"
+    def += " ORDER BY " + order_cols + ""
            " SETTINGS enable_block_number_column = 1,"
            " enable_block_offset_column = 1";
     if (g_projections_enabled) {
