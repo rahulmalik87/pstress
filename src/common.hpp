@@ -263,6 +263,15 @@ struct Option {
     CH_MODIFY_TABLE_SETTING,
     CH_RESET_TABLE_SETTING,
     CH_SOCKET_TIMEOUT,
+    /* Sequential primary keys: an INSERT takes its key from a per-table
+       increasing counter instead of a random value, and predicates aim inside
+       the range of keys handed out so far. On ClickHouse the primary key is the
+       table's ORDER BY prefix, so this is what makes new parts append-only
+       instead of each one spanning the whole key range. */
+    SEQ_PK,
+    SEQ_PK_RECENT_PROB,
+    SEQ_PK_RECENT_ROWS,
+    SEQ_PK_DUP_PROB,
     MAX
   } option;
 

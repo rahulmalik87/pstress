@@ -6,7 +6,7 @@
 #endif
 extern std::mutex all_table_mutex;
 extern std::vector<Table *> *all_tables;
-extern int number_of_records;
+extern size_t number_of_records;
 extern std::atomic<bool> run_query_failed;
 using namespace rapidjson;
 
@@ -61,7 +61,13 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
 
   thd->unique_keys.clear();
 
-  if (has_pk()) {
+  /* A sequential key needs no random set: the block reserved below is unique
+     by construction and already ascending. This also skips building an
+     unordered_set of every key and sorting it, which at --records=12M is the
+     most expensive thing the initial load does. thd->unique_keys is left
+     empty on purpose -- the FK parent pool falls back to iota(1..N), which is
+     exactly the parent's sequential key set. */
+  if (has_pk() && !use_sequential_pk()) {
     bool is_auto_increment = false;
     if (has_int_pk()) {
       for (const auto &col : *columns_) {
@@ -149,6 +155,11 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   malloc_trim(0);
 #endif
 
+  /* One reservation for the whole load, after the FK path above may have
+     shrunk the record count. */
+  const long int pk_base =
+      use_sequential_pk() ? reserve_pk_block(number_of_initial_records) : -1;
+
   std::string prepare_sql = "INSERT ";
   prepare_sql += "INTO " + name_ + " (";
 
@@ -165,7 +176,7 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   std::string values = " VALUES";
   unsigned int records = 0;
 
-  std::vector<int> pk_insert;
+  std::vector<std::string> pk_insert;
 
   while (records < number_of_initial_records) {
     std::string value = "(";
@@ -178,10 +189,15 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
               fk_parent_unique_keys.size() - 1)]);
       } else if (column->type_ == Column::COLUMN_TYPES::GENERATED) {
         value += "DEFAULT";
+      } else if (column->primary_key && pk_base >= 0) {
+        auto pk_val = pk_literal(pk_base + records, column);
+        value += pk_val;
+        if (options->at(Option::LOG_PK_BULK_INSERT)->getBool())
+          pk_insert.push_back(pk_val);
       } else if (column->primary_key and thd->unique_keys.size() > 0) {
         value += std::to_string(thd->unique_keys.at(records));
         if (options->at(Option::LOG_PK_BULK_INSERT)->getBool())
-          pk_insert.push_back(thd->unique_keys.at(records));
+          pk_insert.push_back(std::to_string(thd->unique_keys.at(records)));
 
       } else if (column->auto_increment == true) {
         value += "NULL";
@@ -208,6 +224,7 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
       }
       values = " VALUES";
       log_pk_insert(thd, name_, pk_insert);
+      pk_insert.clear();
     } else {
       values += ", ";
     }
@@ -223,7 +240,7 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   return true;
 }
 
-std::string Table::ColumnValues(Thd1 *thd, int value_count) {
+std::string Table::ColumnValues(Thd1 *thd, int value_count, bool fresh_pk) {
   std::string cols = "(";
   for (auto &column : *columns_) {
     cols += column->name_ + ", ";
@@ -238,6 +255,13 @@ std::string Table::ColumnValues(Thd1 *thd, int value_count) {
   std::vector<std::string> pk_insert;
   if (value_count != 1)
     pk_insert.reserve(value_count);
+  /* One fetch_add for the whole statement, so the rows of a bulk INSERT carry
+     consecutive ascending keys and land as one narrow part -- the shape this
+     option exists to produce. -1 means the key is not ours to hand out and the
+     column falls through to rand_value() like any other. */
+  const long int pk_base =
+      (fresh_pk && use_sequential_pk()) ? reserve_pk_block(value_count) : -1;
+  const int dup_prob = options->at(Option::SEQ_PK_DUP_PROB)->getInt();
   std::string vals;
   for (int i = 0; i < value_count; i++) {
     vals += "(";
@@ -246,7 +270,23 @@ std::string Table::ColumnValues(Thd1 *thd, int value_count) {
         vals += "DEFAULT, ";
       else if (column->auto_increment)
         vals += "NULL, ";
-      else {
+      else if (column->primary_key && pk_base >= 0) {
+        /* Mostly the next key in the reserved block, but --seq-pk-dup-prob of
+           the time one that is already in the table, so ReplacingMergeTree
+           still has duplicates to collapse. Capped below pk_base: the counter
+           has already been advanced past this whole block, so an uncapped
+           sample could return a key this same statement is about to write,
+           which is a collision inside one INSERT rather than with an existing
+           row. */
+        const bool dup =
+            dup_prob > 0 && pk_base > 1 && rand_int(100, 1) <= dup_prob;
+        auto pk_val =
+            pk_literal(dup ? sample_pk(pk_base) : pk_base + i, column);
+        vals += pk_val + ", ";
+        if (value_count != 1 &&
+            options->at(Option::LOG_PK_BULK_INSERT)->getBool())
+          pk_insert.push_back(pk_val);
+      } else {
         auto rand_val = column->rand_value();
         vals += rand_val + ", ";
         if (value_count != 1 &&
@@ -386,6 +426,12 @@ template <typename Writer> void Table::Serialize(Writer &writer) const {
   writer.String("number_of_initial_records");
   writer.Int(number_of_initial_records);
 
+  /* --seq-pk counter. The next step must not hand out a key this one already
+     wrote. Int64, not Int: this counts every key ever handed out, and unlike
+     the record count above it genuinely outgrows 32 bits. */
+  writer.String("pk_next");
+  writer.Int64(pk_next.load());
+
   /* ClickHouse per-table SETTINGS, empty when none were rolled */
   writer.String("settings");
   writer.String(settings.c_str(), static_cast<SizeType>(settings.length()));
@@ -437,6 +483,10 @@ bool Table::load(Thd1 *thd, bool bulk_insert,
   if (options->at(Option::STEP)->getInt() == 1 ||
       options->at(Option::PREPARE)->getBool()) {
     execute_sql("DROP TABLE IF EXISTS " + name_, thd, false);
+    /* --prepare restores the previous step's metadata, counter included, and
+       then empties the table underneath it. Without this the key range would
+       describe rows that no longer exist and every predicate would miss. */
+    reset_pk_counter();
   }
 #endif
   if (!execute_sql(definition(false), thd)) {
@@ -726,6 +776,15 @@ std::string load_metadata_from_file() {
     if (tab.HasMember("settings"))
       table->settings = tab["settings"].GetString();
 
+    /* HasMember, so a step file written before --seq-pk existed still loads;
+       the counter then keeps its default of 1. pk_from_metadata records which
+       of the two happened, because only a counter that really came from a
+       previous --seq-pk run is worth reconciling against the server. */
+    if (tab.HasMember("pk_next")) {
+      table->pk_next.store(tab["pk_next"].GetInt64());
+      table->pk_from_metadata = true;
+    }
+
 #ifdef USE_CLICKHOUSE
     if (tab.HasMember("mv_mutation_reason")) {
       const std::string why = tab["mv_mutation_reason"].GetString();
@@ -803,6 +862,10 @@ std::string load_metadata_from_file() {
       table->AddInternalIndex(index);
     }
 
+    /* the columns are all restored now, so the sequential-key column can be
+       resolved -- same point in the table's life as in Table::table_id() */
+    table->resolve_seq_pk_column();
+
     all_tables->push_back(table);
   }
 
@@ -840,4 +903,68 @@ std::string load_metadata_from_file() {
   fclose(fp);
   print_and_log("metadata loaded from file " + file, nullptr);
   return file;
+}
+
+/* Raise each table's --seq-pk counter to whatever the server says is already
+   there.
+
+   The metadata value is normally the larger of the two: it counts every key
+   handed out, including the ones a failed INSERT never wrote. But the step file
+   is written exactly once, from main() after the worker threads join, so a step
+   that hit a fatal query, tripped an assert (Release builds define no NDEBUG,
+   so asserts are live) or was killed leaves no file at all -- and then step N+1
+   reads step N-1's and would re-issue keys that are in the table. Under
+   ReplacingMergeTree those new rows would silently replace older ones.
+
+   Only tables whose counter really came from a previous --seq-pk run are
+   touched. A table still holding the old random keys must not adopt their
+   maximum: that maximum is around --range * --records, and the range would then
+   span the whole random key space, putting predicates back to matching almost
+   nothing. Such a table simply starts at 1.
+
+   Must run before any worker can allocate a key. Called from
+   Thd1::load_metadata() inside the all_tables->empty() guard, which is what
+   makes it once-per-process: metadata_loaded is a single process-global flag,
+   so with two nodes the second node's loader is still running while both
+   nodes' workers are already released. */
+void reconcile_pk_counters(Thd1 *thd) {
+  for (auto &table : *all_tables) {
+    if (!table->use_sequential_pk() || !table->pk_from_metadata)
+      continue;
+    /* not const: is_col_number() is not const-qualified */
+    Column *pk = table->seq_pk_col;
+    /* toInt64OrZero, so a zero-padded string key parses as its number and an
+       empty table (max() of no rows) answers 0 rather than something that has
+       to be parsed here. */
+    const std::string expr = pk->is_col_number()
+                                 ? "max(" + pk->name_ + ")"
+                                 : "max(toInt64OrZero(" + pk->name_ + "))";
+    const std::string got =
+        thd->db->get_single_value("SELECT " + expr + " FROM " + table->name_);
+    /* empty on any failure -- a table dropped by a DROP whose CREATE failed in
+       the previous step is gone, and that is not an error here */
+    if (got.empty())
+      continue;
+    long int server_max = 0;
+    try {
+      server_max = std::stol(got);
+    } catch (const std::exception &) {
+      continue;
+    }
+    if (server_max < 1)
+      continue;
+    const long int want = server_max + 1;
+    const long int had = table->pk_next.load();
+    if (want <= had)
+      continue; /* the metadata already knew about a later key */
+    /* raise, never lower: this runs before the workers start, but the CAS
+       costs nothing and keeps the invariant true if that ever changes */
+    long int cur = had;
+    while (want > cur && !table->pk_next.compare_exchange_weak(cur, want)) {
+    }
+    print_and_log("sequential pk counter for " + table->name_ + " raised from " +
+                      std::to_string(had) + " to " + std::to_string(want) +
+                      " (highest key on the server)",
+                  thd, false, false);
+  }
 }

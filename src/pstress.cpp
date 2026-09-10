@@ -204,7 +204,12 @@ int main(int argc, char *argv[]) {
           op->setString(optarg);
           break;
         case Option::BOOL:
-          op->setBool(optarg);
+          /* std::string, not the bare char*: setBool is overloaded on bool and
+             std::string, and pointer-to-bool is a standard conversion while
+             char*-to-std::string is user-defined, so the bare pointer picked
+             setBool(bool) and every value-taking BOOL option was forced true
+             regardless of what was passed. */
+          op->setBool(std::string(optarg));
           break;
         case Option::FLOAT:
           op->setFloat(optarg);

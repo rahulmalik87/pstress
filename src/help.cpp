@@ -937,6 +937,48 @@ void add_options() {
   opt->help = "Probability of primary key column being auto increment";
   opt->setInt(10);
 
+  /* Sequential primary keys. Deliberately left at the default
+     required_argument: a no_argument BOOL can only ever be set to true, and
+     this one has to be switchable off on ClickHouse, where it defaults on. */
+  opt = newOption(Option::BOOL, Option::SEQ_PK, "seq-pk");
+  opt->help = "INSERT takes primary key values from a per-table increasing "
+              "counter instead of random ones, and UPDATE/DELETE/SELECT "
+              "predicates aim inside the range of keys handed out so far. On "
+              "ClickHouse the primary key is the table's ORDER BY prefix, so "
+              "this makes each new part cover a narrow, increasing key range "
+              "the way real append-only ingest does, instead of spanning the "
+              "whole key space. Defaults ON for ClickHouse, OFF elsewhere; "
+              "pass --seq-pk=false to turn it off.";
+  opt->setBool(false);
+  opt->short_help = "SeqPK";
+
+  opt = newOption(Option::INT, Option::SEQ_PK_RECENT_PROB,
+                  "seq-pk-recent-prob");
+  opt->help = "With --seq-pk, probability that a predicate aims only at the "
+              "newest slice of the key range (see --seq-pk-recent-rows) "
+              "instead of the whole range. The newest keys are the ones still "
+              "in small unmerged parts, so this is where the interesting "
+              "ClickHouse behaviour is.";
+  opt->setInt(30);
+  opt->short_help = "SeqPKRecent";
+
+  opt = newOption(Option::INT, Option::SEQ_PK_RECENT_ROWS,
+                  "seq-pk-recent-rows");
+  opt->help = "Width, in keys, of the newest slice --seq-pk-recent-prob aims "
+              "at";
+  opt->setInt(10000);
+  opt->short_help = "SeqPKRecentRows";
+
+  opt = newOption(Option::INT, Option::SEQ_PK_DUP_PROB, "seq-pk-dup-prob");
+  opt->help = "With --seq-pk, probability that an inserted row reuses a key "
+              "already handed out instead of taking a new one. Unique keys "
+              "would otherwise retire the ReplacingMergeTree dedup path "
+              "entirely, since colliding random keys are the only reason a "
+              "row is ever collapsed today. A small rate keeps dedup "
+              "exercised while leaving the append-only shape dominant.";
+  opt->setInt(5);
+  opt->short_help = "SeqPKDup";
+
   opt = newOption(Option::INT, Option::INSERT_BULK_COUNT, "insert-bulk-count");
   opt->help = "Number of rows to insert in a single insert statement";
   opt->setInt(1000);

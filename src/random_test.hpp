@@ -51,6 +51,17 @@
 #define opt_string(a) options->at(Option::a)->getString()
 
 long int rand_int(long int upper, long int lower = 0);
+
+/* --seq-pk: zero-pad width for a string primary key. A String is the ORDER BY
+   key, and ClickHouse orders it lexicographically, where '9' > '10' -- so the
+   counter is padded to a fixed width and the two orders agree. The width must
+   stay constant for the life of a table, because a key written at one width
+   would no longer be found by a predicate built at another; it is therefore a
+   constant and never derived from the column's declared length, which
+   ModifyColumn re-rolls mid-run. 12 digits is a trillion keys, far beyond any
+   run, and fits the 50 chars a vpkey is created with. */
+const int seq_pk_pad_width = 12;
+
 template <typename T> static T try_negative(T val) {
   if (rand_int(100) > options->at(Option::POSITIVE_INT_PROB)->getInt()) {
     return val * (-1);
@@ -425,7 +436,12 @@ struct Table {
   std::string GetWherePrecise();
   std::string GetWhereBulk();
   std::string GetWhereLargeRange();
-  std::string ColumnValues(Thd1 *thd, int value_count = 1);
+  /* fresh_pk=false makes the primary key come from the existing-key sampler
+     instead of the counter, for statements that must hit a row that is already
+     there (REPLACE) or that bake their literals in once and run many times
+     (a stored function body). */
+  std::string ColumnValues(Thd1 *thd, int value_count = 1,
+                           bool fresh_pk = true);
   std::string SelectColumn();
   std::string SetClause();
   void DeleteAllRows(Thd1 *thd);
@@ -481,6 +497,42 @@ struct Table {
   int key_block_size = 0;
   long int number_of_initial_records;
   size_t auto_inc_index;
+  /* --seq-pk: the primary key the next INSERT will take, so [1, pk_next) is
+     the range of keys this table has handed out. A statement reserves a whole
+     block of keys with one fetch_add, which gives every thread a disjoint,
+     exclusively owned run of keys -- concurrent inserters can never pick the
+     same key and never need a lock. Predicates sample inside the range. A
+     TRUNCATE or a DROP/CREATE empties the table and takes it back to 1.
+     Persisted, so the next step keeps appending instead of starting over. */
+  std::atomic<long int> pk_next{1};
+  /* Whether the counter above was restored from a step file rather than
+     defaulted. Only then is it worth reconciling against the server: a table
+     whose rows carry the old random keys must not adopt their maximum, or the
+     range would span the whole random key space and predicates would go back
+     to missing almost every row. */
+  bool pk_from_metadata = false;
+  /* The column the counter drives, resolved once when the table is built or
+     restored; nullptr when this table has none. Resolved eagerly rather than
+     on demand because worker threads share the table and would race. */
+  Column *seq_pk_col = nullptr;
+  void resolve_seq_pk_column();
+  /* The primary key column, or nullptr. Caller must hold table_mutex. */
+  Column *pk_column() const;
+  /* Whether this table's keys are ours to hand out. */
+  bool use_sequential_pk() const { return seq_pk_col != nullptr; }
+  /* Reserve count consecutive keys and return the first. Lock-free. */
+  long int reserve_pk_block(long int count) {
+    return pk_next.fetch_add(count, std::memory_order_relaxed);
+  }
+  /* A key that may be in the table right now, for a predicate.
+     upper_exclusive caps the range, for callers that must not pick a key from
+     a block that has been reserved but not yet written; 0 means "up to
+     whatever has been handed out". */
+  long int sample_pk(long int upper_exclusive = 0) const;
+  /* Render a key the way the column stores it. */
+  std::string pk_literal(long int value, const Column *col) const;
+  /* The table is empty, so the sequence starts over. */
+  void reset_pk_counter() { pk_next.store(1, std::memory_order_relaxed); }
   // std::string data_directory; todo add corressponding code
   std::vector<Column *> *columns_;
   std::vector<Index *> *indexes_;
@@ -996,6 +1048,9 @@ std::vector<long int> generateUniqueRandomNumbers(long int number_of_records);
 
 void wait_till_sync(const std::string &name, Thd1 *thd);
 std::string load_metadata_from_file();
+/* Raise each table's --seq-pk counter past whatever keys the server already
+   holds, for when a step died before writing its metadata. */
+void reconcile_pk_counters(Thd1 *thd);
 std::string lower_case_secondary();
 typedef std::vector<std::vector<std::string>> query_result;
 query_result get_query_result(Thd1 *thd, const std::string &query);

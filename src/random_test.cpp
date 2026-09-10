@@ -543,6 +543,10 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::NO_BIT)->setBool(true);
     /* Composite key columns not in primary_key flag would break ORDER BY prefix */
     options->at(Option::COMPOSITE_KEY_PROB)->setInt(0);
+    /* The primary key is the whole ORDER BY here, so append-only keys are the
+       shape worth testing; an explicit --seq-pk=false still wins. */
+    if (!options->at(Option::SEQ_PK)->cl)
+      options->at(Option::SEQ_PK)->setBool(true);
     algorithms.clear();
     locks.clear();
   }
@@ -1805,6 +1809,11 @@ std::string Column::rand_value() {
   }
   /* if primary key we varchar */
   if (primary_key == true) {
+    /* --seq-pk: aim inside the keys actually handed out, rather than over
+       --range * --records, where almost every value matches no row. This is a
+       sample and never an allocation -- see Table::sample_pk(). */
+    if (table_ != nullptr && table_->seq_pk_col == this)
+      return table_->pk_literal(table_->sample_pk(), this);
     auto value = std::to_string(try_negative(rand_int(
         options->at(Option::UNIQUE_RANGE)->getFloat() * number_of_records)));
     if (current_type == Column::COLUMN_TYPES::VARCHAR) {
@@ -2450,6 +2459,9 @@ void Table::DropCreate(Thd1 *thd) {
     return;
   }
   mark_mv_source_mutated("the table was dropped and recreated");
+  /* after the DROP rather than after the CREATE: the rows are gone either
+     way, and the CREATE below has several fallback forms. */
+  reset_pk_counter();
 
   if (set_session_nbo) {
     execute_sql("SET SESSION wsrep_osu_method=DEFAULT ", thd);
@@ -2539,8 +2551,13 @@ void Table::Truncate(Thd1 *thd) {
     if (execute_sql(sql, thd))
       mark_mv_source_mutated("TRUNCATE PARTITION");
   } else {
-    if (execute_sql("TRUNCATE TABLE " + name_, thd))
+    if (execute_sql("TRUNCATE TABLE " + name_, thd)) {
       mark_mv_source_mutated("TRUNCATE TABLE");
+      /* the rows are gone, so the key sequence starts over. Deliberately not
+         done in the TRUNCATE PARTITION branch above: that empties one
+         partition and leaves the rest of the keys in place. */
+      reset_pk_counter();
+    }
   }
 }
 
@@ -3080,6 +3097,7 @@ Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
 
   table->CreateDefaultColumn();
   table->CreateDefaultIndex();
+  table->resolve_seq_pk_column();
 
   if (type == FK) {
     static_cast<FK_table *>(table)->pickRefrence(table);
@@ -3110,6 +3128,83 @@ bool Table::has_auto_inc_col() const {
       return true;
   }
   return false;
+}
+
+Column *Table::pk_column() const {
+  for (const auto &col : *columns_) {
+    if (col->primary_key)
+      return col;
+  }
+  return nullptr;
+}
+
+/* Decide once, when the table is built or restored, whether --seq-pk drives
+   this table's primary key. Eagerly and not on demand: worker threads share
+   the table, so a lazy resolve would be a data race. */
+void Table::resolve_seq_pk_column() {
+  seq_pk_col = nullptr;
+  if (!options->at(Option::SEQ_PK)->getBool())
+    return;
+  Column *pk = pk_column();
+  if (pk == nullptr)
+    return;
+  /* An auto-increment key is the server's counter, not ours. A key that is
+     also the partition column would send every new row past the last defined
+     partition (MySQL only -- ClickHouse forces --no-partition). */
+  if (pk->auto_increment || pk->is_partition)
+    return;
+  switch (pk->type_) {
+  case Column::INT:
+  case Column::INTEGER:
+    seq_pk_col = pk;
+    break;
+  case Column::VARCHAR:
+  case Column::CHAR:
+    /* A string key is zero-padded so that it sorts the way it counts, which
+       needs room for the padding. A column too narrow to hold it keeps random
+       values rather than getting keys that sort wrongly. */
+    if (pk->length >= seq_pk_pad_width)
+      seq_pk_col = pk;
+    break;
+  default:
+    break;
+  }
+}
+
+/* A key that may be in the table right now. Never an allocation: this feeds
+   predicates, and the grammar-SQL substitution calls rand_value() on every
+   column of every table it touches, so allocating here would race the counter
+   far ahead of the data. */
+long int Table::sample_pk(long int upper_exclusive) const {
+  long int hi = pk_next.load(std::memory_order_relaxed); /* exclusive */
+  if (upper_exclusive > 0 && upper_exclusive < hi)
+    hi = upper_exclusive;
+  if (hi <= 1)
+    return 1; /* nothing handed out yet: a predicate that matches nothing */
+  long int lo = 1;
+  if (rand_int(100, 1) <= options->at(Option::SEQ_PK_RECENT_PROB)->getInt()) {
+    /* the newest keys, still in small unmerged parts */
+    const long int tail = options->at(Option::SEQ_PK_RECENT_ROWS)->getInt();
+    if (tail > 0 && hi - lo > tail)
+      lo = hi - tail;
+  }
+  return rand_int(hi - 1, lo);
+}
+
+std::string Table::pk_literal(long int value, const Column *col) const {
+  std::string digits = std::to_string(value);
+  if (col->type_ == Column::INT || col->type_ == Column::INTEGER)
+    return digits;
+  /* Pad to a fixed width so lexicographic order matches numeric order, and
+     quote it -- a String column given a bare number would be stored as the
+     unpadded text and would then sort among the padded keys arbitrarily. */
+  if (digits.size() < static_cast<size_t>(seq_pk_pad_width))
+    digits.insert(0, seq_pk_pad_width - digits.size(), '0');
+#ifdef USE_MYSQL
+  return "\"" + digits + "\"";
+#else
+  return "'" + digits + "'";
+#endif
 }
 
 #ifdef USE_CLICKHOUSE
@@ -4765,7 +4860,11 @@ void Table::CreateFunction(Thd1 *thd) {
     for (auto &dml : function_dmls) {
       if (dml == "INSERT")
         for (int i = 0; i < rand_int(3, 1); i++)
-          sql.append("INSERT INTO " + name_ + ColumnValues(thd) + "; ");
+          /* the function body bakes its literals in once and is then called
+             many times, so an allocated key would be inserted repeatedly and
+             leave a permanent hole in the sequence */
+          sql.append("INSERT INTO " + name_ + ColumnValues(thd, 1, false) +
+                     "; ");
       else if (dml == "UPDATE")
         for (int i = 0; i < rand_int(4, 1); i++)
           sql.append("UPDATE " + add_ignore_clause() + name_ + " SET " +
@@ -4789,7 +4888,9 @@ void Table::CreateFunction(Thd1 *thd) {
 
 void Table::Replace(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
-  auto sql = "REPLACE INTO " + name_ + ColumnValues(thd);
+  /* a REPLACE carrying a brand-new key replaces nothing, so sample an
+     existing one instead of allocating */
+  auto sql = "REPLACE INTO " + name_ + ColumnValues(thd, 1, false);
   unlock_table_mutex();
   std::shared_lock<std::shared_mutex> lock(dml_mutex);
   execute_sql(sql, thd);
@@ -4846,6 +4947,25 @@ void Table::DeleteAllRows(Thd1 *thd) {
    two-thirds of the full value span.  Falls back to GetWhereBulk()
    when no integer PK exists. */
 std::string Table::GetWhereLargeRange() {
+  /* --seq-pk: take the bounds from the keys actually handed out. Without this
+     the range below covers 50-70% of a value span two orders of magnitude
+     wider than the data, so ALTER TABLE UPDATE/DELETE mutate almost nothing.
+     Works for a string key too, because the zero-padded values compare
+     correctly with BETWEEN -- the span-based path below cannot. */
+  if (use_sequential_pk()) {
+    const long int hi = pk_next.load(std::memory_order_relaxed) - 1;
+    if (hi < 1)
+      return GetWhereBulk();
+    const long int span = hi;
+    /* half to two thirds of the live range, placed uniformly inside it so
+       repeated mutations do not keep hitting the same low keys */
+    const long int width = span / 2 + rand_int(span / 5);
+    const long int start = 1 + rand_int(span - width);
+    return " WHERE " + seq_pk_col->name_ + " BETWEEN " +
+           pk_literal(start, seq_pk_col) + " AND " +
+           pk_literal(start + width, seq_pk_col);
+  }
+
   Column *int_pk = nullptr;
   for (auto col : *columns_) {
     if (col->primary_key && col->is_col_number()) {
@@ -5709,6 +5829,11 @@ bool Thd1::load_metadata() {
         exit(EXIT_FAILURE);
       } else {
         std::cout << "metadata loaded from " << file << std::endl;
+        /* Before any worker can allocate a key, and only here: this branch is
+           inside the all_tables->empty() guard, so it runs once per process
+           even in a multi-node run. Not done for step 1 or --prepare, where
+           Table::load() recreates the table and sets the counter itself. */
+        reconcile_pk_counters(this);
       }
     }
   } else {
