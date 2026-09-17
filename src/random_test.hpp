@@ -154,6 +154,13 @@ public:
   int length = 0;
   std::string default_value;
   bool primary_key = false;
+  /* In the primary key, but not the enforcing key column -- what makes the key
+     composite, and on ClickHouse what makes the ORDER BY multi-column. Rolled
+     once by Table::resolve_composite_key() and persisted with the column, so
+     the shape survives DropCreate and the next step. A key column cannot be
+     the target of an UPDATE on ClickHouse, which is why anything picking a
+     column to set has to look at this as well as primary_key. */
+  bool composite_key = false;
   bool auto_increment = false;
   bool compressed = false; // percona type compressed
   bool not_secondary = false;
@@ -516,6 +523,9 @@ struct Table {
      on demand because worker threads share the table and would race. */
   Column *seq_pk_col = nullptr;
   void resolve_seq_pk_column();
+  /* Roll which columns join the primary key beyond the enforcing one. Called
+     once, when the table is built, never from definition(). */
+  void resolve_composite_key();
   /* The primary key column, or nullptr. Caller must hold table_mutex. */
   Column *pk_column() const;
   /* Whether this table's keys are ours to hand out. */

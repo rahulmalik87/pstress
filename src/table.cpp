@@ -548,6 +548,8 @@ template <typename Writer> void Column::Serialize(Writer &writer) const {
   writer.Bool(null_val);
   writer.String("primary_key");
   writer.Bool(primary_key);
+  writer.String("composite_key");
+  writer.Bool(composite_key);
   writer.String("compressed");
   writer.Bool(compressed);
   writer.String("auto_increment");
@@ -839,6 +841,11 @@ std::string load_metadata_from_file() {
       a->auto_increment = col["auto_increment"].GetBool();
       a->length = col["length"].GetInt(),
       a->primary_key = col["primary_key"].GetBool();
+      /* HasMember, so a step file written before composite keys were persisted
+         still loads; those columns then stay out of the key, which is the shape
+         the server already has for a table created by that run. */
+      if (col.HasMember("composite_key"))
+        a->composite_key = col["composite_key"].GetBool();
       a->compressed = col["compressed"].GetBool();
       a->not_secondary = col["not secondary"].GetBool();
       table->AddInternalColumn(a);

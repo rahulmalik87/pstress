@@ -192,9 +192,17 @@ void add_options() {
 
   opt =
       newOption(Option::INT, Option::COMPOSITE_KEY_PROB, "composite-key-prob");
-  opt->help = "Probablity of using a composite key in primary key. Then "
-              "enforcing column would be ipkey or vpkey. But other key are "
-              "added just part of primary key ";
+  opt->help = "Probability that a column is added to the primary key beyond the "
+              "enforcing one (ipkey or vpkey), making the key composite. The "
+              "roll is per candidate column, not per table, so the share of "
+              "tables that end up composite is 1-(1-p)^candidates. Candidates "
+              "exclude the enforcing key, partition columns, BLOB/JSON/TEXT and "
+              "any column whose null_val is set, which in practice leaves about "
+              "a third of the columns -- so 5 yields roughly one table in 7 "
+              "with a 2-column key, not one in three. On ClickHouse the primary "
+              "key is also the ORDER BY, so this is what produces a "
+              "multi-column ORDER BY; it defaults to 5 there and 1 elsewhere. "
+              "0 turns it off.";
   opt->setInt(1);
 
   opt = newOption(Option::INT, Option::CH_VERIFY_INTERVAL, "ch-verify-interval");
@@ -1043,6 +1051,29 @@ void add_options() {
   opt->setSQL();
   opt->short_help = "CHAlterDelete";
   opt->setDDL();
+
+  /* ClickHouse: which implementation a DELETE FROM asks for. The server
+     default, lightweight_delete_mode = alter_update, rewrites every matched
+     part as a heavyweight mutation; lightweight_update writes a patch part
+     instead. Rolled per statement rather than set once, so a single run covers
+     both code paths. */
+  opt = newOption(Option::INT, Option::CH_LIGHTWEIGHT_DELETE,
+                  "ch-lightweight-delete");
+  opt->help =
+      "Probability that a DELETE FROM appends SETTINGS lightweight_delete_mode "
+      "= 'lightweight_update', so the delete writes a patch part inline "
+      "instead of scheduling a heavyweight mutation. The mutation path is "
+      "gated by number_of_free_entries_in_pool_to_execute_mutation, so a "
+      "merge-saturated pool can leave the statement waiting minutes under "
+      "lightweight_deletes_sync = 2; the patch-part path never touches that "
+      "pool. Not a workload action of its own -- it only modifies the DELETE "
+      "FROM that --delete-precise/--delete-bulk already roll. Lowering this "
+      "below 100 also puts mutations back in reach of --ch-kill-mutation, "
+      "which cannot target a patch part. Mode 'lightweight_update' falls back "
+      "to alter_update when a patch part is impossible, so this never fails a "
+      "statement on its own.";
+  opt->setInt(100);
+  opt->short_help = "CHLightweightDelete";
 
   opt = newOption(Option::BOOL, Option::CH_MUTATIONS_SYNC, "ch-mutations-sync");
   opt->help = "Append SETTINGS mutations_sync=2 to ClickHouse ALTER mutations "

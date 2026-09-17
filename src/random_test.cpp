@@ -541,8 +541,25 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::ALTER_DISCARD_TABLESPACE)->setInt(0);
     options->at(Option::ALTER_DATABASE_COLLATION)->setInt(0);
     options->at(Option::NO_BIT)->setBool(true);
-    /* Composite key columns not in primary_key flag would break ORDER BY prefix */
-    options->at(Option::COMPOSITE_KEY_PROB)->setInt(0);
+    /* A multi-column ORDER BY is one of the shapes most worth testing here --
+       it is what real ClickHouse tables look like, and it changes how parts
+       sort, how the primary index is built and which projections the optimizer
+       can prefer. The composite columns land in both PRIMARY KEY and ORDER BY
+       (see the pk_cols loop), so the ORDER BY superset invariant holds, and the
+       enforcing key stays the prefix, so --seq-pk still appends.
+
+       The roll is per candidate column, not per table, and the candidates are
+       fewer than the column count suggests: resolve_composite_key() skips a
+       column whose null_val is set, which is about half of them, so the pool
+       averages ~3 of the 9 int columns rather than all 9. Measured at 5: about
+       one table in 7 ends up with a 2-column key, a couple of percent with 3,
+       and the single-column shape stays dominant. Note that nothing is actually
+       emitted Nullable on ClickHouse (null-prob defaults to 0), so that skip is
+       conservative here rather than necessary -- raise --composite-key-prob if
+       you want the multi-column shape more often. An explicit value still wins,
+       including 0 to turn it off. */
+    if (!options->at(Option::COMPOSITE_KEY_PROB)->cl)
+      options->at(Option::COMPOSITE_KEY_PROB)->setInt(5);
     /* The primary key is the whole ORDER BY here, so append-only keys are the
        shape worth testing; an explicit --seq-pk=false still wins. */
     if (!options->at(Option::SEQ_PK)->cl)
@@ -580,6 +597,7 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::CH_ALTER_UPDATE)->setInt(0);
     options->at(Option::CH_ALTER_DELETE)->setInt(0);
     options->at(Option::CH_KILL_MUTATION)->setInt(0);
+    options->at(Option::CH_LIGHTWEIGHT_DELETE)->setInt(0);
   }
 
   if (strcmp(FORK, "MySQL") == 0) {
@@ -3097,6 +3115,7 @@ Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
 
   table->CreateDefaultColumn();
   table->CreateDefaultIndex();
+  table->resolve_composite_key();
   table->resolve_seq_pk_column();
 
   if (type == FK) {
@@ -3189,6 +3208,52 @@ long int Table::sample_pk(long int upper_exclusive) const {
       lo = hi - tail;
   }
   return rand_int(hi - 1, lo);
+}
+
+/* Which columns join the primary key beyond the enforcing one -- and on
+   ClickHouse the ORDER BY with it, since the two are the same list there.
+
+   Rolled here rather than inside definition(), which used to do it: definition()
+   runs again for DropCreate and at every later step, so a fresh roll there
+   handed the server a key the metadata did not describe, and nothing downstream
+   could tell which columns were in it. The eligibility tests are the ones that
+   condition carried. */
+void Table::resolve_composite_key() {
+#ifdef USE_CLICKHOUSE
+  /* A table with no primary key at all -- AddTable builds these -- still needs
+     an ORDER BY, and definition() falls back to the first column. That makes it
+     a key column on the server while no column is flagged here, so an UPDATE
+     picks it and ClickHouse rejects the whole statement with "Cannot UPDATE key
+     column". Record it, before the probability check, because the fallback is
+     not a roll: it always happens. Nothing else changes -- definition() emits
+     PRIMARY KEY only when has_pk(), so this column stays out of that clause and
+     only the ORDER BY fallback puts it in the key. */
+  if (!has_pk() && !columns_->empty())
+    columns_->at(0)->composite_key = true;
+#endif
+  const long int prob = options->at(Option::COMPOSITE_KEY_PROB)->getInt();
+  if (prob <= 0)
+    return;
+  /* A secondary-engine table whose key is the server's auto-increment counter
+     keeps the narrow key the original condition insisted on. */
+  if (!options->at(Option::SECONDARY_ENGINE)->getString().empty() &&
+      has_auto_inc_col())
+    return;
+  for (auto col : *columns_) {
+    /* the enforcing key is already in; a partition column is added by
+       definition() whether it rolls or not, so leave that to it */
+    if (col->primary_key || col->is_partition)
+      continue;
+    if (col->type_ == Column::BLOB || col->type_ == Column::JSON ||
+        col->type_ == Column::TEXT)
+      continue;
+    /* a nullable key sorts nulls first and needs allow_nullable_key; the
+       original condition avoided it and so do we */
+    if (col->null_val)
+      continue;
+    if (rand_int(100, 1) <= prob)
+      col->composite_key = true;
+  }
 }
 
 std::string Table::pk_literal(long int value, const Column *col) const {
@@ -3335,10 +3400,12 @@ Projection *Table::MakeRandomProjection() {
   if (usable.empty() || keyable.empty())
     return nullptr;
 
-  /* The table's own ORDER BY is the primary key column, so a projection keyed on
-     it alone reorders nothing and the optimizer will never prefer it. Reroll
-     once; a table whose only keyable column is the pk gets no projection rather
-     than a useless one. */
+  /* A projection keyed on the enforcing primary key alone reorders nothing --
+     that column is the table's own ORDER BY prefix -- so the optimizer will
+     never prefer it. Reroll once; a table whose only keyable column is the pk
+     gets no projection rather than a useless one. A composite key column is
+     still worth keying on: it sorts the table only within a prefix, so a
+     projection leading with it is a genuinely different order. */
   std::vector<Column *> keys;
   for (int attempt = 0; attempt < 2; attempt++) {
     keys.clear();
@@ -3437,24 +3504,20 @@ std::string Table::definition(bool with_index, bool with_fk,
   std::vector<std::string> pk_cols; /* all PK columns, including composite */
   if (has_pk()) {
     def += " PRIMARY KEY(";
-    auto table_has_auto_inc = has_auto_inc_col();
     for (auto col : *columns_) {
       if (col->primary_key) {
         def += col->name_ + ", ";
         pk_cols.push_back(col->name_);
       }
     }
+    /* resolve_composite_key() already decided this, once, when the table was
+       built. Rolling it here would give a different key every time definition()
+       runs -- DropCreate, --step 2 -- and leave the metadata describing a table
+       the server does not have. */
     for (auto col : *columns_) {
       if (col->primary_key)
         continue;
-      else if (col->primary_key || col->is_partition ||
-               ((options->at(Option::SECONDARY_ENGINE)->getString() == "" ||
-                 table_has_auto_inc == false) &&
-                col->type_ != Column::BLOB && col->type_ != Column::JSON &&
-                col->type_ != Column::TEXT &&
-                rand_int(100) <=
-                    options->at(Option::COMPOSITE_KEY_PROB)->getInt() &&
-                col->null_val == false)) {
+      if (col->is_partition || col->composite_key) {
         def += col->name_ + ", ";
         pk_cols.push_back(col->name_); /* track composite key cols too */
       }
@@ -3542,7 +3605,11 @@ std::string Table::definition(bool with_index, bool with_fk,
     }
     if (order_cols.empty())
       order_cols = columns_->at(0)->name_;
-    def += " ORDER BY " + order_cols + ""
+    /* A storage ORDER BY is one expression, so more than one column has to be
+       a tuple: bare "ORDER BY a, b" is a syntax error at the comma. Same shape
+       the projection body uses. */
+    def += " ORDER BY " +
+           (pk_cols.size() > 1 ? "(" + order_cols + ")" : order_cols) +
            " SETTINGS enable_block_number_column = 1,"
            " enable_block_offset_column = 1";
     if (g_projections_enabled) {
@@ -4910,10 +4977,32 @@ void Table::UpdateRandomROW(Thd1 *thd) {
     mark_mv_source_mutated("UPDATE");
 }
 
+/* ClickHouse: DELETE FROM is rewritten server-side into an internal update of
+   _row_exists, and lightweight_delete_mode picks how. At its alter_update
+   default that is a heavyweight mutation -- a full rewrite of every matched
+   part, executed on the background merge pool and only ever scheduled when
+   number_of_free_entries_in_pool_to_execute_mutation slots are free, so a pool
+   saturated by merges leaves the statement blocked for as long as the insert
+   load lasts (DELETE FROM waits by default, lightweight_deletes_sync = 2).
+   lightweight_update writes a patch part inline instead, like an INSERT: no
+   pool slot, nothing in system.mutations, and the patch is applied on every
+   SELECT until a merge folds it into the base part.
+
+   Rolled per statement, not set once for the run, so both implementations get
+   exercised by one invocation. Empty for every other fork -- the option is
+   zeroed there, the same way CH_ALTER_UPDATE/DELETE are. */
+static std::string lightweight_delete_settings() {
+  const long int prob = options->at(Option::CH_LIGHTWEIGHT_DELETE)->getInt();
+  if (prob > 0 && rand_int(100, 1) <= prob)
+    return " SETTINGS lightweight_delete_mode = 'lightweight_update'";
+  return "";
+}
+
 void Table::DeleteRandomRow(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
   std::string sql = "DELETE " + add_ignore_clause() + " FROM " + name_ +
-                    GetRandomPartition() + GetWherePrecise();
+                    GetRandomPartition() + GetWherePrecise() +
+                    lightweight_delete_settings();
   unlock_table_mutex();
   std::shared_lock lock(dml_mutex);
   if (execute_sql(sql, thd))
@@ -4934,7 +5023,8 @@ void Table::UpdateAllRows(Thd1 *thd) {
 void Table::DeleteAllRows(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
   std::string sql = "DELETE " + add_ignore_clause() + " FROM " + name_ +
-                    GetRandomPartition() + GetWhereBulk();
+                    GetRandomPartition() + GetWhereBulk() +
+                    lightweight_delete_settings();
   unlock_table_mutex();
   std::shared_lock lock(dml_mutex);
   if (execute_sql(sql, thd))
@@ -5447,12 +5537,18 @@ std::string Table::SetClause() {
       columns_->size() == 1) {
     col = columns_->at(0);
   } else {
-    while (col == nullptr) {
-      int set = rand_int(columns_->size() - 1);
-      if (columns_->at(set)->type_ != Column::GENERATED &&
-          columns_->at(set)->primary_key == false)
-        col = columns_->at(set);
-    }
+    /* A composite key column is a key column, and ClickHouse rejects an UPDATE
+       on any of them ("Cannot UPDATE key column"). --pk-in-set above is the
+       switch for deliberately trying a key column, so gate these the same way
+       rather than letting the ordinary path pick one by accident. Collected
+       into a list instead of rejection-sampled: same distribution, and it
+       cannot spin forever on a table whose every column is in the key. */
+    std::vector<Column *> settable;
+    for (auto c : *columns_)
+      if (c->type_ != Column::GENERATED && !c->primary_key && !c->composite_key)
+        settable.push_back(c);
+    col = settable.empty() ? columns_->at(0)
+                           : settable[rand_int(settable.size() - 1)];
   }
   std::string set_clause = col->name_ + " = ";
   set_clause +=
@@ -5461,7 +5557,11 @@ std::string Table::SetClause() {
   /* 10% update most of column */
   if (rand_int(100) < 10) {
     for (const auto &column : *columns_) {
-      if (column->primary_key == false && column->type_ != Column::GENERATED &&
+      /* composite_key as well as primary_key: this tail widens the SET list
+         past the column picked above, and a key column here fails the whole
+         statement on ClickHouse just as surely as one picked there. */
+      if (column->primary_key == false && column->composite_key == false &&
+          column->type_ != Column::GENERATED &&
           column->name_ != col->name_ && rand_int(100) > 50) {
         set_clause += "," + column->name_ + " = " +
                       (column->type_ == Column::JSON ? json_set(column)

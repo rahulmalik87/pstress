@@ -272,6 +272,11 @@ struct Option {
     SEQ_PK_RECENT_PROB,
     SEQ_PK_RECENT_ROWS,
     SEQ_PK_DUP_PROB,
+    /* Which implementation a DELETE FROM asks the server for. Appended at the
+       end of the enum on purpose: a step file records options by this value, so
+       inserting one next to the other CH_ mutation options would renumber
+       everything after it and misread every step file written before now. */
+    CH_LIGHTWEIGHT_DELETE,
     MAX
   } option;
 

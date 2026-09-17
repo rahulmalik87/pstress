@@ -80,12 +80,19 @@ static void kill_query(Thd1 *thd) {
 
    A mutation is a background rewrite of every part, tracked in
    system.mutations until is_done. More of the workload produces one than the
-   --ch-alter-update/--ch-alter-delete options it was written for: DELETE FROM is
-   rewritten into ALTER TABLE ... UPDATE _row_exists = 0 while
-   lightweight_delete_mode is at its alter_update default, and DROP COLUMN and a
-   retyping MODIFY COLUMN are mutations too. A lightweight UPDATE is not one --
-   it writes patch parts, which never appear in system.mutations -- so no roll
-   ever targets it.
+   --ch-alter-update/--ch-alter-delete options it was written for: DROP COLUMN
+   and a retyping MODIFY COLUMN are mutations too. A lightweight UPDATE is not
+   one -- it writes patch parts, which never appear in system.mutations -- so no
+   roll ever targets it.
+
+   DELETE FROM is only a candidate when --ch-lightweight-delete leaves it as
+   one. That option defaults to 100, which asks for lightweight_delete_mode =
+   lightweight_update on every delete and so keeps DELETE FROM out of
+   system.mutations entirely; at the alter_update default it would instead be
+   rewritten into ALTER TABLE ... UPDATE _row_exists = 0 and become by far the
+   largest source of candidates. Enabling --ch-kill-mutation without also
+   lowering --ch-lightweight-delete therefore leaves only the DDL mutations to
+   target, and the roll does nothing most of the time.
 
    Killing a mutation mid-flight leaves the table with some parts rewritten and
    some not, and fails the statement still waiting on it (any ALTER under
