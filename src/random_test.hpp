@@ -975,6 +975,9 @@ struct SettingSpec {
    ReplacingMergeTree. An unrecognised engine, or one written with its own
    arguments, is returned unchanged. */
 std::string ch_resolve_engine(const std::string &engine);
+/* false under --no-version-column: every table, INSERT and view then leaves
+   _pstress_ver out */
+bool ch_version_column();
 /* True when the engine merges rows sharing a sorting key, so an exact row for
    row comparison of a table against a materialized view over it cannot hold. */
 bool ch_engine_collapses_rows(const std::string &engine);

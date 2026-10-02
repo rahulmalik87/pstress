@@ -277,6 +277,9 @@ struct Option {
        inserting one next to the other CH_ mutation options would renumber
        everything after it and misread every step file written before now. */
     CH_LIGHTWEIGHT_DELETE,
+    /* Appended for the same reason as CH_LIGHTWEIGHT_DELETE. */
+    INSERT_COLUMN_SUBSET_PROB,
+    NO_VERSION_COLUMN,
     MAX
   } option;
 

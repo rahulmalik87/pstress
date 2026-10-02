@@ -3302,6 +3302,10 @@ static std::string ch_engine_base(const std::string &engine) {
    An engine spelled with its own arguments, or one not in the list, is passed
    through exactly as written, so an engine pstress has not been taught about
    can still be tried without a code change. */
+bool ch_version_column() {
+  return !options->at(Option::NO_VERSION_COLUMN)->getBool();
+}
+
 std::string ch_resolve_engine(const std::string &engine) {
   std::string name = engine;
   if (name.size() >= 2 && name.compare(name.size() - 2, 2, "()") == 0)
@@ -3324,7 +3328,7 @@ std::string ch_resolve_engine(const std::string &engine) {
 
   std::string resolved = replicated ? "Replicated" : "";
   resolved += base;
-  if (base_upper == "REPLACINGMERGETREE")
+  if (base_upper == "REPLACINGMERGETREE" && ch_version_column())
     resolved += "(_pstress_ver)";
   return resolved;
 }
@@ -3495,8 +3499,10 @@ std::string Table::definition(bool with_index, bool with_fk,
     def += col->definition() + ", ";
   }
 #ifdef USE_CLICKHOUSE
-  /* version column for ReplacingMergeTree — always present, never dropped */
-  def += "_pstress_ver UInt64, ";
+  /* version column for ReplacingMergeTree — never dropped, and present unless
+     --no-version-column */
+  if (ch_version_column())
+    def += "_pstress_ver UInt64, ";
 #endif
 
 
@@ -5178,7 +5184,8 @@ void Table::CreateMaterializedView(Thd1 *thd) {
   /* definition() appends the version column by hand, so it is a real column of
      the table but never appears in columns_. DropColumn refuses to drop it, so
      it is safe for the view to select it. */
-  columns.push_back("_pstress_ver");
+  if (ch_version_column())
+    columns.push_back("_pstress_ver");
   unlock_table_mutex();
 
   /* An explicit column list, never SELECT *, pins the view's shape at creation:

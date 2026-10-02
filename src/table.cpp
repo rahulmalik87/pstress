@@ -168,7 +168,8 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
     prepare_sql += column->name_ + ", ";
   }
 #ifdef USE_CLICKHOUSE
-  prepare_sql += "_pstress_ver, ";
+  if (ch_version_column())
+    prepare_sql += "_pstress_ver, ";
 #endif
   prepare_sql.erase(prepare_sql.length() - 2);
   prepare_sql += ")";
@@ -208,7 +209,8 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
       value += ", ";
     }
 #ifdef USE_CLICKHOUSE
-    value += "toUnixTimestamp64Micro(now64()), ";
+    if (ch_version_column())
+      value += "toUnixTimestamp64Micro(now64()), ";
 #endif
     value.erase(value.size() - 2);
     value += ")";
@@ -241,12 +243,36 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
 }
 
 std::string Table::ColumnValues(Thd1 *thd, int value_count, bool fresh_pk) {
-  std::string cols = "(";
+  /* With --insert-column-subset-prob the statement names only some columns and
+     the server fills the rest with their defaults. Key columns always stay:
+     --seq-pk hands their values out, and on ClickHouse they are the ORDER BY,
+     so defaulting them would pile every row onto one key. Outside ClickHouse a
+     NOT NULL column with no default has nothing to fall back to. */
+  std::vector<Column *> chosen;
+  const bool subset =
+      rand_int(100, 1) <=
+      options->at(Option::INSERT_COLUMN_SUBSET_PROB)->getInt();
   for (auto &column : *columns_) {
+    bool must_write = !subset || column->primary_key || column->composite_key;
+#ifndef USE_CLICKHOUSE
+    must_write = must_write || (!column->null_val &&
+                                column->default_value.empty() &&
+                                !column->auto_increment &&
+                                column->type_ != Column::COLUMN_TYPES::GENERATED);
+#endif
+    if (must_write || rand_int(1))
+      chosen.push_back(column);
+  }
+  if (chosen.empty())
+    chosen.push_back(columns_->at(rand_int(columns_->size() - 1)));
+
+  std::string cols = "(";
+  for (auto &column : chosen) {
     cols += column->name_ + ", ";
   }
 #ifdef USE_CLICKHOUSE
-  cols += "_pstress_ver, ";
+  if (ch_version_column())
+    cols += "_pstress_ver, ";
 #endif
   cols.pop_back();
   cols.pop_back();
@@ -265,7 +291,7 @@ std::string Table::ColumnValues(Thd1 *thd, int value_count, bool fresh_pk) {
   std::string vals;
   for (int i = 0; i < value_count; i++) {
     vals += "(";
-    for (auto &column : *columns_) {
+    for (auto &column : chosen) {
       if (column->type_ == Column::COLUMN_TYPES::GENERATED)
         vals += "DEFAULT, ";
       else if (column->auto_increment)
@@ -299,7 +325,8 @@ std::string Table::ColumnValues(Thd1 *thd, int value_count, bool fresh_pk) {
     vals.pop_back();
     vals.pop_back();
 #ifdef USE_CLICKHOUSE
-    vals += ", toUnixTimestamp64Micro(now64())";
+    if (ch_version_column())
+      vals += ", toUnixTimestamp64Micro(now64())";
 #endif
     vals += "), ";
   }

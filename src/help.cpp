@@ -1075,6 +1075,26 @@ void add_options() {
   opt->setInt(100);
   opt->short_help = "CHLightweightDelete";
 
+  opt = newOption(Option::INT, Option::INSERT_COLUMN_SUBSET_PROB,
+                  "insert-column-subset-prob");
+  opt->help =
+      "Probability that a runtime INSERT names only a random subset of the "
+      "table's columns, so the server fills the rest with their defaults. Key "
+      "columns are always written, and so is any NOT NULL column without a "
+      "default outside ClickHouse, where omitting it would fail the statement. "
+      "The initial load always writes every column.";
+  opt->setInt(10);
+  opt->short_help = "InsertColSubset";
+
+  opt = newOption(Option::BOOL, Option::NO_VERSION_COLUMN, "no-version-column");
+  opt->help =
+      "ClickHouse: do not add the _pstress_ver UInt64 column to tables or "
+      "write it on INSERT. ReplacingMergeTree is then created without a "
+      "version argument, so of the rows sharing a key the one a merge keeps "
+      "is the last it reads rather than the newest by version.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
   opt = newOption(Option::BOOL, Option::CH_MUTATIONS_SYNC, "ch-mutations-sync");
   opt->help = "Append SETTINGS mutations_sync=2 to ClickHouse ALTER mutations "
               "(ADD/DROP COLUMN, ALTER UPDATE/DELETE). Pass flag to enable.";
