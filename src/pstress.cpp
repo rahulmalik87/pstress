@@ -303,6 +303,41 @@ int main(int argc, char *argv[]) {
                 << std::endl;
       exit(EXIT_FAILURE);
     }
+    /* --thread-per-table is what lets the comparison run alongside writes:
+       each thread is the only writer of its own table and compares only that
+       table. A thread past the last table is handed a random one, which some
+       other thread is writing to. */
+    if (options->at(Option::THREAD_PER_TABLE)->getBool()) {
+      if (options->at(Option::THREADS)->getInt() >
+          options->at(Option::TABLES)->getInt()) {
+        std::cerr << "--compare-result-with-setting with --thread-per-table "
+                     "needs --threads <= --tables, a thread past the last "
+                     "table works on a table another thread writes to"
+                  << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      if (options->at(Option::PORT)->getString().find(',') !=
+          std::string::npos)
+        std::cout << "WARNING: --thread-per-table numbers the threads per "
+                     "node, so with more than one --port two nodes write the "
+                     "same table and the comparison can see rows arrive"
+                  << std::endl;
+      if (ch_engine_collapses_rows(options->at(Option::ENGINE)->getString()))
+        std::cout << "WARNING: --engine="
+                  << options->at(Option::ENGINE)->getString()
+                  << " collapses rows in background merges, so a merge "
+                     "between the two runs can change the result. Use "
+                     "--engine=MergeTree"
+                  << std::endl;
+      if (!options->at(Option::CH_MUTATIONS_SYNC)->getBool() &&
+          (options->at(Option::CH_ALTER_UPDATE)->getInt() > 0 ||
+           options->at(Option::CH_ALTER_DELETE)->getInt() > 0))
+        std::cout << "WARNING: ALTER UPDATE/DELETE without --ch-mutations-sync "
+                     "finish in the background and can land between the two "
+                     "runs. Pass --ch-mutations-sync"
+                  << std::endl;
+    }
+
     /* the comparison only ever runs from the grammar SQL path */
     if (options->at(Option::GRAMMAR_SQL)->getInt() == 0)
       std::cout << "WARNING: --compare-result-with-setting does nothing with "

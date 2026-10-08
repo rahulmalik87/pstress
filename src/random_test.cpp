@@ -760,6 +760,42 @@ int sum_of_all_options(Thd1 *thd) {
     }
   }
 
+  /* ---- text indexes ---- */
+  {
+    auto prob = [](Option::Opt o) { return options->at(o)->getInt(); };
+    g_text_index_phrase_search_enabled =
+        prob(Option::CH_TEXT_INDEX_PHRASE_SEARCH_PROB) > 0;
+
+    if (prob(Option::CH_TEXT_INDEX_PROB) == 0 &&
+        prob(Option::CH_ADD_TEXT_INDEX) == 0 &&
+        (prob(Option::CH_DROP_TEXT_INDEX) > 0 ||
+         prob(Option::CH_MATERIALIZE_TEXT_INDEX) > 0))
+      print_and_log("WARNING: --drop-text-index and --materialize-text-index "
+                    "only act on text indexes that already exist. With "
+                    "--text-index-prob=0 and --add-text-index=0 they act only "
+                    "on the ones an earlier step left behind.");
+
+    if ((prob(Option::CH_TEXT_INDEX_PROB) > 0 ||
+         prob(Option::CH_ADD_TEXT_INDEX) > 0) &&
+        prob(Option::TEXT_WORDS) == 0)
+      print_and_log("WARNING: text indexes without --text-words. Most String "
+                    "values are then a single word, so hasAllTokens and "
+                    "hasPhrase rarely have more than one token to look for.");
+
+    if (prob(Option::CH_TEXT_INDEX_PREPROCESSOR_PROB) > 0 &&
+        options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool() &&
+        options->at(Option::RUN_QUERY_SETTING)->getString().find(
+            "use_skip_indexes") != std::string::npos) {
+      print_and_log("--text-index-preprocessor-prob together with "
+                    "--run-query-setting use_skip_indexes: a preprocessor is "
+                    "only applied on the index path, so the two sides "
+                    "legitimately differ and every mismatch would be a false "
+                    "alarm. Set --text-index-preprocessor-prob=0, or compare "
+                    "against query_plan_direct_read_from_text_index = 0.");
+      exit(EXIT_FAILURE);
+    }
+  }
+
   /* ---- table settings altered while the run is going ---- */
   {
     auto prob = [](Option::Opt o) { return options->at(o)->getInt(); };
@@ -795,6 +831,9 @@ int sum_of_all_options(Thd1 *thd) {
   opt_int_set(CH_DROP_PROJECTION, 0);
   opt_int_set(CH_MODIFY_PROJECTION, 0);
   opt_int_set(CH_MATERIALIZE_PROJECTION, 0);
+  opt_int_set(CH_ADD_TEXT_INDEX, 0);
+  opt_int_set(CH_DROP_TEXT_INDEX, 0);
+  opt_int_set(CH_MATERIALIZE_TEXT_INDEX, 0);
   opt_int_set(CH_MODIFY_TABLE_SETTING, 0);
   opt_int_set(CH_RESET_TABLE_SETTING, 0);
 #endif
@@ -1519,6 +1558,63 @@ std::string rand_string(size_t size) {
   return rs;
 }
 
+#ifdef USE_CLICKHOUSE
+/* --text-words: 1 to max_words dictionary words joined by a separator, mostly
+   a space, sometimes one that only some tokenizers split on. One word in ten is
+   capitalized, so a lower() preprocessor and a case sensitive needle disagree
+   on something. The dictionary has no quotes, so the value needs no escaping. */
+std::string rand_words(int max_words) {
+  static const char *const seps[] = {" ", " ", " ", " ", ", ", "-", ". ", "/",
+                                     "_"};
+  const int n = rand_int(max_words, 1);
+  std::string rs;
+  for (int i = 0; i < n; i++) {
+    if (i > 0)
+      rs += seps[rand_int(8)];
+    std::string w = random_strs.at(rand_int(random_strs.size() - 1));
+    if (!w.empty() && rand_int(9) == 0)
+      w[0] = std::toupper(static_cast<unsigned char>(w[0]));
+    rs += w;
+  }
+  return rs;
+}
+
+/* The dictionary entries that are a single token: letters and digits only.
+   It also has compounds like "wide-query-merger", which hasToken rejects as a
+   needle, and which a LIKE needle would match as several tokens. */
+static const std::vector<std::string> &single_token_words() {
+  static const std::vector<std::string> words = [] {
+    std::vector<std::string> out;
+    for (const auto &w : random_strs)
+      if (!w.empty() && std::all_of(w.begin(), w.end(), [](unsigned char c) {
+            return std::isalnum(c);
+          }))
+        out.push_back(w);
+    return out;
+  }();
+  return words;
+}
+
+/* a random single token word of the dictionary, for RAND_WORD */
+std::string rand_word() {
+  const auto &words = single_token_words();
+  return words.at(rand_int(words.size() - 1));
+}
+
+/* The first (RAND_PREFIX) or last (RAND_SUFFIX) 2 to 8 characters of a random
+   word, never the whole word, for LIKE 'abc%' and LIKE '%xyz' needles.
+   text_index_like_min_pattern_length defaults to 4, so the range straddles
+   it: shorter needles take the path that does not use the index. */
+std::string rand_word_part(bool prefix) {
+  std::string w;
+  do
+    w = rand_word();
+  while (w.size() < 3);
+  const size_t len = rand_int(std::min<size_t>(8, w.size() - 1), 2);
+  return prefix ? w.substr(0, len) : w.substr(w.size() - len);
+}
+#endif
+
 /* return column type from a string */
 Column::COLUMN_TYPES Column::col_type(std::string type) {
   if (type.compare("INTEGER") == 0)
@@ -1850,6 +1946,17 @@ std::string Column::rand_value() {
     }
     return value;
   }
+
+#ifdef USE_CLICKHOUSE
+  if (current_type == Column::COLUMN_TYPES::CHAR ||
+      current_type == Column::COLUMN_TYPES::VARCHAR ||
+      current_type == Column::COLUMN_TYPES::TEXT ||
+      current_type == Column::COLUMN_TYPES::BLOB) {
+    static const int text_words = opt_int(TEXT_WORDS);
+    if (text_words > 0)
+      return "'" + rand_words(text_words) + "'";
+  }
+#endif
 
   switch (current_type) {
   case Column::COLUMN_TYPES::INTEGER:
@@ -3115,6 +3222,9 @@ Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
 
   table->CreateDefaultColumn();
   table->CreateDefaultIndex();
+#ifdef USE_CLICKHOUSE
+  table->RollTextIndexes();
+#endif
   table->resolve_composite_key();
   table->resolve_seq_pk_column();
 
@@ -3355,6 +3465,7 @@ bool ch_engine_collapses_rows(const std::string &engine) {
 }
 
 bool g_projections_enabled = false;
+bool g_text_index_phrase_search_enabled = false;
 
 
 /* Columns a projection may put in its SELECT list.
@@ -3544,6 +3655,17 @@ std::string Table::definition(bool with_index, bool with_fk,
       def += indexes_->at(auto_inc_index)->definition() + ", ";
     }
   }
+#ifdef USE_CLICKHOUSE
+  /* Whatever with_index says: the text indexes are part of the table, and
+     Table::load() creates it with with_index = false. Copied under the lock,
+     --add-text-index and --drop-text-index change the list while the run is
+     going. */
+  {
+    std::shared_lock<std::shared_mutex> lock(table_mutex);
+    for (const auto &ti : text_indexes_)
+      def += ti.definition() + ", ";
+  }
+#endif
 
 
   if (with_fk) {
@@ -3640,6 +3762,8 @@ std::string Table::definition(bool with_index, bool with_fk,
          column, so nothing else changes. */
       def += ", allow_nullable_key = 1";
     }
+    if (g_text_index_phrase_search_enabled)
+      def += ", allow_experimental_text_index_phrase_search = 1";
     /* per-table settings from --table-settings-file / --table-settings.
        Copied under the lock rather than read in place: --modify-table-setting
        rewrites this string while the run is going, and none of definition()'s
@@ -4200,6 +4324,11 @@ void Table::DropColumn(Thd1 *thd) {
     unlock_table_mutex();
     return;
   }
+  /* and so would a text index */
+  if (!DropTextIndexesOnColumn(thd, name)) {
+    unlock_table_mutex();
+    return;
+  }
 #endif
 
   std::string sql = "ALTER TABLE " + name_ + " DROP COLUMN " + name;
@@ -4644,6 +4773,9 @@ void Table::ColumnRename(Thd1 *thd) {
       if (col->name_.compare(name) == 0)
         col->name_ = new_name;
     }
+#ifdef USE_CLICKHOUSE
+    RenameTextIndexColumn(name, new_name);
+#endif
     unlock_table_mutex();
   }
 }
@@ -4762,10 +4894,47 @@ std::string Table::GetRandomPartition() {
   return sql;
 }
 
-std::string Table::GetWherePrecise() {
+#ifdef USE_CLICKHOUSE
+/* A text search predicate over a column that has a text index: the functions
+   the index serves, and the prefix and suffix LIKE patterns. */
+static std::string ch_text_search_predicate(const std::string &col) {
+  auto w = [] { return rand_word(); };
+  switch (rand_int(9)) {
+  case 0:
+    return "hasToken(" + col + ", '" + w() + "')";
+  case 1:
+    return "hasAnyTokens(" + col + ", ['" + w() + "', '" + w() + "'])";
+  case 2:
+    return "hasAllTokens(" + col + ", ['" + w() + "', '" + w() + "'])";
+  case 3:
+    return "hasPhrase(" + col + ", '" + w() + " " + w() + "')";
+  case 4:
+    return col + " LIKE '" + rand_word_part(true) + "%'";
+  case 5:
+    return col + " LIKE '%" + rand_word_part(false) + "'";
+  case 6:
+    return col + " LIKE '" + w() + "%'";
+  case 7:
+    return col + " LIKE '%" + w() + "'";
+  case 8:
+    return col + " LIKE '%" + w() + "%'";
+  default:
+    return "hasAnyTokens(" + col + ", '" + w() + " " + w() + "')";
+  }
+}
+#endif
+
+std::string Table::GetWherePrecise(bool text_search) {
   auto col = GetRandomColumn();
   std::string where = " WHERE ";
   std::string rand_value;
+
+#ifdef USE_CLICKHOUSE
+  /* most of the time a column with a text index gets searched the way the
+     index is meant for, rather than compared for equality */
+  if (text_search && HasTextIndex(col->name_) && rand_int(99) < 80)
+    return where + ch_text_search_predicate(col->name_);
+#endif
 
   if (col->type_ == Column::JSON) {
     where += json_where(col);
@@ -4872,7 +5041,7 @@ std::string Table::GetWhereBulk() {
 
 void Table::SelectRandomRow(Thd1 *thd, bool select_for_update) {
   lock_table_mutex(thd->ddl_query);
-  std::string where = GetWherePrecise();
+  std::string where = GetWherePrecise(true);
   assert(where.size() > 4);
   auto select_column = SelectColumn();
   std::string sql = "SELECT " + select_column + " FROM " + name_ +
@@ -4885,6 +5054,18 @@ void Table::SelectRandomRow(Thd1 *thd, bool select_for_update) {
       options->at(Option::SECONDARY_ENGINE)->getString() == "")
     sql += " FOR UPDATE SKIP LOCKED";
 
+#ifdef USE_CLICKHOUSE
+  /* Under --thread-per-table this thread is the only writer of the table, so
+     the same SELECT run with and without the setting must return the same
+     rows. ORDER BY ALL keeps the comparison order independent. */
+  if (options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool() &&
+      options->at(Option::THREAD_PER_TABLE)->getBool()) {
+    sql += " ORDER BY ALL";
+    unlock_table_mutex();
+    compare_result_with_setting(sql, thd);
+    return;
+  }
+#endif
   unlock_table_mutex();
   if (options->at(Option::COMPARE_RESULT)->getBool()) {
     Compare_between_engine(sql, thd);
@@ -5514,6 +5695,220 @@ void Table::ForgetProjections() {
   for (auto *proj : *projections_)
     delete proj;
   projections_->clear();
+}
+
+/* ---------------------------------------------------------------------------
+   Text indexes. ClickHouse allows one per column and only on String, which is
+   what VARCHAR, CHAR, TEXT and BLOB all become.
+   ------------------------------------------------------------------------- */
+
+static bool ch_text_indexable(const Column *c) {
+  switch (c->type_) {
+  case Column::CHAR:
+  case Column::VARCHAR:
+  case Column::TEXT:
+  case Column::BLOB:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static std::string ch_roll_text_tokenizer() {
+  const int r = rand_int(99);
+  if (r < 35)
+    return "splitByNonAlpha";
+  if (r < 45)
+    return "splitByString";
+  if (r < 55)
+    return "splitByString([' ', ',', '-', '.', '/', '_'])";
+  if (r < 67)
+    return "ngrams(" + std::to_string(rand_int(4, 2)) + ")";
+  if (r < 75)
+    return "sparseGrams(3, " + std::to_string(rand_int(6, 4)) + ")";
+  if (r < 85)
+    return "asciiCJK";
+  if (r < 93)
+    return "unicodeWord";
+  return "splitByRegexp('[^a-zA-Z0-9]+')";
+}
+
+TextIndex Table::MakeRandomTextIndex(const std::string &column) {
+  static const int preprocessor_prob = opt_int(CH_TEXT_INDEX_PREPROCESSOR_PROB);
+  static const int phrase_prob = opt_int(CH_TEXT_INDEX_PHRASE_SEARCH_PROB);
+  /* seed and counter, for the same reason as the projection names: nothing is
+     persisted, so a later step restarts the counter */
+  static std::atomic<unsigned long> next_id{0};
+
+  TextIndex ti;
+  ti.name = "ti_" + name_ + "_" +
+            std::to_string(options->at(Option::INITIAL_SEED)->getInt()) + "_" +
+            std::to_string(next_id++);
+  ti.column = column;
+
+  std::string args = "tokenizer = " + ch_roll_text_tokenizer();
+  if (rand_int(99) < preprocessor_prob)
+    args += ", preprocessor = " +
+            std::string(rand_int(1) ? "lower(" : "lowerUTF8(") + column + ")";
+  if (rand_int(99) < phrase_prob)
+    args += ", support_phrase_search = 1";
+  if (rand_int(4) == 0) {
+    static const char *const v[] = {"16", "128", "512", "4096"};
+    args += ", dictionary_block_size = " + std::string(v[rand_int(3)]);
+  }
+  if (rand_int(4) == 0)
+    args += ", dictionary_block_frontcoding_compression = " +
+            std::to_string(rand_int(1));
+  if (rand_int(4) == 0) {
+    static const char *const v[] = {"128", "1024", "65536", "1048576"};
+    args += ", posting_list_block_size = " + std::string(v[rand_int(3)]);
+  }
+  if (rand_int(4) == 0) {
+    static const char *const v[] = {"'none'", "'bitpacking'", "'pfor'"};
+    args += ", posting_list_codec = " + std::string(v[rand_int(2)]);
+  }
+  /* no GRANULARITY: the server stores 100000000 for a text index whatever
+     the statement says */
+  ti.type = "text(" + args + ")";
+  return ti;
+}
+
+void Table::RollTextIndexes() {
+  static const int prob = opt_int(CH_TEXT_INDEX_PROB);
+  if (prob <= 0)
+    return;
+  for (auto col : *columns_)
+    if (ch_text_indexable(col) && rand_int(99) < prob)
+      text_indexes_.push_back(MakeRandomTextIndex(col->name_));
+}
+
+bool Table::HasTextIndex(const std::string &column) const {
+  for (const auto &ti : text_indexes_)
+    if (ti.column == column)
+      return true;
+  return false;
+}
+
+void Table::RenameTextIndexColumn(const std::string &from,
+                                  const std::string &to) {
+  for (auto &ti : text_indexes_)
+    if (ti.column == from)
+      ti.column = to;
+}
+
+bool Table::DropTextIndexesOnColumn(Thd1 *thd, const std::string &column) {
+  for (auto it = text_indexes_.begin(); it != text_indexes_.end();) {
+    if (it->column != column) {
+      it++;
+      continue;
+    }
+    if (!execute_sql("ALTER TABLE " + name_ + " DROP INDEX IF EXISTS " +
+                         it->name,
+                     thd))
+      return false;
+    it = text_indexes_.erase(it);
+  }
+  return true;
+}
+
+/* The server is the source of truth: CREATE TABLE may have failed, an earlier
+   step may have added or dropped indexes, and none of it is in the metadata. */
+bool Table::LoadTextIndexesFromServer(Thd1 *thd) {
+  auto rows = thd->db->get_query_result(
+      "SELECT name, expr, type_full, granularity FROM "
+      "system.data_skipping_indices WHERE database = '" +
+      options->at(Option::DATABASE)->getString() + "' AND table = '" + name_ +
+      "' AND type = 'text' ORDER BY name");
+  std::vector<TextIndex> found;
+  for (const auto &row : rows) {
+    if (row.size() < 4)
+      return false;
+    TextIndex ti;
+    ti.name = row[0];
+    ti.column = row[1];
+    ti.type = row[2];
+    ti.granularity = row[3];
+    found.push_back(ti);
+  }
+  lock_table_mutex(true);
+  text_indexes_ = std::move(found);
+  unlock_table_mutex();
+  return true;
+}
+
+void Table::AddTextIndex(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  std::vector<std::string> candidates;
+  for (auto col : *columns_)
+    if (ch_text_indexable(col) && !HasTextIndex(col->name_))
+      candidates.push_back(col->name_);
+  if (candidates.empty()) {
+    unlock_table_mutex();
+    return;
+  }
+  TextIndex ti =
+      MakeRandomTextIndex(candidates.at(rand_int(candidates.size() - 1)));
+  unlock_table_mutex();
+
+  /* shared dml_mutex, so a DROP COLUMN cannot take the column away between
+     building the statement and running it */
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
+  if (!execute_sql("ALTER TABLE " + name_ + " ADD " + ti.definition(), thd))
+    return;
+
+  lock_table_mutex(thd->ddl_query);
+  text_indexes_.push_back(ti);
+  unlock_table_mutex();
+}
+
+/* Copy out one of this table's text indexes. A copy rather than a reference,
+   because a concurrent DropTextIndex erases it once the lock is released. */
+static bool ch_pick_text_index(Table *table, Thd1 *thd, TextIndex *out) {
+  table->lock_table_mutex(thd->ddl_query);
+  if (table->text_indexes_.empty()) {
+    table->unlock_table_mutex();
+    return false;
+  }
+  *out = table->text_indexes_.at(rand_int(table->text_indexes_.size() - 1));
+  table->unlock_table_mutex();
+  return true;
+}
+
+void Table::DropTextIndex(Thd1 *thd) {
+  TextIndex picked;
+  if (!ch_pick_text_index(this, thd, &picked))
+    return;
+
+  if (!execute_sql("ALTER TABLE " + name_ + " DROP INDEX IF EXISTS " +
+                       picked.name,
+                   thd))
+    return;
+
+  lock_table_mutex(thd->ddl_query);
+  for (auto it = text_indexes_.begin(); it != text_indexes_.end(); it++)
+    if (it->name == picked.name) {
+      text_indexes_.erase(it);
+      break;
+    }
+  unlock_table_mutex();
+}
+
+/* MATERIALIZE INDEX builds the index on parts that lack it, CLEAR INDEX
+   removes it from every part while keeping it in the table definition. Either
+   way the queries keep running against a mix of indexed and unindexed parts,
+   which must not change a single result. */
+void Table::MaterializeTextIndex(Thd1 *thd) {
+  TextIndex picked;
+  if (!ch_pick_text_index(this, thd, &picked))
+    return;
+
+  std::string sql = "ALTER TABLE " + name_ +
+                    (rand_int(3) == 0 ? " CLEAR INDEX IF EXISTS "
+                                      : " MATERIALIZE INDEX IF EXISTS ") +
+                    picked.name;
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+  execute_sql(sql, thd);
 }
 
 #else

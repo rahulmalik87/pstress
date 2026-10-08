@@ -1245,6 +1245,68 @@ void add_options() {
   opt->short_help = "MaterializeProjection";
   opt->setDDL();
 
+  /* ClickHouse text indexes. A column takes at most one text index, and only a
+     String (VARCHAR, CHAR, TEXT, BLOB) column can take one. */
+  opt = newOption(Option::INT, Option::CH_TEXT_INDEX_PROB, "text-index-prob");
+  opt->help = "Probability out of 100 that a String column gets a text index "
+              "in CREATE TABLE, with a random tokenizer and random optional "
+              "parameters. Use with --text-words so the values have more than "
+              "one token.";
+  opt->setInt(0);
+
+  opt = newOption(Option::INT, Option::CH_TEXT_INDEX_PREPROCESSOR_PROB,
+                  "text-index-preprocessor-prob");
+  opt->help = "Probability out of 100 that a text index gets preprocessor = "
+              "lower(col). The preprocessor is only applied on the index path, "
+              "so hasToken and friends legitimately return different rows with "
+              "use_skip_indexes = 0. Keep it at 0 when comparing against "
+              "use_skip_indexes = 0; it is fine against "
+              "query_plan_direct_read_from_text_index = 0.";
+  opt->setInt(0);
+
+  opt = newOption(Option::INT, Option::CH_TEXT_INDEX_PHRASE_SEARCH_PROB,
+                  "text-index-phrase-search-prob");
+  opt->help = "Probability out of 100 that a text index gets "
+              "support_phrase_search = 1. Any value above 0 also sets the "
+              "MergeTree setting allow_experimental_text_index_phrase_search "
+              "= 1 on every table, which the argument requires.";
+  opt->setInt(0);
+
+  opt = newOption(Option::INT, Option::CH_ADD_TEXT_INDEX, "add-text-index");
+  opt->help = "ALTER TABLE t ADD INDEX ... TYPE text(...) on a String column "
+              "that has no text index yet. Existing parts stay unindexed until "
+              "--materialize-text-index reaches them.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "AddTextIndex";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_DROP_TEXT_INDEX, "drop-text-index");
+  opt->help = "ALTER TABLE t DROP INDEX on one of the table's text indexes.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "DropTextIndex";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_MATERIALIZE_TEXT_INDEX,
+                  "materialize-text-index");
+  opt->help = "ALTER TABLE t MATERIALIZE INDEX on one of the table's text "
+              "indexes, or a quarter of the time CLEAR INDEX, which removes "
+              "the index from every part and leaves the table with a mix of "
+              "indexed and unindexed parts again. Both are mutations and honour "
+              "--ch-mutations-sync.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "MaterializeTextIndex";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::TEXT_WORDS, "text-words");
+  opt->help = "Generate String values as 1 to N dictionary words joined by "
+              "random separators, with an occasional capitalized word, instead "
+              "of the usual single word. 0 keeps the usual values. Ignores the "
+              "VARCHAR width, which ClickHouse does not enforce.";
+  opt->setInt(0);
+
   /* ClickHouse table settings changed while the run is going. The pool file
      decides what may be altered: only its alter: lines are candidates, because
      a MergeTree setting can be read only after create and nothing in

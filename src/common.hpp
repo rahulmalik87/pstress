@@ -257,6 +257,17 @@ struct Option {
     CH_DROP_PROJECTION,
     CH_MODIFY_PROJECTION,
     CH_MATERIALIZE_PROJECTION,
+    /* ClickHouse text (full-text) indexes on String columns: a share of
+       them get one at CREATE TABLE, and ADD/DROP/MATERIALIZE put them under
+       load while the run is going. TEXT_WORDS makes string values a few
+       dictionary words long, so there is something to tokenize. */
+    CH_TEXT_INDEX_PROB,
+    CH_TEXT_INDEX_PREPROCESSOR_PROB,
+    CH_TEXT_INDEX_PHRASE_SEARCH_PROB,
+    CH_ADD_TEXT_INDEX,
+    CH_DROP_TEXT_INDEX,
+    CH_MATERIALIZE_TEXT_INDEX,
+    TEXT_WORDS,
     /* ClickHouse table settings changed while the run is going: MODIFY sets an
        alterable pool entry to a fresh value, RESET takes the override away
        again. See the alter: prefix in the table settings pool file. */

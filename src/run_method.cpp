@@ -237,6 +237,17 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
         working_table = enforce_table;
         table_check = 0;
       }
+#ifdef USE_CLICKHOUSE
+      /* --thread-per-table makes this thread the only writer of its table, so
+         the two runs of --compare-result-with-setting see the same rows as
+         long as both read that table and nothing else. A table picked at
+         random could be changing under another thread's inserts. */
+      if (options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool() &&
+          options->at(Option::THREAD_PER_TABLE)->getBool()) {
+        working_table = enforce_table;
+        table_check = 0;
+      }
+#endif
       working_table->lock_table_mutex(thd->ddl_query);
       table.found_name = working_table->name_;
 
@@ -250,6 +261,19 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
         // if column is defined as NOT SECONDARY skip it
         if (col->not_secondary)
           continue;
+
+#ifdef USE_CLICKHOUSE
+        /* T1_TEXTIDX_n wants a column with a text index, whatever its
+           pstress type; fill that first, so an indexed VARCHAR column is not
+           spent on a T1_VARCHAR_n the line may not even have */
+        if (table.column_count.at(grammar_table::TEXTIDX) >
+                (int)table.columns.at(grammar_table::TEXTIDX).size() &&
+            working_table->HasTextIndex(col->name_)) {
+          table.columns.at(grammar_table::TEXTIDX)
+              .emplace_back(col->name_, col->rand_value());
+          continue;
+        }
+#endif
 
         // if a valid column is not found in the table
         if (col_type == grammar_table::MAX)
@@ -317,6 +341,23 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
 
   sql = std::regex_replace(sql, std::regex("RAND_INT"),
                            std::to_string(rand_int(100)));
+
+#ifdef USE_CLICKHOUSE
+  /* RAND_WORD_0-9 is one dictionary word reused wherever the line repeats it,
+     a bare RAND_WORD a fresh word at every occurrence */
+  for (int i = 0; i < 10; i++)
+    sql = std::regex_replace(sql, std::regex("RAND_WORD_" + std::to_string(i)),
+                             rand_word());
+  for (auto pos = sql.find("RAND_WORD"); pos != std::string::npos;
+       pos = sql.find("RAND_WORD", pos))
+    sql.replace(pos, 9, rand_word());
+  /* RAND_PREFIX / RAND_SUFFIX: the start or the end of a word, fresh at every
+     occurrence */
+  for (const std::string ph : {"RAND_PREFIX", "RAND_SUFFIX"})
+    for (auto pos = sql.find(ph); pos != std::string::npos;
+         pos = sql.find(ph, pos))
+      sql.replace(pos, ph.size(), rand_word_part(ph == "RAND_PREFIX"));
+#endif
 
 #ifdef USE_CLICKHOUSE
   /* Not COMPARE_RESULT, so the enforce_table override above does not kick in
@@ -542,6 +583,10 @@ bool Thd1::run_some_query() {
   static std::once_flag startup_schema_check;
   static std::atomic<bool> startup_schema_ok{true};
   std::call_once(startup_schema_check, [&]() {
+    /* the text indexes are not in the metadata, read back what the server
+       has before the workload starts relying on the list */
+    for (auto *table : *all_tables)
+      table->LoadTextIndexesFromServer(this);
     bool ok = ch_verify_schema({myParam->address}, {myParam->port},
                                options->at(Option::DATABASE)->getString(),
                                options->at(Option::USER)->getString(),
@@ -811,6 +856,15 @@ bool Thd1::run_some_query() {
       break;
     case Option::CH_MATERIALIZE_PROJECTION:
       table->MaterializeProjection(this);
+      break;
+    case Option::CH_ADD_TEXT_INDEX:
+      table->AddTextIndex(this);
+      break;
+    case Option::CH_DROP_TEXT_INDEX:
+      table->DropTextIndex(this);
+      break;
+    case Option::CH_MATERIALIZE_TEXT_INDEX:
+      table->MaterializeTextIndex(this);
       break;
     case Option::CH_MODIFY_TABLE_SETTING:
       table->ModifyTableSetting(this);

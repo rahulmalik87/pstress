@@ -72,6 +72,14 @@ template <typename T> static T try_negative(T val) {
 std::string rand_float(float upper, float lower = 0);
 std::string rand_double(double upper, double lower = 0);
 std::string rand_string(size_t size);
+#ifdef USE_CLICKHOUSE
+/* --text-words: 1 to max_words dictionary words with random separators */
+std::string rand_words(int max_words);
+/* one single token dictionary word, for RAND_WORD in a grammar line */
+std::string rand_word();
+/* the start or the end of a word, for RAND_PREFIX and RAND_SUFFIX */
+std::string rand_word_part(bool prefix);
+#endif
 const int maximum_records_in_each_parititon_list = 30;
 const std::string TABLE_PREFIX = "tt_";
 const std::string PARTITION_SUFFIX = "_p";
@@ -91,6 +99,7 @@ struct Table;
 #ifdef USE_CLICKHOUSE
 /* defined further down, next to MVInfo; Table only holds pointers to it */
 struct Projection;
+struct TextIndex;
 #endif
 struct Column {
 public:
@@ -440,7 +449,10 @@ struct Table {
   void SetSecondaryEngine(Thd1 *thd);
   std::string GetRandomPartition();
   Column *GetRandomColumn();
-  std::string GetWherePrecise();
+  /* text_search: on ClickHouse, a column with a text index may be searched
+     with hasToken/LIKE instead of matched for equality. Only SELECT asks for
+     it: an UPDATE or DELETE has to stay a point predicate. */
+  std::string GetWherePrecise(bool text_search = false);
   std::string GetWhereBulk();
   std::string GetWhereLargeRange();
   /* fresh_pk=false makes the primary key come from the existing-key sampler
@@ -564,6 +576,28 @@ struct Table {
   void DropProjection(Thd1 *thd);
   void ModifyProjection(Thd1 *thd);
   void MaterializeProjection(Thd1 *thd);
+  /* Text indexes on String columns, at most one per column. Guarded by
+     table_mutex. Not persisted in the metadata: at the start of every step
+     LoadTextIndexesFromServer() rebuilds the list from
+     system.data_skipping_indices, so the server is the source of truth. */
+  std::vector<TextIndex> text_indexes_;
+  /* roll the text indexes CREATE TABLE emits, see --text-index-prob. Called
+     once when the table is built, before anything else can see it. */
+  void RollTextIndexes();
+  /* a random text index over column, see --text-index-preprocessor-prob */
+  TextIndex MakeRandomTextIndex(const std::string &column);
+  /* Caller must hold table_mutex. */
+  bool HasTextIndex(const std::string &column) const;
+  /* Drop the text index on this column before an ALTER ClickHouse would
+     otherwise reject (DROP COLUMN). Caller must hold table_mutex; false when
+     the drop failed, so the caller can leave the column alone. */
+  bool DropTextIndexesOnColumn(Thd1 *thd, const std::string &column);
+  /* RENAME COLUMN rewrites the index expression on the server, follow it */
+  void RenameTextIndexColumn(const std::string &from, const std::string &to);
+  bool LoadTextIndexesFromServer(Thd1 *thd);
+  void AddTextIndex(Thd1 *thd);
+  void DropTextIndex(Thd1 *thd);
+  void MaterializeTextIndex(Thd1 *thd);
   /* ALTER TABLE ... MODIFY SETTING / RESET SETTING one of the settings the pool
      marked alterable, keeping Table::settings in step so a later DROP/CREATE
      and the next step rebuild the table the way it is now. */
@@ -849,6 +883,8 @@ struct grammar_table {
     DECIMAL,
     TEXT,
     JSON,
+    /* a String column carrying a text index, T1_TEXTIDX_1 in a grammar line */
+    TEXTIDX,
     MAX
   };
   static sql_col_types get_col_type(std::string type) {
@@ -872,6 +908,8 @@ struct grammar_table {
       return TEXT;
     if (type == "JSON")
       return JSON;
+    if (type == "TEXTIDX")
+      return TEXTIDX;
     return MAX;
   }
   static std::string get_col_type(sql_col_types type) {
@@ -896,6 +934,8 @@ struct grammar_table {
       return "TEXT";
     case JSON:
       return "JSON";
+    case TEXTIDX:
+      return "TEXTIDX";
     case MAX:
       break;
     }
@@ -1011,6 +1051,27 @@ struct Projection {
   std::string body; /* "SELECT i1, v2 ORDER BY (i1, v2)" */
   std::vector<std::string> columns;
 };
+
+/* One text index pstress put on a String column (or found there at the start
+   of a step). type is the full index type, "text(tokenizer = ...)", and
+   granularity is empty for the server default. */
+struct TextIndex {
+  std::string name;
+  std::string column;
+  std::string type;
+  std::string granularity;
+  std::string definition() const {
+    std::string def = "INDEX " + name + " " + column + " TYPE " + type;
+    if (!granularity.empty())
+      def += " GRANULARITY " + granularity;
+    return def;
+  }
+};
+
+/* True when --text-index-phrase-search-prob is on, so Table::definition() emits
+   the MergeTree setting support_phrase_search needs. Set once in
+   sum_of_all_options(). */
+extern bool g_text_index_phrase_search_enabled;
 
 /* True when --add-projection is on, so Table::definition() knows to emit the
    MergeTree settings a projection needs. Set once in sum_of_all_options(). */
