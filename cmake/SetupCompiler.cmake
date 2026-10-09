@@ -1,0 +1,78 @@
+SET(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+#
+IF((CMAKE_SYSTEM_PROCESSOR MATCHES "i386|i686|x86|AMD64") AND (CMAKE_SIZEOF_VOID_P EQUAL 4))
+  SET(ARCH "x86")
+ELSEIF((CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64") AND (CMAKE_SIZEOF_VOID_P EQUAL 8))
+  SET(ARCH "x86_64")
+ELSEIF((CMAKE_SYSTEM_PROCESSOR MATCHES "i386") AND (CMAKE_SIZEOF_VOID_P EQUAL 8) AND (APPLE))
+  # Mac is weird like that.
+  SET(ARCH "x86_64")
+ELSEIF(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm*")
+  SET(ARCH "ARM")
+ELSEIF(CMAKE_SYSTEM_PROCESSOR MATCHES "sparc")
+  SET(ARCH "sparc")
+ENDIF()
+#
+MESSAGE(STATUS "Architecture is ${ARCH}")
+#
+OPTION(STRICT_FLAGS "Turn on a lot of compiler warnings" ON)
+OPTION(ASAN "Turn ON Address sanitizer feature" OFF)
+OPTION(DEBUG "Add debug info for GDB" OFF)
+OPTION(STATIC_LIBRARY "Statically compile MySQL library into PStress" ON)
+OPTION(STRICT_CPU "Strictly bind the binary to current CPU" ON)
+#
+# Debug Release RelWithDebInfo MinSizeRel
+IF(CMAKE_BUILD_TYPE STREQUAL "")
+  SET(CMAKE_BUILD_TYPE "Release")
+ENDIF()
+#
+IF(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  ADD_DEFINITIONS(-ggdb3)
+ELSE()
+  ADD_DEFINITIONS(-O3)
+ENDIF()
+##
+IF(STRICT_CPU)
+  ADD_DEFINITIONS(-march=native)
+ELSE()
+  # Portable x86-64 baseline.
+  # On GCC/Linux we additionally enable runtime SIMD dispatch: hot functions
+  # annotated with PSTRESS_TARGET_CLONES are compiled into multiple ISA
+  # variants (AVX-512, AVX2, generic) and the best one is selected at load
+  # time via GCC IFUNC — no SIGILL on machines that lack AVX-512.
+  ADD_DEFINITIONS(-march=x86-64)
+  IF(ARCH STREQUAL "x86_64" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+     AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    ADD_DEFINITIONS(-DPSTRESS_RUNTIME_SIMD)
+    MESSAGE(STATUS "Runtime SIMD dispatch enabled (AVX-512/AVX2/default via target_clones)")
+  ENDIF()
+ENDIF()
+#
+IF(STRICT_FLAGS)
+   ADD_DEFINITIONS(-Wall -Werror -pedantic-errors -Wmissing-declarations)
+   ADD_DEFINITIONS(-Wno-error=unused-parameter)
+ENDIF ()
+##
+IF(ASAN)
+  # doesn't work with GCC < 4.8
+  ADD_DEFINITIONS(-fsanitize=address)
+  SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+ENDIF()
+#
+SET(OTHER_LIBS ${OTHER_LIBS} resolv)
+INCLUDE(FindOpenSSL REQUIRED)
+SET(OTHER_LIBS ${OTHER_LIBS} ssl crypto)
+#
+INCLUDE(FindThreads REQUIRED)
+SET (OTHER_LIBS ${OTHER_LIBS} pthread)
+#
+INCLUDE(FindZLIB REQUIRED)
+SET (OTHER_LIBS ${OTHER_LIBS} z)
+#
+#
+IF(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  SET (OTHER_LIBS ${OTHER_LIBS} dl rt)
+ENDIF()
+#

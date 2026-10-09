@@ -77,10 +77,17 @@ void add_options() {
   opt->setInt(0);
   opt->help = "Number of default undo tablespaces ";
 
-  /* Engine */
+  /* Engine. For ClickHouse this names the MergeTree family member used for
+     every table: MergeTree, ReplacingMergeTree, SummingMergeTree or
+     AggregatingMergeTree (a Replicated prefix is added when --port names more
+     than one port). The default is ReplacingMergeTree, which is what pstress
+     used unconditionally before the engine was honoured; pass
+     --engine=MergeTree for a source that never collapses rows, which is what
+     the materialized view consistency check needs to catch duplicates. */
   opt = newOption(Option::STRING, Option::ENGINE, "engine");
   opt->help = "Engine used ";
-  opt->setString(strcmp(FORK, "MySQL") == 0 ? "INNODB" : "");
+  opt->setString(strcmp(FORK, "MySQL") == 0 ? "INNODB" :
+                 strcmp(FORK, "ClickHouse") == 0 ? "ReplacingMergeTree" : "");
 
   /* Just Load DDL*/
   opt = newOption(Option::BOOL, Option::JUST_LOAD_DDL, "jlddl");
@@ -185,10 +192,24 @@ void add_options() {
 
   opt =
       newOption(Option::INT, Option::COMPOSITE_KEY_PROB, "composite-key-prob");
-  opt->help = "Probablity of using a composite key in primary key. Then "
-              "enforcing column would be ipkey or vpkey. But other key are "
-              "added just part of primary key ";
+  opt->help = "Probability that a column is added to the primary key beyond the "
+              "enforcing one (ipkey or vpkey), making the key composite. The "
+              "roll is per candidate column, not per table, so the share of "
+              "tables that end up composite is 1-(1-p)^candidates. Candidates "
+              "exclude the enforcing key, partition columns, BLOB/JSON/TEXT and "
+              "any column whose null_val is set, which in practice leaves about "
+              "a third of the columns -- so 5 yields roughly one table in 7 "
+              "with a 2-column key, not one in three. On ClickHouse the primary "
+              "key is also the ORDER BY, so this is what produces a "
+              "multi-column ORDER BY; it defaults to 5 there and 1 elsewhere. "
+              "0 turns it off.";
   opt->setInt(1);
+
+  opt = newOption(Option::INT, Option::CH_VERIFY_INTERVAL, "ch-verify-interval");
+  opt->help = "ClickHouse replica verification interval in seconds (0=disabled, "
+              "only at end). When > 0, a background thread pauses all worker "
+              "threads and checks count+checksum on all replicas every N seconds.";
+  opt->setInt(0);
 
   opt = newOption(Option::INT, Option::CALL_FUNCTION, "call-function-prob");
   opt->help = "Probability of calling function ";
@@ -483,8 +504,8 @@ void add_options() {
 
   opt = newOption(Option::INT, Option::BULK_INSERT_WIDTH, "bulk-insert-width");
   opt->help = "The maximum width of each insert in bulk insert default is " +
-              std::to_string(1024 * 1024);
-  opt->setInt(4024 * 1024);
+              std::to_string(16 * 1024 * 1024);
+  opt->setInt(16 * 1024 * 1024);
 
   /* ENFORCE REWRITE  */
   opt = newOption(Option::INT, Option::ENFORCE_MERGE, "enforce-merge-prob");
@@ -569,7 +590,7 @@ void add_options() {
   opt = newOption(Option::INT, Option::NULL_PROB, "null-prob");
   opt->help = "Probability that a column would have null value. It is used for "
               "insert, update, delete and also in where clause";
-  opt->setInt(1);
+  opt->setInt(0);
 
   opt = newOption(Option::FLOAT, Option::UNIQUE_RANGE, "range");
   opt->help = "Sets the range for random number generation (integers, floats, "
@@ -585,6 +606,13 @@ void add_options() {
   opt = newOption(Option::STRING, Option::DICTIONARY_FILE, "dictionary-file");
   opt->help = "Dictionary file for random string";
   opt->setString("english_dictionary.txt");
+
+  /* table name prefix */
+  opt = newOption(Option::STRING, Option::TABLE_PREFIX, "table-prefix");
+  opt->help = "Prefix of the generated table names, followed by the table "
+              "number: tt_1, tt_2, ... Give two runs that share a database "
+              "different prefixes so neither drops the other's tables.";
+  opt->setString("tt_");
 
   /* total number of queries */
   opt = newOption(Option::INT, Option::TOTAL_QUERIES, "total-queries");
@@ -625,7 +653,7 @@ void add_options() {
 
   opt = newOption(Option::INT, Option::PKEY_IN_SET, "pk-in-set");
   opt->help = "USE PKEY IN SET tt_N set col=";
-  opt->setInt(1);
+  opt->setInt(0);
 
   /* disable char columns*/
   opt = newOption(Option::BOOL, Option::NO_CHAR, "no-char");
@@ -931,9 +959,51 @@ void add_options() {
   opt->help = "Probability of primary key column being auto increment";
   opt->setInt(10);
 
+  /* Sequential primary keys. Deliberately left at the default
+     required_argument: a no_argument BOOL can only ever be set to true, and
+     this one has to be switchable off on ClickHouse, where it defaults on. */
+  opt = newOption(Option::BOOL, Option::SEQ_PK, "seq-pk");
+  opt->help = "INSERT takes primary key values from a per-table increasing "
+              "counter instead of random ones, and UPDATE/DELETE/SELECT "
+              "predicates aim inside the range of keys handed out so far. On "
+              "ClickHouse the primary key is the table's ORDER BY prefix, so "
+              "this makes each new part cover a narrow, increasing key range "
+              "the way real append-only ingest does, instead of spanning the "
+              "whole key space. Defaults ON for ClickHouse, OFF elsewhere; "
+              "pass --seq-pk=false to turn it off.";
+  opt->setBool(false);
+  opt->short_help = "SeqPK";
+
+  opt = newOption(Option::INT, Option::SEQ_PK_RECENT_PROB,
+                  "seq-pk-recent-prob");
+  opt->help = "With --seq-pk, probability that a predicate aims only at the "
+              "newest slice of the key range (see --seq-pk-recent-rows) "
+              "instead of the whole range. The newest keys are the ones still "
+              "in small unmerged parts, so this is where the interesting "
+              "ClickHouse behaviour is.";
+  opt->setInt(30);
+  opt->short_help = "SeqPKRecent";
+
+  opt = newOption(Option::INT, Option::SEQ_PK_RECENT_ROWS,
+                  "seq-pk-recent-rows");
+  opt->help = "Width, in keys, of the newest slice --seq-pk-recent-prob aims "
+              "at";
+  opt->setInt(10000);
+  opt->short_help = "SeqPKRecentRows";
+
+  opt = newOption(Option::INT, Option::SEQ_PK_DUP_PROB, "seq-pk-dup-prob");
+  opt->help = "With --seq-pk, probability that an inserted row reuses a key "
+              "already handed out instead of taking a new one. Unique keys "
+              "would otherwise retire the ReplacingMergeTree dedup path "
+              "entirely, since colliding random keys are the only reason a "
+              "row is ever collapsed today. A small rate keeps dedup "
+              "exercised while leaving the append-only shape dominant.";
+  opt->setInt(5);
+  opt->short_help = "SeqPKDup";
+
   opt = newOption(Option::INT, Option::INSERT_BULK_COUNT, "insert-bulk-count");
   opt->help = "Number of rows to insert in a single insert statement";
-  opt->setInt(10);
+  opt->setInt(1000);
 
   opt = newOption(Option::INT, Option::INSERT_BULK, "insert-bulk");
   opt->help = "insert random row";
@@ -979,6 +1049,453 @@ void add_options() {
   opt->setInt(8);
   opt->short_help = "DB";
   opt->setSQL();
+
+  /* ClickHouse ALTER TABLE UPDATE mutation */
+  opt = newOption(Option::INT, Option::CH_ALTER_UPDATE, "ch-alter-update");
+  opt->help = "ClickHouse ALTER TABLE t UPDATE col=val WHERE ... SETTINGS mutations_sync=2";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "CHAlterUpdate";
+  opt->setDDL();
+
+  /* ClickHouse ALTER TABLE DELETE mutation */
+  opt = newOption(Option::INT, Option::CH_ALTER_DELETE, "ch-alter-delete");
+  opt->help = "ClickHouse ALTER TABLE t DELETE WHERE ... SETTINGS mutations_sync=2";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "CHAlterDelete";
+  opt->setDDL();
+
+  /* ClickHouse: which implementation a DELETE FROM asks for. The server
+     default, lightweight_delete_mode = alter_update, rewrites every matched
+     part as a heavyweight mutation; lightweight_update writes a patch part
+     instead. Rolled per statement rather than set once, so a single run covers
+     both code paths. */
+  opt = newOption(Option::INT, Option::CH_LIGHTWEIGHT_DELETE,
+                  "ch-lightweight-delete");
+  opt->help =
+      "Probability that a DELETE FROM appends SETTINGS lightweight_delete_mode "
+      "= 'lightweight_update', so the delete writes a patch part inline "
+      "instead of scheduling a heavyweight mutation. The mutation path is "
+      "gated by number_of_free_entries_in_pool_to_execute_mutation, so a "
+      "merge-saturated pool can leave the statement waiting minutes under "
+      "lightweight_deletes_sync = 2; the patch-part path never touches that "
+      "pool. Not a workload action of its own -- it only modifies the DELETE "
+      "FROM that --delete-precise/--delete-bulk already roll. Lowering this "
+      "below 100 also puts mutations back in reach of --ch-kill-mutation, "
+      "which cannot target a patch part. Mode 'lightweight_update' falls back "
+      "to alter_update when a patch part is impossible, so this never fails a "
+      "statement on its own.";
+  opt->setInt(100);
+  opt->short_help = "CHLightweightDelete";
+
+  opt = newOption(Option::INT, Option::INSERT_COLUMN_SUBSET_PROB,
+                  "insert-column-subset-prob");
+  opt->help =
+      "Probability that a runtime INSERT names only a random subset of the "
+      "table's columns, so the server fills the rest with their defaults. Key "
+      "columns are always written, and so is any NOT NULL column without a "
+      "default outside ClickHouse, where omitting it would fail the statement. "
+      "The initial load always writes every column.";
+  opt->setInt(10);
+  opt->short_help = "InsertColSubset";
+
+  opt = newOption(Option::BOOL, Option::NO_VERSION_COLUMN, "no-version-column");
+  opt->help =
+      "ClickHouse: do not add the _pstress_ver UInt64 column to tables or "
+      "write it on INSERT. ReplacingMergeTree is then created without a "
+      "version argument, so of the rows sharing a key the one a merge keeps "
+      "is the last it reads rather than the newest by version.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  opt = newOption(Option::BOOL, Option::SEQ_PK_TRUST_METADATA,
+                  "seq-pk-trust-metadata");
+  opt->help =
+      "With --seq-pk, at step >= 2 take each table's next key from the step "
+      "file as written instead of raising it to SELECT max(pk) from the "
+      "server. Skips one full-column scan per table at startup, which is slow "
+      "with many tables or many parts. Only safe when the previous step wrote "
+      "its step file: if that step died, keys already in the table get "
+      "reissued and, under ReplacingMergeTree, silently replace older rows.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  opt = newOption(Option::BOOL, Option::CH_MUTATIONS_SYNC, "ch-mutations-sync");
+  opt->help = "Append SETTINGS mutations_sync=2 to ClickHouse ALTER mutations "
+              "(ADD/DROP COLUMN, ALTER UPDATE/DELETE). Pass flag to enable.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+  opt->short_help = "CHMutationsSync";
+
+  /* ClickHouse KILL MUTATION. A mutation is a background part rewrite, so
+     cancelling one mid-flight leaves the table half-mutated and any ALTER that
+     was waiting on it (--ch-mutations-sync) failing — both states the server
+     has to survive. */
+  opt = newOption(Option::INT, Option::CH_KILL_MUTATION, "ch-kill-mutation");
+  opt->help = "Probability weight for KILL MUTATION: pick a random unfinished "
+              "mutation of this run's database out of system.mutations and "
+              "cancel it. Rolls blind and does nothing when there is no "
+              "unfinished mutation.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "CHKillMutation";
+  opt->setDDL();
+
+  opt = newOption(Option::BOOL, Option::CH_ADD_COLUMN_BACKFILL,
+                  "ch-add-column-backfill");
+  opt->help = "After ADD COLUMN succeeds, fire an ALTER TABLE UPDATE to "
+              "backfill existing rows with a random server-side value "
+              "instead of leaving them at the ClickHouse zero-default.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+  opt->short_help = "CHBackfill";
+
+  /* ClickHouse materialized views. --create-mv fires CREATE MATERIALIZED VIEW
+     ... POPULATE against a random table while the load keeps inserting into it,
+     which is the race the atomicity of POPULATE has to survive. */
+  opt = newOption(Option::INT, Option::CH_CREATE_MV, "create-mv");
+  opt->help = "Create a ClickHouse materialized view with POPULATE over a "
+              "random table while the workload runs. The view mirrors the "
+              "table, so once inserts stop it must hold exactly the table's "
+              "rows; --verify-mv checks that at the end of the run. Atomic "
+              "POPULATE is a per-server guarantee, so against a multi-replica "
+              "ClickHouse Cloud endpoint the check reports a false MISMATCH: "
+              "pass --create-mv=0 there, or use a single-replica service.";
+  opt->setInt(1);
+  opt->setSQL();
+  opt->short_help = "CreateMV";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_DROP_MV, "drop-mv");
+  opt->help = "Drop a random existing materialized view. With "
+              "--verify-mv-before-drop (the default) the view is checked "
+              "against its table first, which pauses all workers for the "
+              "duration of the check, so keep this probability low.";
+  opt->setInt(1);
+  opt->setSQL();
+  opt->short_help = "DropMV";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_MAX_MV_PER_TABLE,
+                  "max-mv-per-table");
+  opt->help = "Maximum number of materialized views on a single table. Every "
+              "view adds work to every insert into that table.";
+  opt->setInt(2);
+
+  opt = newOption(Option::INT, Option::CH_MV_SNAPSHOT_SLEEP_MS,
+                  "mv-snapshot-sleep-ms");
+  opt->help = "Appended as SETTINGS merge_tree_storage_snapshot_sleep_ms=N to "
+              "CREATE MATERIALIZED VIEW ... POPULATE, widening the window in "
+              "which the source snapshot is taken so concurrent inserts "
+              "actually collide with it. 0 disables. If a run with "
+              "--mv-populate-atomically=off reports no mismatch at all, this "
+              "is the first thing to raise.";
+  opt->setInt(1000);
+
+  opt = newOption(Option::STRING, Option::CH_MV_POPULATE_ATOMICALLY,
+                  "mv-populate-atomically");
+  opt->help = "on|off|random. Appended as SETTINGS "
+              "materialized_views_populate_atomically=1/0 to each CREATE "
+              "MATERIALIZED VIEW, and recorded per view. off forces the legacy "
+              "non-atomic population, which is expected to lose or duplicate "
+              "rows and so acts as a negative control proving the check "
+              "actually detects the bug; mismatches on off views are reported "
+              "but never fail the run. random rolls per view.";
+  opt->setString("on");
+
+  opt = newOption(Option::INT, Option::CH_MV_TO_PROB, "mv-to-prob");
+  opt->help = "Percent chance that a materialized view writes into a freshly "
+              "created TO target table instead of its own inner table. "
+              "POPULATE together with TO was a syntax error before ClickHouse "
+              "PR 108715.";
+  opt->setInt(30);
+
+  opt = newOption(Option::BOOL, Option::CH_VERIFY_MV_BEFORE_DROP,
+                  "verify-mv-before-drop");
+  opt->help = "Check a materialized view against its table before --drop-mv "
+              "drops it, so every view that ever existed is checked instead of "
+              "only the ones alive at the end of the run. Pauses all workers "
+              "for the check. Pass off for stall free create/drop churn.";
+  opt->setBool(true);
+
+  opt = newOption(Option::BOOL, Option::CH_SKIP_SCHEMA_VERIFY,
+                  "skip-schema-verify");
+  opt->help = "Skip comparing pstress metadata against the server's columns, "
+              "both at startup (where a mismatch aborts the run) and at the "
+              "end of the run. Saves a system.columns read per table, which "
+              "adds up with many tables.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  opt = newOption(Option::BOOL, Option::CH_VERIFY_MV, "verify-mv");
+  opt->help = "At the end of the run, compare every materialized view against "
+              "its source table and fail the run on a mismatch.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  /* ClickHouse projections. PR 113343 added ALTER TABLE ... MODIFY PROJECTION,
+     a metadata only alter whose new settings apply lazily through later inserts
+     and merges. Exercising it needs a projection to exist first, so --add- and
+     --drop-projection are here too. */
+  opt = newOption(Option::INT, Option::CH_ADD_PROJECTION, "add-projection");
+  opt->help = "ALTER TABLE t ADD PROJECTION p (SELECT ... ORDER BY ...) WITH "
+              "SETTINGS (index_granularity = N) on a random table. Up to 5 per "
+              "table. Also switches on the MergeTree settings a projection "
+              "needs: without deduplicate_merge_projection_mode = rebuild a "
+              "ReplacingMergeTree refuses projections outright, and without "
+              "lightweight_mutation_projection_mode = rebuild a lightweight "
+              "DELETE on a projected table fails.";
+  opt->setInt(2);
+  opt->setSQL();
+  opt->short_help = "AddProjection";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_DROP_PROJECTION, "drop-projection");
+  opt->help = "ALTER TABLE t DROP PROJECTION p. Keep this below "
+              "--modify-projection or most MODIFYs will find their target "
+              "already gone.";
+  opt->setInt(1);
+  opt->setSQL();
+  opt->short_help = "DropProjection";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_MODIFY_PROJECTION,
+                  "modify-projection");
+  opt->help = "ALTER TABLE t MODIFY PROJECTION p (<the same body>) WITH "
+              "SETTINGS (index_granularity = N) — ClickHouse PR 113343. "
+              "Restates the stored definition verbatim and changes only the "
+              "settings, which is the one thing the statement allows. Needs "
+              "--add-projection to have something to act on.";
+  opt->setInt(2);
+  opt->setSQL();
+  opt->short_help = "ModifyProjection";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_MATERIALIZE_PROJECTION,
+                  "materialize-projection");
+  opt->help = "ALTER TABLE t MATERIALIZE PROJECTION p — rebuilds the "
+              "projection on parts that do not have it yet. Unlike MODIFY this "
+              "is a mutation, so it honours --ch-mutations-sync and can be "
+              "cancelled mid-flight by --ch-kill-mutation.";
+  opt->setInt(1);
+  opt->setSQL();
+  opt->short_help = "MaterializeProjection";
+  opt->setDDL();
+
+  /* ClickHouse text indexes. A column takes at most one text index, and only a
+     String (VARCHAR, CHAR, TEXT, BLOB) column can take one. */
+  opt = newOption(Option::INT, Option::CH_TEXT_INDEX_PROB, "text-index-prob");
+  opt->help = "Probability out of 100 that a String column gets a text index "
+              "in CREATE TABLE, with a random tokenizer and random optional "
+              "parameters. Use with --text-words so the values have more than "
+              "one token.";
+  opt->setInt(0);
+
+  opt = newOption(Option::INT, Option::CH_TEXT_INDEX_PREPROCESSOR_PROB,
+                  "text-index-preprocessor-prob");
+  opt->help = "Probability out of 100 that a text index gets preprocessor = "
+              "lower(col). The preprocessor is only applied on the index path, "
+              "so hasToken and friends legitimately return different rows with "
+              "use_skip_indexes = 0. Keep it at 0 when comparing against "
+              "use_skip_indexes = 0; it is fine against "
+              "query_plan_direct_read_from_text_index = 0.";
+  opt->setInt(0);
+
+  opt = newOption(Option::INT, Option::CH_TEXT_INDEX_PHRASE_SEARCH_PROB,
+                  "text-index-phrase-search-prob");
+  opt->help = "Probability out of 100 that a text index gets "
+              "support_phrase_search = 1. Any value above 0 also sets the "
+              "MergeTree setting allow_experimental_text_index_phrase_search "
+              "= 1 on every table, which the argument requires.";
+  opt->setInt(0);
+
+  opt = newOption(Option::INT, Option::CH_ADD_TEXT_INDEX, "add-text-index");
+  opt->help = "ALTER TABLE t ADD INDEX ... TYPE text(...) on a String column "
+              "that has no text index yet. Existing parts stay unindexed until "
+              "--materialize-text-index reaches them.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "AddTextIndex";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_DROP_TEXT_INDEX, "drop-text-index");
+  opt->help = "ALTER TABLE t DROP INDEX on one of the table's text indexes.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "DropTextIndex";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_MATERIALIZE_TEXT_INDEX,
+                  "materialize-text-index");
+  opt->help = "ALTER TABLE t MATERIALIZE INDEX on one of the table's text "
+              "indexes, or a quarter of the time CLEAR INDEX, which removes "
+              "the index from every part and leaves the table with a mix of "
+              "indexed and unindexed parts again. Both are mutations and honour "
+              "--ch-mutations-sync.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "MaterializeTextIndex";
+  opt->setDDL();
+
+  /* ClickHouse skipping indexes on int columns: minmax, set(N) or
+     bloom_filter(p). They go on the first int column that is not the primary
+     key, one per column, and the primary key is left alone because the ORDER
+     BY already indexes it. An index can only change how many granules are
+     read, never which rows come back, so compare against use_skip_indexes = 0
+     with --compare-result-with-setting. */
+  opt = newOption(Option::INT, Option::CH_INT_INDEX_PROB, "int-index-prob");
+  opt->help = "Probability out of 100 that CREATE TABLE gives the table's "
+              "first non primary key int column a skipping index of a random "
+              "type: minmax, set(N) or bloom_filter(p), with a random "
+              "GRANULARITY.";
+  opt->setInt(50);
+
+  opt = newOption(Option::INT, Option::CH_ADD_INT_INDEX, "add-int-index");
+  opt->help = "ALTER TABLE t ADD INDEX ... TYPE minmax|set|bloom_filter on the "
+              "first int column that has no such index yet. Existing parts "
+              "stay unindexed until --materialize-int-index reaches them.";
+  opt->setInt(2);
+  opt->setSQL();
+  opt->short_help = "AddIntIndex";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_DROP_INT_INDEX, "drop-int-index");
+  opt->help = "ALTER TABLE t DROP INDEX on one of the table's int indexes.";
+  opt->setInt(1);
+  opt->setSQL();
+  opt->short_help = "DropIntIndex";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_MATERIALIZE_INT_INDEX,
+                  "materialize-int-index");
+  opt->help = "ALTER TABLE t MATERIALIZE INDEX on one of the table's int "
+              "indexes, or a quarter of the time CLEAR INDEX. Both are "
+              "mutations and honour --ch-mutations-sync.";
+  opt->setInt(1);
+  opt->setSQL();
+  opt->short_help = "MaterializeIntIndex";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::TEXT_WORDS, "text-words");
+  opt->help = "Generate String values as 1 to N dictionary words joined by "
+              "random separators, with an occasional capitalized word, instead "
+              "of the usual single word. 0 keeps the usual values. Ignores the "
+              "VARCHAR width, which ClickHouse does not enforce.";
+  opt->setInt(0);
+
+  /* ClickHouse table settings changed while the run is going. The pool file
+     decides what may be altered: only its alter: lines are candidates, because
+     a MergeTree setting can be read only after create and nothing in
+     system.merge_tree_settings says which ones are. */
+  opt = newOption(Option::INT, Option::CH_MODIFY_TABLE_SETTING,
+                  "modify-table-setting");
+  opt->help = "ALTER TABLE t MODIFY SETTING <name> = <value> on a random "
+              "table, with the name and the value taken from the alter: lines "
+              "of --table-settings-file. The new value replaces the one the "
+              "table was created with, so a later DROP/CREATE and the next "
+              "step recreate the table with it. Needs at least one alter: "
+              "line in the pool.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "ModifySetting";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_RESET_TABLE_SETTING,
+                  "reset-table-setting");
+  opt->help = "ALTER TABLE t RESET SETTING <name> — take away an override the "
+              "table currently carries and go back to the server default. "
+              "Only names from the alter: lines of --table-settings-file are "
+              "reset, and only when the table has one set, so this does "
+              "nothing until --modify-table-setting or a roll at CREATE TABLE "
+              "has put one there.";
+  opt->setInt(0);
+  opt->setSQL();
+  opt->short_help = "ResetSetting";
+  opt->setDDL();
+
+  /* Per-table ClickHouse MergeTree settings */
+  opt = newOption(Option::STRING, Option::CH_TABLE_SETTINGS_FILE,
+                  "table-settings-file");
+  opt->help = "File with the pool of ClickHouse table settings, one per line as "
+              "[session:|alter:][<prob>:]<name> = <v1>|<v2> or int:<lo>..<hi>. "
+              "Each table rolls every line against its probability, so prob "
+              "100 puts a setting on every table and prob 5 on about one in "
+              "twenty. session: lines are applied as SET on each connection. "
+              "alter: lines are also rolled onto CREATE TABLE and, on top of "
+              "that, are the pool --modify-table-setting and "
+              "--reset-table-setting pick from at run time. "
+              "Looked up next to the pstress binary. Missing default file is "
+              "not an error; a missing file named on the command line is.";
+  opt->setString("clickhouse_table_settings.txt");
+
+  opt = newOption(Option::STRING, Option::CH_TABLE_SETTINGS, "table-settings");
+  opt->help = "Fixed ClickHouse table settings applied verbatim to every "
+              "table, e.g. --table-settings=\"index_granularity = 4096, "
+              "compress_marks = 1\". Nothing is randomized and the settings "
+              "file is not read.";
+  opt->setString("");
+
+  opt = newOption(Option::BOOL, Option::NO_TABLE_SETTINGS, "no-table-settings");
+  opt->help = "Do not add any table or session settings, ignoring both "
+              "--table-settings-file and --table-settings. Only the settings "
+              "pstress requires internally are emitted. Pass flag to enable.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  /* Compare a grammar SQL run with and without a query setting */
+  opt = newOption(Option::BOOL, Option::COMPARE_RESULT_WITH_SETTING,
+                  "compare-result-with-setting");
+  opt->help = "Run every grammar SQL twice, once as it is and once with "
+              "SETTINGS <--run-query-setting> appended, and compare the two "
+              "result sets. Aborts on a mismatch, dumping both sets to "
+              "default_result.csv and with_setting_result.csv in the log dir. "
+              "Requires --run-query-setting. The comparison is order "
+              "sensitive and takes no locks, so the workload has to be "
+              "deterministic: use a single thread or an insert only workload, "
+              "and give every grammar line an ORDER BY. Pass flag to enable.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  opt = newOption(Option::STRING, Option::RUN_QUERY_SETTING,
+                  "run-query-setting");
+  opt->help = "Setting clause appended as SETTINGS <clause> to the second run "
+              "of each query compared by --compare-result-with-setting, e.g. "
+              "--run-query-setting=\"join_algorithm='grace_hash'\". "
+              "Comma separate to set more than one. Only use settings that "
+              "are not supposed to change query results.";
+  opt->setString("");
+
+  /* TLS for the ClickHouse native protocol (required by ClickHouse Cloud) */
+  opt = newOption(Option::BOOL, Option::SECURE, "secure");
+  opt->help = "Connect over TLS using the ClickHouse native protocol. "
+              "Required for ClickHouse Cloud. Changes the default port from "
+              "9000 to 9440.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
+  opt = newOption(Option::INT, Option::CH_SOCKET_TIMEOUT, "ch-socket-timeout");
+  opt->help = "Seconds a worker waits for a reply on an established connection "
+              "before giving up on it (SO_RCVTIMEO/SO_SNDTIMEO). Only catches a "
+              "server that holds the connection open and stops answering — a "
+              "dropped connection is caught by TCP keepalive instead. Must stay "
+              "clear of legitimately slow queries: a synchronous mutation on a "
+              "busy service can take 20+ minutes. 0 waits forever, which is how "
+              "a finished run can hang until it is killed.";
+  opt->setInt(600);
+
+  opt = newOption(Option::STRING, Option::CH_GRAMMAR_QUERY_SETTINGS,
+                  "ch-grammar-query-settings");
+  opt->help = "Setting clause appended as SETTINGS <clause> to every grammar "
+              "SQL query (--grammar-sql). The grammar joins are unbounded and "
+              "a join key that is mostly one value (0 from ADD COLUMN or a "
+              "column left out of INSERT) turns a self-join into billions of "
+              "rows, so the default cuts such a query off instead of letting "
+              "it pin the server for hours. Comma separate to set more than "
+              "one, e.g. \"max_execution_time=60, max_rows_in_join=100000000\". "
+              "Merged into a SETTINGS clause the grammar line already has. "
+              "Empty string sends the queries as written.";
+  opt->setString("max_execution_time=120");
 
   /* Drop column */
   opt = newOption(Option::INT, Option::DROP_COLUMN, "drop-column");
@@ -1108,7 +1625,14 @@ void add_options() {
 
   /* Address */
   opt = newOption(Option::STRING, Option::ADDRESS, "address");
-  opt->help = "IP address to connect to";
+  opt->help = "Hostname or IP address to connect to. Same as --host.";
+  opt->setString("");
+
+  /* Host — alias for --address, matching clickhouse-client's flag name.
+     Remapped to ADDRESS in the getopt switch in pstress.cpp, so this option
+     never holds a value of its own and the two are genuinely last-one-wins. */
+  opt = newOption(Option::STRING, Option::HOST, "host");
+  opt->help = "Hostname or IP address to connect to. Alias for --address.";
   opt->setString("");
 
   /* Infile */

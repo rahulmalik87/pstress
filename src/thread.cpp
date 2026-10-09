@@ -3,6 +3,8 @@
 #include "MySQLDatabase.hpp"
 #elif USE_DUCKDB
 #include "DuckdbDatabase.hpp"
+#elif USE_CLICKHOUSE
+#include "ClickhouseDatabase.hpp"
 #endif
 #include "common.hpp"
 #include "node.hpp"
@@ -46,9 +48,10 @@ void Node::workerThread(int number) {
 
 #ifdef USE_MYSQL
   std::unique_ptr<DatabaseInterface> db = std::make_unique<MySQLDatabase>();
-#else
-      std::unique_ptr<DatabaseInterface> db =
-          std::make_unique<DuckDBDatabase>();
+#elif USE_DUCKDB
+  std::unique_ptr<DatabaseInterface> db = std::make_unique<DuckDBDatabase>();
+#elif USE_CLICKHOUSE
+  std::unique_ptr<DatabaseInterface> db = std::make_unique<ClickHouseDatabase>();
 #endif
   if (!db->connect(myParams)) {
     std::cout << "Failed to connect database " << std::endl;
@@ -88,6 +91,9 @@ void Node::workerThread(int number) {
     std::cerr << errmsg.str() << std::endl;
     exit(EXIT_FAILURE);
   }
+  if (thd->db->idle_reconnects_count() > 0)
+    thread_log << "connection drops recovered by reconnect and retry => "
+               << thd->db->idle_reconnects_count() << std::endl;
   if (thd->query_buffer.size() > 0) {
     thread_log << "last N SQL executed by thread " << std::endl;
     for (const auto &sql : thd->query_buffer.get_all()) {

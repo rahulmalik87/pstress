@@ -227,9 +227,83 @@ struct Option {
     INSERT_BULK_COUNT,
     NON_INT_PK,
     DICTIONARY_FILE,
+    TABLE_PREFIX,
     TOTAL_QUERIES,
     VARCHAR_COLUMN_MAX_WIDTH,
     COMPOSITE_KEY_PROB,
+    CH_VERIFY_INTERVAL,
+    CH_ALTER_UPDATE,
+    CH_ALTER_DELETE,
+    CH_MUTATIONS_SYNC,
+    CH_KILL_MUTATION,
+    CH_ADD_COLUMN_BACKFILL,
+    SECURE,
+    HOST,
+    CH_TABLE_SETTINGS_FILE,
+    CH_TABLE_SETTINGS,
+    NO_TABLE_SETTINGS,
+    COMPARE_RESULT_WITH_SETTING,
+    RUN_QUERY_SETTING,
+    CH_CREATE_MV,
+    CH_DROP_MV,
+    CH_MAX_MV_PER_TABLE,
+    CH_MV_SNAPSHOT_SLEEP_MS,
+    CH_MV_POPULATE_ATOMICALLY,
+    CH_MV_TO_PROB,
+    CH_VERIFY_MV_BEFORE_DROP,
+    CH_VERIFY_MV,
+    /* ClickHouse projections: ADD to create one, MODIFY to change its
+       settings (ClickHouse PR 113343), DROP to take it away again. */
+    CH_ADD_PROJECTION,
+    CH_DROP_PROJECTION,
+    CH_MODIFY_PROJECTION,
+    CH_MATERIALIZE_PROJECTION,
+    /* ClickHouse text (full-text) indexes on String columns: a share of
+       them get one at CREATE TABLE, and ADD/DROP/MATERIALIZE put them under
+       load while the run is going. TEXT_WORDS makes string values a few
+       dictionary words long, so there is something to tokenize. */
+    CH_TEXT_INDEX_PROB,
+    CH_TEXT_INDEX_PREPROCESSOR_PROB,
+    CH_TEXT_INDEX_PHRASE_SEARCH_PROB,
+    CH_ADD_TEXT_INDEX,
+    CH_DROP_TEXT_INDEX,
+    CH_MATERIALIZE_TEXT_INDEX,
+    /* minmax / set / bloom_filter skipping index on the first int column */
+    CH_INT_INDEX_PROB,
+    CH_ADD_INT_INDEX,
+    CH_DROP_INT_INDEX,
+    CH_MATERIALIZE_INT_INDEX,
+    TEXT_WORDS,
+    /* ClickHouse table settings changed while the run is going: MODIFY sets an
+       alterable pool entry to a fresh value, RESET takes the override away
+       again. See the alter: prefix in the table settings pool file. */
+    CH_MODIFY_TABLE_SETTING,
+    CH_RESET_TABLE_SETTING,
+    CH_SOCKET_TIMEOUT,
+    /* SETTINGS clause appended to every grammar SQL query, so one bad
+       template (a self-join on a column that is mostly 0) is cut off by the
+       server instead of pinning it for hours. */
+    CH_GRAMMAR_QUERY_SETTINGS,
+    /* Sequential primary keys: an INSERT takes its key from a per-table
+       increasing counter instead of a random value, and predicates aim inside
+       the range of keys handed out so far. On ClickHouse the primary key is the
+       table's ORDER BY prefix, so this is what makes new parts append-only
+       instead of each one spanning the whole key range. */
+    SEQ_PK,
+    SEQ_PK_RECENT_PROB,
+    SEQ_PK_RECENT_ROWS,
+    SEQ_PK_DUP_PROB,
+    /* Which implementation a DELETE FROM asks the server for. Appended at the
+       end of the enum on purpose: a step file records options by this value, so
+       inserting one next to the other CH_ mutation options would renumber
+       everything after it and misread every step file written before now. */
+    CH_LIGHTWEIGHT_DELETE,
+    /* Appended for the same reason as CH_LIGHTWEIGHT_DELETE. */
+    INSERT_COLUMN_SUBSET_PROB,
+    NO_VERSION_COLUMN,
+    SEQ_PK_TRUST_METADATA,
+    CH_SKIP_SCHEMA_VERIFY,
+    /* Appended for the same reason as CH_LIGHTWEIGHT_DELETE. */
     PREPARED_STMT_PROB,
     MAX
   } option;

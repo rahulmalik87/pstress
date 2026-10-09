@@ -34,12 +34,34 @@
 #define DESC_INDEXES_IN_COLUMN 34
 #define MYSQL_8 8.0
 
+/* Runtime SIMD dispatch via GCC target_clones.
+   Compiles annotated functions for AVX-512, AVX2, and a generic fallback;
+   the IFUNC resolver picks the best version at load time — no SIGILL.
+   Enabled only on x86_64 GCC/Linux when STRICT_CPU=OFF. */
+#ifdef PSTRESS_RUNTIME_SIMD
+#  define PSTRESS_TARGET_CLONES \
+     __attribute__((target_clones("avx512f", "avx2", "default")))
+#else
+#  define PSTRESS_TARGET_CLONES
+#endif
+
 #define opt_int(a) options->at(Option::a)->getInt();
 #define opt_int_set(a, b) options->at(Option::a)->setInt(b);
 #define opt_bool(a) options->at(Option::a)->getBool();
 #define opt_string(a) options->at(Option::a)->getString()
 
 long int rand_int(long int upper, long int lower = 0);
+
+/* --seq-pk: zero-pad width for a string primary key. A String is the ORDER BY
+   key, and ClickHouse orders it lexicographically, where '9' > '10' -- so the
+   counter is padded to a fixed width and the two orders agree. The width must
+   stay constant for the life of a table, because a key written at one width
+   would no longer be found by a predicate built at another; it is therefore a
+   constant and never derived from the column's declared length, which
+   ModifyColumn re-rolls mid-run. 12 digits is a trillion keys, far beyond any
+   run, and fits the 50 chars a vpkey is created with. */
+const int seq_pk_pad_width = 12;
+
 template <typename T> static T try_negative(T val) {
   if (rand_int(100) > options->at(Option::POSITIVE_INT_PROB)->getInt()) {
     return val * (-1);
@@ -50,17 +72,36 @@ template <typename T> static T try_negative(T val) {
 std::string rand_float(float upper, float lower = 0);
 std::string rand_double(double upper, double lower = 0);
 std::string rand_string(size_t size);
+#ifdef USE_CLICKHOUSE
+/* --text-words: 1 to max_words dictionary words with random separators */
+std::string rand_words(int max_words);
+/* one single token dictionary word, for RAND_WORD in a grammar line */
+std::string rand_word();
+/* the start or the end of a word, for RAND_PREFIX and RAND_SUFFIX */
+std::string rand_word_part(bool prefix);
+#endif
 const int maximum_records_in_each_parititon_list = 30;
-const std::string TABLE_PREFIX = "tt_";
+/* --table-prefix, "tt_" unless given */
+std::string table_prefix();
 const std::string PARTITION_SUFFIX = "_p";
 const std::string FK_SUFFIX = "_fk";
 const std::string TEMP_SUFFIX = "_t";
-/* used to create metadata */
-const int version = 2;
+/* used to create metadata. Bumped to 3 when per-table settings were added, to 4
+   when --engine started naming the MergeTree family member (metadata from an
+   older run stores "MergeTree()", which used to mean ReplacingMergeTree and now
+   means plain MergeTree, so such a file has to be rejected rather than silently
+   recreating tables with a different engine), and to 5 when the materialized
+   view registry started being persisted so a view survives a step restart. */
+const int version = 5;
 std::string add_ignore_clause();
 struct Thd1;
 
 struct Table;
+#ifdef USE_CLICKHOUSE
+/* defined further down, next to MVInfo; Table only holds pointers to it */
+struct Projection;
+struct SkipIndex;
+#endif
 struct Column {
 public:
   enum COLUMN_TYPES {
@@ -123,6 +164,13 @@ public:
   int length = 0;
   std::string default_value;
   bool primary_key = false;
+  /* In the primary key, but not the enforcing key column -- what makes the key
+     composite, and on ClickHouse what makes the ORDER BY multi-column. Rolled
+     once by Table::resolve_composite_key() and persisted with the column, so
+     the shape survives DropCreate and the next step. A key column cannot be
+     the target of an UPDATE on ClickHouse, which is why anything picking a
+     column to set has to look at this as well as primary_key. */
+  bool composite_key = false;
   bool auto_increment = false;
   bool compressed = false; // percona type compressed
   bool not_secondary = false;
@@ -413,13 +461,30 @@ struct Table {
   bool BuildPreparedWhereBulk(std::string &prepared_where,
                               std::string &printable_where,
                               std::vector<PreparedStatementParam> &params);
-  std::string GetWherePrecise();
+  /* text_search: on ClickHouse, a column with a text index may be searched
+     with hasToken/LIKE instead of matched for equality. Only SELECT asks for
+     it: an UPDATE or DELETE has to stay a point predicate. */
+  std::string GetWherePrecise(bool text_search = false);
   std::string GetWhereBulk();
-  std::string ColumnValues(Thd1 *thd, int value_count = 1);
+  std::string GetWhereLargeRange();
+  /* fresh_pk=false makes the primary key come from the existing-key sampler
+     instead of the counter, for statements that must hit a row that is already
+     there (REPLACE) or that bake their literals in once and run many times
+     (a stored function body). */
+  std::string ColumnValues(Thd1 *thd, int value_count = 1,
+                           bool fresh_pk = true);
   std::string SelectColumn();
   std::string SetClause();
   void DeleteAllRows(Thd1 *thd);
   void UpdateAllRows(Thd1 *thd);
+  void AlterTableUpdate(Thd1 *thd);
+  void AlterTableDelete(Thd1 *thd);
+#ifdef USE_CLICKHOUSE
+  /* CREATE MATERIALIZED VIEW ... POPULATE over this table while the workload
+     keeps inserting into it, and the matching drop. */
+  void CreateMaterializedView(Thd1 *thd);
+  void DropMaterializedView(Thd1 *thd);
+#endif
   void ColumnRename(Thd1 *thd);
   void IndexRename(Thd1 *thd);
   template <typename Writer> void Serialize(Writer &writer) const;
@@ -427,16 +492,145 @@ struct Table {
 
   std::string name_;
   std::string engine;
+  /* ClickHouse: extra SETTINGS for this table as "name = value, name = value".
+     Rolled once in table_id() and persisted, so DropCreate and later steps
+     recreate the table with the same settings. */
+  std::string settings;
   std::string row_format;
   std::string tablespace;
   std::string compression;
   std::string encryption = "N";
+#ifdef USE_CLICKHOUSE
+  /* Set once this table has been changed in a way a materialized view over it
+     cannot mirror: a mutation, a truncate, a drop/rename of a column it
+     selects. The views on it are then reported as skipped rather than compared,
+     because they are legitimately out of sync. ADD COLUMN does not set this —
+     the views select an explicit column list, so a new column cannot affect
+     them. Never cleared: once a view has missed a change it stays behind. */
+  std::atomic<bool> mv_source_mutated{false};
+  /* what changed, so the report names it instead of listing everything it could
+     have been. Always a string literal, so there is no lifetime to manage. */
+  std::atomic<const char *> mv_mutation_reason{nullptr};
+  void mark_mv_source_mutated(const char *why) {
+    mv_source_mutated.store(true);
+    mv_mutation_reason.store(why);
+  }
+  /* the reason, or "" when this table can still be compared to its views */
+  std::string mv_skip_reason() const {
+    const char *why = mv_mutation_reason.load();
+    return why == nullptr ? "" : why;
+  }
+#else
+  /* so the callers do not need to be guarded one by one */
+  void mark_mv_source_mutated(const char *) {}
+  std::string mv_skip_reason() const { return ""; }
+#endif
   int key_block_size = 0;
   long int number_of_initial_records;
   size_t auto_inc_index;
+  /* --seq-pk: the primary key the next INSERT will take, so [1, pk_next) is
+     the range of keys this table has handed out. A statement reserves a whole
+     block of keys with one fetch_add, which gives every thread a disjoint,
+     exclusively owned run of keys -- concurrent inserters can never pick the
+     same key and never need a lock. Predicates sample inside the range. A
+     TRUNCATE or a DROP/CREATE empties the table and takes it back to 1.
+     Persisted, so the next step keeps appending instead of starting over. */
+  std::atomic<long int> pk_next{1};
+  /* Whether the counter above was restored from a step file rather than
+     defaulted. Only then is it worth reconciling against the server: a table
+     whose rows carry the old random keys must not adopt their maximum, or the
+     range would span the whole random key space and predicates would go back
+     to missing almost every row. */
+  bool pk_from_metadata = false;
+  /* The column the counter drives, resolved once when the table is built or
+     restored; nullptr when this table has none. Resolved eagerly rather than
+     on demand because worker threads share the table and would race. */
+  Column *seq_pk_col = nullptr;
+  void resolve_seq_pk_column();
+  /* Roll which columns join the primary key beyond the enforcing one. Called
+     once, when the table is built, never from definition(). */
+  void resolve_composite_key();
+  /* The primary key column, or nullptr. Caller must hold table_mutex. */
+  Column *pk_column() const;
+  /* Whether this table's keys are ours to hand out. */
+  bool use_sequential_pk() const { return seq_pk_col != nullptr; }
+  /* Reserve count consecutive keys and return the first. Lock-free. */
+  long int reserve_pk_block(long int count) {
+    return pk_next.fetch_add(count, std::memory_order_relaxed);
+  }
+  /* A key that may be in the table right now, for a predicate.
+     upper_exclusive caps the range, for callers that must not pick a key from
+     a block that has been reserved but not yet written; 0 means "up to
+     whatever has been handed out". */
+  long int sample_pk(long int upper_exclusive = 0) const;
+  /* Render a key the way the column stores it. */
+  std::string pk_literal(long int value, const Column *col) const;
+  /* The table is empty, so the sequence starts over. */
+  void reset_pk_counter() { pk_next.store(1, std::memory_order_relaxed); }
   // std::string data_directory; todo add corressponding code
   std::vector<Column *> *columns_;
   std::vector<Index *> *indexes_;
+#ifdef USE_CLICKHOUSE
+  /* Projections live on the table, not in a global registry like MVInfo: a
+     projection is a clause inside the table's own DDL and dies with the table.
+     Guarded by table_mutex, exactly like indexes_. */
+  std::vector<Projection *> *projections_;
+  /* a random projection over this table, or nullptr when it has no column a
+     projection can be built from. Caller must hold table_mutex. */
+  Projection *MakeRandomProjection();
+  /* Drop every projection that names this column, before an ALTER ClickHouse
+     would otherwise reject. Caller must hold table_mutex; false when a drop
+     failed, so the caller can leave the column alone. */
+  bool DropProjectionsOnColumn(Thd1 *thd, const std::string &column);
+  /* forget them all, for when the table itself is recreated */
+  void ForgetProjections();
+  void AddProjection(Thd1 *thd);
+  void DropProjection(Thd1 *thd);
+  void ModifyProjection(Thd1 *thd);
+  void MaterializeProjection(Thd1 *thd);
+  /* Data skipping indexes: text indexes on String columns and minmax, set or
+     bloom_filter indexes on int columns, at most one of each family per
+     column. Guarded by table_mutex. Not persisted in the metadata: at the
+     start of every step LoadSkipIndexesFromServer() rebuilds the list from
+     system.data_skipping_indices, so the server is the source of truth. */
+  std::vector<SkipIndex> skip_indexes_;
+  /* roll the indexes CREATE TABLE emits, see --text-index-prob and
+     --int-index-prob. Called once when the table is built, before anything
+     else can see it. */
+  void RollSkipIndexes();
+  /* a random text index over column, see --text-index-preprocessor-prob */
+  SkipIndex MakeRandomTextIndex(const std::string &column);
+  /* a random minmax, set or bloom_filter index over an int column */
+  SkipIndex MakeRandomIntIndex(const std::string &column);
+  /* Caller must hold table_mutex. */
+  bool HasTextIndex(const std::string &column) const;
+  bool HasIntIndex(const std::string &column) const;
+  /* The first int column that is not the primary key and has no int index
+     yet, the column --int-index-prob and --add-int-index put theirs on.
+     nullptr when there is none. Caller must hold table_mutex. */
+  Column *IntIndexCandidate() const;
+  /* Drop every skipping index on this column before an ALTER ClickHouse would
+     otherwise reject (DROP COLUMN). Caller must hold table_mutex; false when
+     a drop failed, so the caller can leave the column alone. */
+  bool DropSkipIndexesOnColumn(Thd1 *thd, const std::string &column);
+  /* RENAME COLUMN rewrites the index expression on the server, follow it */
+  void RenameSkipIndexColumn(const std::string &from, const std::string &to);
+  bool LoadSkipIndexesFromServer(Thd1 *thd);
+  void AddTextIndex(Thd1 *thd);
+  void DropTextIndex(Thd1 *thd);
+  void MaterializeTextIndex(Thd1 *thd);
+  void AddIntIndex(Thd1 *thd);
+  void DropIntIndex(Thd1 *thd);
+  void MaterializeIntIndex(Thd1 *thd);
+  /* shared by the text and the int flavours: text selects which family */
+  void DropSkipIndex(Thd1 *thd, bool text);
+  void MaterializeSkipIndex(Thd1 *thd, bool text);
+  /* ALTER TABLE ... MODIFY SETTING / RESET SETTING one of the settings the pool
+     marked alterable, keeping Table::settings in step so a later DROP/CREATE
+     and the next step rebuild the table the way it is now. */
+  void ModifyTableSetting(Thd1 *thd);
+  void ResetTableSetting(Thd1 *thd);
+#endif
   mutable std::shared_mutex table_mutex;
   void lock_table_mutex(bool ddl_query) const {
     /* if option no ddl then do not lock mutex */
@@ -716,6 +910,8 @@ struct grammar_table {
     DECIMAL,
     TEXT,
     JSON,
+    /* a String column carrying a text index, T1_TEXTIDX_1 in a grammar line */
+    TEXTIDX,
     MAX
   };
   static sql_col_types get_col_type(std::string type) {
@@ -739,6 +935,8 @@ struct grammar_table {
       return TEXT;
     if (type == "JSON")
       return JSON;
+    if (type == "TEXTIDX")
+      return TEXTIDX;
     return MAX;
   }
   static std::string get_col_type(sql_col_types type) {
@@ -763,6 +961,8 @@ struct grammar_table {
       return "TEXT";
     case JSON:
       return "JSON";
+    case TEXTIDX:
+      return "TEXTIDX";
     case MAX:
       break;
     }
@@ -805,11 +1005,163 @@ struct grammar_tables {
 void print_and_log(std::string &&str, Thd1 *thd = nullptr,
                    bool print_error = false, bool count_to_console = true);
 std::string getExecutablePath();
+
+#ifdef USE_CLICKHOUSE
+/* --compare-result-with-setting: run sql with and without
+   --run-query-setting and compare the two result sets */
+void compare_result_with_setting(const std::string &sql, Thd1 *thd);
+#ifdef USE_CLICKHOUSE
+/* Append or merge "SETTINGS <setting>" into a query */
+std::string add_settings_clause(const std::string &sql,
+                                const std::string &setting);
+#endif
+/* one line at the end of the run saying how much was really compared */
+void print_compare_with_setting_stats();
+extern std::atomic<long> g_compare_done;
+extern std::atomic<long> g_compare_baseline_failed;
+extern std::atomic<long> g_compare_setting_failed;
+#endif
+
+/* One line of the ClickHouse settings pool file:
+     [session:|alter:][<prob>:]<name> = <v1>|<v2>|<v3>
+     [session:|alter:][<prob>:]<name> = int:<lo>..<hi>
+   Table entries stay in g_table_settings and are rolled independently for
+   every table in pick_table_settings(). Session entries are rolled once at
+   startup and land in g_session_settings as ready-to-run "name = value".
+   An alter: entry is a table entry as well, and additionally goes into
+   g_alterable_table_settings for --modify-table-setting to pick from. */
+struct SettingSpec {
+  std::string name;
+  std::vector<std::string> values;
+  bool is_range = false;
+  long int lo = 0;
+  long int hi = 0;
+  int prob = 100;
+  /* the pool said this one may also be changed by ALTER TABLE MODIFY SETTING */
+  bool alterable = false;
+};
+#ifdef USE_CLICKHOUSE
+/* Resolve --engine into the ENGINE clause of a CREATE TABLE: a MergeTree family
+   name, matched case insensitively, gets the Replicated prefix when running
+   against more than one port and the _pstress_ver version column when it is a
+   ReplacingMergeTree. An unrecognised engine, or one written with its own
+   arguments, is returned unchanged. */
+std::string ch_resolve_engine(const std::string &engine);
+/* false under --no-version-column: every table, INSERT and view then leaves
+   _pstress_ver out */
+bool ch_version_column();
+/* True when the engine merges rows sharing a sorting key, so an exact row for
+   row comparison of a table against a materialized view over it cannot hold. */
+bool ch_engine_collapses_rows(const std::string &engine);
+
+/* One materialized view pstress created, kept so the consistency check knows
+   what to compare against what. columns is the explicit list the view selects,
+   captured at CREATE time, so a later ADD COLUMN on the source does not change
+   what the view is expected to hold. target is empty for a view with its own
+   inner table and names the TO table otherwise. */
+struct MVInfo {
+  std::string name;
+  std::string target;
+  std::string src_table;
+  std::vector<std::string> columns;
+  /* the materialized_views_populate_atomically this view was created with. A
+     mismatch on a view created with false is the expected legacy behaviour and
+     must not fail the run. */
+  bool populate_atomically = true;
+};
+/* One projection pstress put on a table.
+
+   body is the exact text pstress emitted between the parentheses, kept verbatim
+   because ALTER TABLE ... MODIFY PROJECTION requires the whole definition to be
+   restated and rejects anything whose query body formats differently. Replaying
+   our own text is the only way to be sure it round trips.
+
+   columns is every column the body names, so a DROP or RENAME COLUMN can drop
+   the projections that would otherwise make the ALTER fail. */
+struct Projection {
+  std::string name;
+  std::string body; /* "SELECT i1, v2 ORDER BY (i1, v2)" */
+  std::vector<std::string> columns;
+};
+
+/* One data skipping index pstress put on a column (or found there at the
+   start of a step). kind is the bare index type as system.data_skipping_indices
+   reports it ("text", "minmax", "set", "bloom_filter"), type the full type with
+   its arguments, "text(tokenizer = ...)" or "set(100)", and granularity is
+   empty for the server default. A text index only goes on a String column, the
+   other kinds on an int column. */
+struct SkipIndex {
+  std::string name;
+  std::string column;
+  std::string kind;
+  std::string type;
+  std::string granularity;
+  bool is_text() const { return kind == "text"; }
+  std::string definition() const {
+    std::string def = "INDEX " + name + " " + column + " TYPE " + type;
+    if (!granularity.empty())
+      def += " GRANULARITY " + granularity;
+    return def;
+  }
+};
+
+/* True when --text-index-phrase-search-prob is on, so Table::definition() emits
+   the MergeTree setting support_phrase_search needs. Set once in
+   sum_of_all_options(). */
+extern bool g_text_index_phrase_search_enabled;
+
+/* True when --add-projection is on, so Table::definition() knows to emit the
+   MergeTree settings a projection needs. Set once in sum_of_all_options(). */
+extern bool g_projections_enabled;
+
+extern std::vector<MVInfo> g_materialized_views;
+extern std::mutex g_materialized_views_mutex;
+/* Views are named mv_<source table>_<id> and their TO targets mvt_<same>, with
+   id from a global counter so two threads creating a view on the same table at
+   the same time cannot pick the same name. */
+const std::string MV_PREFIX = "mv_";
+const std::string MV_TARGET_PREFIX = "mvt_";
+unsigned long next_mv_id();
+/* Raise the id counter above one already in use, so a view created after a step
+   restart cannot collide with a surviving view from the previous step. */
+void bump_mv_id_floor(unsigned long id);
+/* Give a reason read back from the metadata file the process-lifetime storage
+   that mark_mv_source_mutated() expects, so a table stays uncomparable across a
+   step restart for the reason it originally became uncomparable. */
+const char *intern_mv_reason(const std::string &why);
+/* How many views currently exist on this table. */
+size_t mv_count_for_table(const std::string &table_name);
+#endif
+
+extern std::vector<SettingSpec> g_table_settings;
+extern std::vector<std::string> g_session_settings;
+/* the alter: subset of g_table_settings, in the same order. Copies rather than
+   pointers so a spec stays valid however g_table_settings is later touched. */
+extern std::vector<SettingSpec> g_alterable_table_settings;
+/* --table-settings, normalized once and used for every table */
+extern std::string g_fixed_table_settings;
+void load_table_settings_pool();
+std::string pick_table_settings();
+/* Helpers over the flat "name = value, name = value" clause a table carries in
+   Table::settings, used by the MODIFY/RESET SETTING actions. upsert replaces
+   the value of a setting already there and appends it otherwise; erase drops it
+   if present; names lists what the clause currently sets. */
+void ch_settings_upsert(std::string &clause, const std::string &name,
+                        const std::string &value);
+void ch_settings_erase(std::string &clause, const std::string &name);
+std::vector<std::string> ch_settings_names(const std::string &clause);
+/* One alterable setting with a fresh value for it, or false when the pool has
+   no alter: entry at all. */
+bool ch_roll_alterable_setting(std::string &name, std::string &value);
+
 std::vector<std::string> random_strs_generator();
 std::vector<long int> generateUniqueRandomNumbers(long int number_of_records);
 
 void wait_till_sync(const std::string &name, Thd1 *thd);
 std::string load_metadata_from_file();
+/* Raise each table's --seq-pk counter past whatever keys the server already
+   holds, for when a step died before writing its metadata. */
+void reconcile_pk_counters(Thd1 *thd);
 std::string lower_case_secondary();
 typedef std::vector<std::vector<std::string>> query_result;
 query_result get_query_result(Thd1 *thd, const std::string &query);

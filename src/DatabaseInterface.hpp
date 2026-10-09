@@ -4,6 +4,16 @@
 struct workerParams;
 typedef std::vector<std::vector<std::string>> query_result;
 
+/* Values get_error_number() reports. They are MySQL client error codes because
+   the workload's error handling in random_test.cpp was written against them:
+   CR_SERVER_LOST is what makes it log the query as fatal and fail the run's
+   exit code. ClickHouse has no equivalent codes of its own, so
+   ClickHouseDatabase maps every transport-level failure onto CR_SERVER_LOST. */
+#define CR_WSREP_NOT_PREPARED 1047
+#define CR_SERVER_GONE_ERROR 2006
+#define CR_SERVER_LOST 2013
+#define CR_SECONDARY_NOT_READY 6000
+
 struct PreparedStatementParam {
   std::string value;
   bool is_null = false;
@@ -28,6 +38,10 @@ public:
   virtual int get_error_number() = 0;
   virtual ~DatabaseInterface() = default;
   virtual int get_server_version() = 0;
+  /* Connections the backend rebuilt after a socket-level failure and used to
+     retry the failed statement; 0 where the backend has no such recovery.
+     Reported in the thread log so a run that leaned on it says so. */
+  virtual size_t idle_reconnects_count() { return 0; }
 };
 
 /*

@@ -3,17 +3,17 @@
 SELECT SUBSTR(T1_TEXT_1, T1_INT_1, T1_INT_2) from T1 order by 1
 SELECT SUBSTR(T1_CHAR_1, T1_INT_1, T1_INT_2)  from T1 order by 1
 SELECT SUBSTR(T1_TEXT_1, T1_INT_1, T1_INT_2)  from T1 order by 1
-SELECT BIT_LENGTH(T1_TEXT_1) from T1 order by 1
-SELECT BIT_LENGTH(T1_CHAR_1) from T1 order by 1
+SELECT LENGTH(T1_TEXT_1) from T1 order by 1
+SELECT LENGTH(T1_CHAR_1) from T1 order by 1
 #singe value fucntion
-SELECT max(BIT_LENGTH(T1_CHAR_1)) from T1
-SELECT min(BIT_LENGTH(T1_CHAR_1)) from T1
-SELECT sum(BIT_LENGTH(T1_CHAR_1)) from T1
-SELECT avg(BIT_LENGTH(T1_CHAR_1)) from T1
-SELECT max(BIT_LENGTH(T1_TEXT_1)) from T1
-SELECT min(BIT_LENGTH(T1_TEXT_1)) from T1
-SELECT sum(BIT_LENGTH(T1_TEXT_1)) from T1
-SELECT avg(BIT_LENGTH(T1_TEXT_1)) from T1
+SELECT max(LENGTH(T1_CHAR_1)) from T1
+SELECT min(LENGTH(T1_CHAR_1)) from T1
+SELECT sum(LENGTH(T1_CHAR_1)) from T1
+SELECT avg(LENGTH(T1_CHAR_1)) from T1
+SELECT max(LENGTH(T1_TEXT_1)) from T1
+SELECT min(LENGTH(T1_TEXT_1)) from T1
+SELECT sum(LENGTH(T1_TEXT_1)) from T1
+SELECT avg(LENGTH(T1_TEXT_1)) from T1
 #ELT
 SELECT ELT(T1_INT_1, T1_TEXT_1, T1_TEXT_2, T1_CHAR_1, T1_TEXT_3, T2_TEXT_1, T2_CHAR_1) from T1 , T2 where T1_INT_1 = T2_INT_1 order by 1 desc
 SELECT ELT(4, T1_TEXT_1, T1_TEXT_2, T1_CHAR_1, T1_TEXT_3, T2_TEXT_1, T2_CHAR_1) from T1 , T2 where T1_INT_1 = T2_INT_1 order by 1 desc
@@ -30,8 +30,8 @@ SELECT INSTR(T1_TEXT_1, T1_CHAR_1) from T1 order by 1 desc
 #LOCATE todo enable them
 SELECT LOCATE(T1_CHAR_1, T1_TEXT_1) from T1 order by 1 desc
 SELECT LOCATE(T1_TEXT_1, T1_TEXT_1) from T1 order by 1 desc
-SELECT LOCATE("a", T1_TEXT_1) from T1 order by 1 desc
-SELECT LOCATE("a", T1_INT_1) from T1 order by 1 desc
+SELECT LOCATE('a',T1_TEXT_1) from T1 order by 1 desc
+SELECT LOCATE('a',T1_INT_1) from T1 order by 1 desc
 # some nullif,colla etc
 SELECT NULLIF(T1_TEXT_1, T1_TEXT_2) from T1 order by 1 desc
 SELECT COALESCE(T1_TEXT_1, T1_TEXT_2) from T1 order by 1 desc

@@ -31,7 +31,8 @@ void Node::writeFinalReport() {
     std::ostringstream exitmsg;
     exitmsg.precision(2);
     exitmsg << std::fixed;
-    exitmsg << "* NODE SUMMARY: " << failed_queries_total << "/"
+    exitmsg << "* NODE SUMMARY [" << myParams.myName << ":"
+            << myParams.port << "]: " << failed_queries_total << "/"
             << performed_queries_total << " queries failed, ("
             << (performed_queries_total - failed_queries_total) * 100.0 /
                    performed_queries_total

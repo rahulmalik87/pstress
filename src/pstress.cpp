@@ -16,6 +16,10 @@
 #include "node.hpp"
 #include "pstress.hpp"
 #include "random_test.hpp"
+extern std::vector<Table *> *all_tables;
+#ifdef USE_CLICKHOUSE
+#include "ch_verify.hpp"
+#endif
 #include <INIReader.hpp>
 #include <cstdlib>  // For free()
 #include <cxxabi.h> // For demangling
@@ -23,11 +27,47 @@
 #include <iostream>
 #include <libgen.h> //dirname() uses this
 #include <signal.h> //For signal()
+#include <algorithm>
+#include <filesystem>
+#include <set>
 #include <string>
 #include <thread>
 
 extern std::atomic<bool> run_query_failed;
 thread_local std::mt19937 rng;
+
+/* Scan logdir for existing metadata step files and return the next step to run.
+   File pattern: {instance}_{db}_metadata_step_{N}.log
+   Returns the highest N found + 1, or 1 if no files found. */
+static int detect_next_step(const std::string &logdir, const std::string &db) {
+#ifdef USE_MYSQL
+  const std::string instance = "mysql";
+#elif USE_DUCKDB
+  const std::string instance = "duckdb";
+#else
+  const std::string instance = "clickhouse";
+#endif
+  const std::string prefix = instance + "_" + db + "_metadata_step_";
+  const std::string suffix = ".log";
+  int max_step = 0;
+  try {
+    for (const auto &entry : std::filesystem::directory_iterator(logdir)) {
+      if (!entry.is_regular_file())
+        continue;
+      std::string fname = entry.path().filename().string();
+      if (fname.rfind(prefix, 0) != 0)
+        continue;
+      if (fname.size() <= prefix.size() + suffix.size())
+        continue;
+      std::string num = fname.substr(prefix.size(),
+                                     fname.size() - prefix.size() - suffix.size());
+      if (num.empty() || !std::all_of(num.begin(), num.end(), ::isdigit))
+        continue;
+      max_step = std::max(max_step, std::stoi(num));
+    }
+  } catch (...) {}
+  return max_step + 1;
+}
 
 void read_section_settings(struct workerParams *wParams, std::string secName,
                            std::string confFile) {
@@ -94,6 +134,11 @@ int main(int argc, char *argv[]) {
   signal(SIGFPE, crashHandler);  // Floating-point exception
   signal(SIGILL, crashHandler);  // Illegal instruction
 
+  std::cout << "Command: ";
+  for (int i = 0; i < argc; i++)
+    std::cout << argv[i] << " ";
+  std::cout << std::endl;
+
   std::vector<std::thread> nodes;
   add_options();
   int c;
@@ -134,6 +179,10 @@ int main(int argc, char *argv[]) {
       exit(EXIT_FAILURE);
       break;
     default:
+      /* --host is an alias for --address; remap before the lookup below so both
+         write the same option slot and the later ->cl checks see either one. */
+      if (c == Option::HOST)
+        c = Option::ADDRESS;
       if (c >= Option::MAX) {
         break;
       }
@@ -155,7 +204,12 @@ int main(int argc, char *argv[]) {
           op->setString(optarg);
           break;
         case Option::BOOL:
-          op->setBool(optarg);
+          /* std::string, not the bare char*: setBool is overloaded on bool and
+             std::string, and pointer-to-bool is a standard conversion while
+             char*-to-std::string is user-defined, so the bare pointer picked
+             setBool(bool) and every value-taking BOOL option was forced true
+             regardless of what was passed. */
+          op->setBool(std::string(optarg));
           break;
         case Option::FLOAT:
           op->setFloat(optarg);
@@ -193,6 +247,12 @@ int main(int argc, char *argv[]) {
     read_option_prob_file(options->at(Option::OPTION_PROB_FILE)->getString());
   }
 
+#ifdef USE_CLICKHOUSE
+  /* after the seed is set so the session settings are reproducible, and before
+     any thread connects so the SETs are ready to apply */
+  load_table_settings_pool();
+#endif
+
 #ifdef USE_DUCKDB
   // if step=1 or prepare=true remove the duckdb file in logdir
   if (options->at(Option::STEP)->getInt() == 1 ||
@@ -207,11 +267,117 @@ int main(int argc, char *argv[]) {
 #endif
 
   auto confFile = options->at(Option::CONFIGFILE)->getString();
+
+#ifdef USE_CLICKHOUSE
+  /* Apply ClickHouse defaults early — ch_verify_startup() runs before worker
+     threads call sum_of_all_options(), so defaults must be set here too. */
+  if (!options->at(Option::ADDRESS)->cl)
+    options->at(Option::ADDRESS)->setString("127.0.0.1");
+  if (!options->at(Option::USER)->cl)
+    options->at(Option::USER)->setString("default");
+  if (!options->at(Option::DATABASE)->cl)
+    options->at(Option::DATABASE)->setString("test_db");
+  /* The global default is MySQL's 3306, which is never right for the
+     ClickHouse native protocol. 9440 is the TLS port, 9000 the plaintext one. */
+  if (!options->at(Option::PORT)->cl)
+    options->at(Option::PORT)->setString(
+        options->at(Option::SECURE)->getBool() ? "9440" : "9000");
+  /* grammar.sql is MySQL syntax throughout (DIV, MOD, ELT, FIELD,
+     CONVERT USING) and every line of it would simply error on ClickHouse */
+  if (!options->at(Option::GRAMMAR_FILE)->cl)
+    options->at(Option::GRAMMAR_FILE)->setString("clickhouse_grammar.sql");
+
+  /* Check the comparison options before anything connects or creates a table,
+     a run that can never compare anything should not get that far. */
+  if (options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool()) {
+    if (options->at(Option::RUN_QUERY_SETTING)->getString().empty()) {
+      std::cerr << "--compare-result-with-setting needs a setting to compare "
+                   "against, pass --run-query-setting, for example "
+                   "--run-query-setting=\"join_algorithm='grace_hash'\""
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    if (options->at(Option::COMPARE_RESULT)->getBool()) {
+      std::cerr << "--compare-result-with-setting and --compare-result are two "
+                   "different oracles for the same grammar SQL, pick one"
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    /* --thread-per-table is what lets the comparison run alongside writes:
+       each thread is the only writer of its own table and compares only that
+       table. A thread past the last table is handed a random one, which some
+       other thread is writing to. */
+    if (options->at(Option::THREAD_PER_TABLE)->getBool()) {
+      if (options->at(Option::THREADS)->getInt() >
+          options->at(Option::TABLES)->getInt()) {
+        std::cerr << "--compare-result-with-setting with --thread-per-table "
+                     "needs --threads <= --tables, a thread past the last "
+                     "table works on a table another thread writes to"
+                  << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      if (options->at(Option::PORT)->getString().find(',') !=
+          std::string::npos)
+        std::cout << "WARNING: --thread-per-table numbers the threads per "
+                     "node, so with more than one --port two nodes write the "
+                     "same table and the comparison can see rows arrive"
+                  << std::endl;
+      if (ch_engine_collapses_rows(options->at(Option::ENGINE)->getString()))
+        std::cout << "WARNING: --engine="
+                  << options->at(Option::ENGINE)->getString()
+                  << " collapses rows in background merges, so a merge "
+                     "between the two runs can change the result. Use "
+                     "--engine=MergeTree"
+                  << std::endl;
+      if (!options->at(Option::CH_MUTATIONS_SYNC)->getBool() &&
+          (options->at(Option::CH_ALTER_UPDATE)->getInt() > 0 ||
+           options->at(Option::CH_ALTER_DELETE)->getInt() > 0))
+        std::cout << "WARNING: ALTER UPDATE/DELETE without --ch-mutations-sync "
+                     "finish in the background and can land between the two "
+                     "runs. Pass --ch-mutations-sync"
+                  << std::endl;
+    }
+
+    /* the comparison only ever runs from the grammar SQL path */
+    if (options->at(Option::GRAMMAR_SQL)->getInt() == 0)
+      std::cout << "WARNING: --compare-result-with-setting does nothing with "
+                   "--grammar-sql=0, no query will be compared"
+                << std::endl;
+  }
+#endif
+
+  /* Auto-detect step from logdir if --step was not explicitly given.
+     Scans for the highest existing metadata step file and runs the next one. */
+  if (!options->at(Option::STEP)->cl) {
+    const std::string &logdir = options->at(Option::LOGDIR)->getString();
+    const std::string &db    = options->at(Option::DATABASE)->getString();
+    int next_step = detect_next_step(logdir, db);
+    options->at(Option::STEP)->setInt(next_step);
+    std::cout << "Auto-detected step " << next_step
+              << " (scanned " << logdir << ")" << std::endl;
+  }
+
   auto ports = splitStringToArray<int>(options->at(Option::PORT)->getString());
+  auto addrs = splitStringToArray<std::string>(options->at(Option::ADDRESS)->getString());
+  if (addrs.empty()) {
+#ifdef USE_CLICKHOUSE
+    addrs.push_back("127.0.0.1");
+#else
+    addrs.push_back("localhost");
+#endif
+  }
+  if (addrs.size() > 1 && addrs.size() != ports.size()) {
+    std::cerr << "Error: --address has " << addrs.size()
+              << " entries but --port has " << ports.size()
+              << ". Provide one address (broadcast) or one per port.\n";
+    exit(EXIT_FAILURE);
+  }
 #ifdef USE_MYSQL
   std::string name = "mysql";
 #elif USE_DUCKDB
   std::string name = "duckdb";
+#elif USE_CLICKHOUSE
+  std::string name = "clickhouse";
 #endif
   if (confFile.empty() && ports.size() == 1) {
     /*single node and command line */
@@ -220,14 +386,55 @@ int main(int argc, char *argv[]) {
     create_worker(wParams);
     delete wParams;
   } else if (confFile.empty() && ports.size() > 1) {
-    for (auto port : ports) {
-      workerParams *wParams = new workerParams(port);
-      wParams->myName = name + "." + std::to_string(port);
+#ifdef USE_CLICKHOUSE
+    /* Verify replicas are consistent before starting workload */
+    ch_verify_startup(addrs, ports,
+                      options->at(Option::DATABASE)->getString(),
+                      options->at(Option::USER)->getString(),
+                      options->at(Option::PASSWORD)->getString());
+#endif
+    for (size_t i = 0; i < ports.size(); i++) {
+      workerParams *wParams = new workerParams(ports[i], i, ports.size());
+      wParams->address = (addrs.size() == 1) ? addrs[0] : addrs[i];
+      wParams->myName = name + "." + wParams->address + "." + std::to_string(ports[i]);
       nodes.push_back(std::thread(create_worker, wParams));
     }
+#ifdef USE_CLICKHOUSE
+    /* Periodic replica verification thread: pauses workers, checksums, resumes */
+    std::atomic<bool> nodes_done(false);
+    int verify_interval = options->at(Option::CH_VERIFY_INTERVAL)->getInt();
+    std::thread verifier_thread;
+    if (verify_interval > 0) {
+      verifier_thread = std::thread([&]() {
+        while (!nodes_done.load(std::memory_order_relaxed)) {
+          for (int s = 0; s < verify_interval; s++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (nodes_done.load(std::memory_order_relaxed)) return;
+          }
+          /* An exception here would escape this thread and terminate the
+             process, taking the workload down over a failed verification
+             query. */
+          try {
+            ch_verify_replicas(addrs, ports,
+                               options->at(Option::DATABASE)->getString(),
+                               options->at(Option::USER)->getString(),
+                               options->at(Option::PASSWORD)->getString(),
+                               {});
+          } catch (const std::exception &e) {
+            std::cerr << "ERROR: replica verification failed: " << e.what()
+                      << "\n";
+          }
+        }
+      });
+    }
+#endif
     /* join all nodes */
     for (auto node = nodes.begin(); node != nodes.end(); node++)
       node->join();
+#ifdef USE_CLICKHOUSE
+    nodes_done.store(true, std::memory_order_relaxed);
+    if (verifier_thread.joinable()) verifier_thread.join();
+#endif
   } else {
     INIReader reader(confFile);
     if (reader.ParseError() < 0) {
@@ -252,6 +459,36 @@ int main(int argc, char *argv[]) {
   }
 
   save_metadata_to_file();
+
+#ifdef USE_CLICKHOUSE
+  {
+    const std::string &chdb  = options->at(Option::DATABASE)->getString();
+    const std::string &chuser = options->at(Option::USER)->getString();
+    const std::string &chpass = options->at(Option::PASSWORD)->getString();
+
+    if (ports.size() > 1) {
+      /* Collect table names before clean_up_at_end() frees all_tables */
+      std::vector<std::string> tnames;
+      std::set<std::string> seen;
+      for (auto *t : *all_tables)
+        if (seen.insert(t->name_).second)
+          tnames.push_back(t->name_);
+
+      ch_verify_replicas(addrs, ports, chdb, chuser, chpass, tnames);
+    }
+
+    /* metadata vs actual ClickHouse columns, unless --skip-schema-verify */
+    if (!options->at(Option::CH_SKIP_SCHEMA_VERIFY)->getBool())
+      ch_verify_schema(addrs, ports, chdb, chuser, chpass);
+
+    /* Every worker has joined, so nothing is inserting and each view has
+       received everything its table holds: the point where a view that mirrors
+       its table must match it exactly. */
+    if (options->at(Option::CH_VERIFY_MV)->getBool())
+      ch_verify_materialized_views(addrs, ports, chdb, chuser, chpass);
+  }
+#endif
+
   clean_up_at_end();
 
   /* print option with total_queries */
@@ -261,6 +498,9 @@ int main(int argc, char *argv[]) {
                 << ", success=>" << op->success_queries << std::endl;
     }
   }
+#ifdef USE_CLICKHOUSE
+  print_compare_with_setting_stats();
+#endif
   delete_options();
   std::cout << "COMPLETED" << std::endl;
   if (run_query_failed)

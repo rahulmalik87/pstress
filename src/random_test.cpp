@@ -7,7 +7,13 @@
 #include "common.hpp"
 #include "json.hpp"
 #include "node.hpp"
+#ifdef USE_CLICKHOUSE
+#include "ch_verify.hpp"
+#endif
 #include <array>
+#include <deque>
+#include <functional>
+#include <map>
 #include <document.h>
 #include <filesystem>
 #include <iomanip>
@@ -17,11 +23,14 @@
 #include <thread>
 #include <unistd.h>
 
-#define CR_SERVER_GONE_ERROR 2006
-#define CR_SERVER_LOST 2013
-#define CR_WSREP_NOT_PREPARED 1047
-#define CR_SECONDARY_NOT_READY 6000
 extern thread_local std::mt19937 rng;
+
+#ifdef USE_CLICKHOUSE
+/* defined further down with the rest of the ClickHouse helpers, needed up here
+   by the option validation in sum_of_all_options() */
+static std::string to_upper(const std::string &s);
+static std::string ch_engine_base(const std::string &engine);
+#endif
 
 size_t number_of_records;
 
@@ -37,6 +46,20 @@ std::vector<std::string> g_tablespace;
 std::vector<std::string> locks;
 std::vector<std::string> algorithms;
 std::vector<int> g_key_block_size;
+std::vector<SettingSpec> g_table_settings;
+std::vector<std::string> g_session_settings;
+std::vector<SettingSpec> g_alterable_table_settings;
+std::string g_fixed_table_settings;
+#ifdef USE_CLICKHOUSE
+std::vector<MVInfo> g_materialized_views;
+std::mutex g_materialized_views_mutex;
+#endif
+#ifdef USE_CLICKHOUSE
+/* --compare-result-with-setting bookkeeping, reported at the end of the run */
+std::atomic<long> g_compare_done(0);
+std::atomic<long> g_compare_baseline_failed(0);
+std::atomic<long> g_compare_setting_failed(0);
+#endif
 std::vector<std::string> random_strs;
 int g_innodb_page_size;
 int sum_of_all_opts = 0; // sum of all probablility
@@ -78,8 +101,9 @@ void print_and_log(std::string &&str, Thd1 *thd, bool print_error,
   ss << "[" << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S")
      << "] ";
 
-  ss << "Thread " << (thd ? std::to_string(thd->thread_id) : "#") << " : "
-     << str;
+  ss << "Thread " << (thd ? std::to_string(thd->thread_id) : "#")
+     << (thd && thd->myParam ? "@" + std::to_string(thd->myParam->port) : "")
+     << " : " << str;
   if (print_error) {
     ss << "error: " << thd->db->get_error();
   }
@@ -115,11 +139,14 @@ static bool save_query_result_in_file(const query_result &result,
 
 /* compare the result set of two queries and return true if successsful else
  * false and also print the result of queries to afile */
-static bool compare_query_result(const query_result &r1, const query_result &r2,
-                                 Thd1 *thd, bool case_insensitive = false) {
-  auto print_query_result = [r1, r2]() {
-    save_query_result_in_file(r1, "secondary_result.csv");
-    save_query_result_in_file(r2, "mysql_result.csv");
+static bool
+compare_query_result(const query_result &r1, const query_result &r2, Thd1 *thd,
+                     bool case_insensitive = false,
+                     const std::string &r1_file = "secondary_result.csv",
+                     const std::string &r2_file = "mysql_result.csv") {
+  auto print_query_result = [&]() {
+    save_query_result_in_file(r1, r1_file);
+    save_query_result_in_file(r2, r2_file);
     return false;
   };
   if (r1.size() != r2.size()) {
@@ -178,6 +205,7 @@ static size_t convert_to_number(const std::string &str) {
 /* generate random numbers to populate system with unique values
 @param[in] number_of_records
 @param[out] vector containing unique elements */
+PSTRESS_TARGET_CLONES
 std::vector<long int> generateUniqueRandomNumbers(long int number_of_records) {
 
   std::unordered_set<long int> unique_keys_set(number_of_records);
@@ -206,6 +234,32 @@ std::vector<long int> generateUniqueRandomNumbers(long int number_of_records) {
 static bool get_check_result(const std::string &sql, Thd1 *thd) {
 
   auto result = thd->db->get_query_result(sql);
+
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse CHECK TABLE returns one row per part as
+     (part_name, is_passed UInt8, message) — three columns, not MySQL's four
+     (Table, Op, Msg_type, Msg_text), and no "OK" anywhere. Judging it by the
+     MySQL shape below reports every successful check as a failure.
+     An empty result is not a failure either: a table with no active parts
+     (freshly truncated, or every part dropped) has nothing to check. */
+  if (!thd->db->get_error().empty()) {
+    print_and_log("CHECK TABLE FAILED " + sql + " " + thd->db->get_error(),
+                  thd);
+    return false;
+  }
+  for (const auto &row : result) {
+    /* single-value form (check_query_single_value_result=1) is one column */
+    const std::string &passed = row.size() > 1 ? row[1] : row[0];
+    if (passed != "1") {
+      print_and_log("Check table failed " + sql + " part " + row[0] + " -> " +
+                        (row.size() > 2 ? row[2] : passed),
+                    thd);
+      return false;
+    }
+  }
+  return true;
+#endif
+
   if (result.empty() || result.size() < 1 || result[0].size() < 4) {
     print_and_log("CHECK TABLE FAILED" + sql + thd->db->get_error(), thd);
     return false;
@@ -393,7 +447,7 @@ int sum_of_all_options(Thd1 *thd) {
   }
 
   /* check if keyring component is installed */
-  if (strcmp(FORK, "DuckDB") != 0 &&
+  if (strcmp(FORK, "MySQL") == 0 &&
       thd->db->get_single_value(
           "SELECT status_value FROM performance_schema.keyring_component_status WHERE \
     status_key='component_status'") == "Active")
@@ -452,6 +506,68 @@ int sum_of_all_options(Thd1 *thd) {
     locks.clear();
   }
 
+  if (strcmp(FORK, "ClickHouse") == 0) {
+    /* Convenient defaults for ClickHouse (only if not overridden on CLI) */
+    if (!options->at(Option::ADDRESS)->cl)
+      options->at(Option::ADDRESS)->setString("127.0.0.1");
+    if (!options->at(Option::USER)->cl)
+      options->at(Option::USER)->setString("default");
+    if (!options->at(Option::DATABASE)->cl)
+      options->at(Option::DATABASE)->setString("test_db");
+    if (!options->at(Option::PORT)->cl)
+      options->at(Option::PORT)->setString(
+          options->at(Option::SECURE)->getBool() ? "9440" : "9000");
+    options->at(Option::NO_FK)->setBool(true);
+    options->at(Option::NO_AUTO_INC)->setBool(true);
+    options->at(Option::PK_COLUMN_AUTOINC)->setInt(0);
+    options->at(Option::NO_TABLESPACE)->setBool(true);
+    options->at(Option::NO_TEMPORARY)->setBool(true);
+    options->at(Option::NO_COLUMN_COMPRESSION)->setBool(true);
+    options->at(Option::NO_TABLE_COMPRESSION)->setBool(true);
+    options->at(Option::XA_TRANSACTION)->setInt(0);
+    options->at(Option::SAVEPOINT_PRB_K)->setInt(0);
+    options->at(Option::NO_VIRTUAL_COLUMNS)->setBool(true);
+    options->at(Option::NO_ENUM)->setBool(true);
+    options->at(Option::NO_DESC_INDEX)->setBool(true);
+    options->at(Option::INDEXES)->setInt(0);
+    options->at(Option::NO_PARTITION)->setBool(true);
+    options->at(Option::IGNORE_DML_CLAUSE)->setInt(0);
+    options->at(Option::REPLACE_ROW)->setInt(0);
+    options->at(Option::SELECT_FOR_UPDATE)->setInt(0);
+    options->at(Option::SELECT_FOR_UPDATE_BULK)->setInt(0);
+    options->at(Option::CALL_FUNCTION)->setInt(0);
+    options->at(Option::ADD_DROP_PARTITION)->setInt(0);
+    options->at(Option::RENAME_INDEX)->setInt(0);
+    options->at(Option::ALTER_DISCARD_TABLESPACE)->setInt(0);
+    options->at(Option::ALTER_DATABASE_COLLATION)->setInt(0);
+    options->at(Option::NO_BIT)->setBool(true);
+    /* A multi-column ORDER BY is one of the shapes most worth testing here --
+       it is what real ClickHouse tables look like, and it changes how parts
+       sort, how the primary index is built and which projections the optimizer
+       can prefer. The composite columns land in both PRIMARY KEY and ORDER BY
+       (see the pk_cols loop), so the ORDER BY superset invariant holds, and the
+       enforcing key stays the prefix, so --seq-pk still appends.
+
+       The roll is per candidate column, not per table, and the candidates are
+       fewer than the column count suggests: resolve_composite_key() skips a
+       column whose null_val is set, which is about half of them, so the pool
+       averages ~3 of the 9 int columns rather than all 9. Measured at 5: about
+       one table in 7 ends up with a 2-column key, a couple of percent with 3,
+       and the single-column shape stays dominant. Note that nothing is actually
+       emitted Nullable on ClickHouse (null-prob defaults to 0), so that skip is
+       conservative here rather than necessary -- raise --composite-key-prob if
+       you want the multi-column shape more often. An explicit value still wins,
+       including 0 to turn it off. */
+    if (!options->at(Option::COMPOSITE_KEY_PROB)->cl)
+      options->at(Option::COMPOSITE_KEY_PROB)->setInt(5);
+    /* The primary key is the whole ORDER BY here, so append-only keys are the
+       shape worth testing; an explicit --seq-pk=false still wins. */
+    if (!options->at(Option::SEQ_PK)->cl)
+      options->at(Option::SEQ_PK)->setBool(true);
+    algorithms.clear();
+    locks.clear();
+  }
+
   /* Disabling alter discard tablespace until 8.0.30
    * Bug: https://jira.percona.com/browse/PS-7865 is fixed by upstream in
    * MySQL 8.0.31 */
@@ -475,6 +591,15 @@ int sum_of_all_options(Thd1 *thd) {
     g_encryption = {enc_type};
 
   /* feature not supported by oracle */
+  /* CH_ALTER_UPDATE/DELETE are ClickHouse-only mutations, and so is the
+     KILL MUTATION that cancels them */
+  if (strcmp(FORK, "ClickHouse") != 0) {
+    options->at(Option::CH_ALTER_UPDATE)->setInt(0);
+    options->at(Option::CH_ALTER_DELETE)->setInt(0);
+    options->at(Option::CH_KILL_MUTATION)->setInt(0);
+    options->at(Option::CH_LIGHTWEIGHT_DELETE)->setInt(0);
+  }
+
   if (strcmp(FORK, "MySQL") == 0) {
     options->at(Option::ALTER_DATABASE_ENCRYPTION)->setInt(0);
     options->at(Option::NO_COLUMN_COMPRESSION)->setBool("true");
@@ -541,6 +666,193 @@ int sum_of_all_options(Thd1 *thd) {
   if (options->at(Option::NO_FK)->getBool()) {
     options->at(Option::FK_PROB)->setInt(0);
   }
+
+#ifdef USE_CLICKHOUSE
+  {
+    const std::string mode =
+        options->at(Option::CH_MV_POPULATE_ATOMICALLY)->getString();
+    if (mode != "on" && mode != "off" && mode != "random") {
+      print_and_log("--mv-populate-atomically must be on, off or random, not " +
+                    mode);
+      exit(EXIT_FAILURE);
+    }
+    /* The exact view check needs a source that never merges rows sharing a
+       sorting key, otherwise the duplicates a non-atomic populate leaves behind
+       are collapsed away before anyone can see them. Say so once at startup
+       instead of leaving a weaker check looking like a full one. */
+    if (options->at(Option::CH_CREATE_MV)->getInt() > 0 &&
+        ch_engine_collapses_rows(options->at(Option::ENGINE)->getString()))
+      print_and_log("--engine=" +
+                    options->at(Option::ENGINE)->getString() +
+                    " merges rows sharing a sorting key, so materialized views "
+                    "can only be checked for lost rows, not duplicated ones. "
+                    "Use --engine=MergeTree for the exact check.");
+  }
+
+  /* ---- projections ---- */
+  {
+    auto prob = [](Option::Opt o) { return options->at(o)->getInt(); };
+    /* only ADD creates one; the other two act on what it made */
+    g_projections_enabled = prob(Option::CH_ADD_PROJECTION) > 0;
+
+    if (!g_projections_enabled &&
+        (prob(Option::CH_MODIFY_PROJECTION) > 0 ||
+         prob(Option::CH_DROP_PROJECTION) > 0 ||
+         prob(Option::CH_MATERIALIZE_PROJECTION) > 0)) {
+      print_and_log("--modify-projection, --drop-projection and "
+                    "--materialize-projection need a projection to act on. "
+                    "Pass --add-projection=N, otherwise they would roll and do "
+                    "nothing and the run would look healthy while testing "
+                    "nothing.");
+      exit(EXIT_FAILURE);
+    }
+
+    if (g_projections_enabled) {
+      /* Projections only exist on the MergeTree family, and ch_resolve_engine
+         passes an engine it does not recognise through verbatim, so say so once
+         here instead of failing every CREATE TABLE. */
+      const std::string base_upper =
+          to_upper(ch_engine_base(options->at(Option::ENGINE)->getString()));
+      if (base_upper != "MERGETREE" && base_upper != "REPLACINGMERGETREE" &&
+          base_upper != "SUMMINGMERGETREE" &&
+          base_upper != "AGGREGATINGMERGETREE") {
+        print_and_log("--engine=" + options->at(Option::ENGINE)->getString() +
+                      " is not a MergeTree family engine pstress knows, so it "
+                      "cannot carry projections.");
+        exit(EXIT_FAILURE);
+      }
+
+      /* A projection index_granularity override needs the parent table to keep
+         adaptive granularity, so index_granularity_bytes = 0 in the pool would
+         turn every projection ALTER on that table into SUPPORT_IS_DISABLED. */
+      for (const auto &spec : g_table_settings)
+        if (spec.name == "index_granularity_bytes" &&
+            std::find(spec.values.begin(), spec.values.end(), "0") !=
+                spec.values.end()) {
+          print_and_log("index_granularity_bytes = 0 in the table settings pool "
+                        "makes every projection index_granularity override fail "
+                        "with SUPPORT_IS_DISABLED. Remove the 0 value.");
+          exit(EXIT_FAILURE);
+        }
+
+      /* the same trap, reached at run time instead of at CREATE TABLE: an
+         alter: entry can put the 0 there later, and a range starting at 0 can
+         resolve to it without ever spelling it out */
+      for (const auto &spec : g_alterable_table_settings)
+        if (spec.name == "index_granularity_bytes" &&
+            (spec.is_range ? spec.lo == 0
+                           : std::find(spec.values.begin(), spec.values.end(),
+                                       "0") != spec.values.end())) {
+          print_and_log("alter:index_granularity_bytes in the table settings "
+                        "pool lets --modify-table-setting turn off adaptive "
+                        "granularity mid-run, which makes every projection "
+                        "index_granularity override fail with "
+                        "SUPPORT_IS_DISABLED. Drop the alter: prefix from that "
+                        "line while projections are on.");
+          exit(EXIT_FAILURE);
+        }
+
+      if (prob(Option::CH_MODIFY_PROJECTION) > 0 &&
+          prob(Option::CH_DROP_PROJECTION) > prob(Option::CH_MODIFY_PROJECTION))
+        print_and_log("WARNING: --drop-projection is more likely than "
+                      "--modify-projection, so most MODIFYs will find their "
+                      "target already dropped.");
+    }
+  }
+
+  /* ---- text indexes ---- */
+  {
+    auto prob = [](Option::Opt o) { return options->at(o)->getInt(); };
+    g_text_index_phrase_search_enabled =
+        prob(Option::CH_TEXT_INDEX_PHRASE_SEARCH_PROB) > 0;
+
+    if (prob(Option::CH_TEXT_INDEX_PROB) == 0 &&
+        prob(Option::CH_ADD_TEXT_INDEX) == 0 &&
+        (prob(Option::CH_DROP_TEXT_INDEX) > 0 ||
+         prob(Option::CH_MATERIALIZE_TEXT_INDEX) > 0))
+      print_and_log("WARNING: --drop-text-index and --materialize-text-index "
+                    "only act on text indexes that already exist. With "
+                    "--text-index-prob=0 and --add-text-index=0 they act only "
+                    "on the ones an earlier step left behind.");
+
+    if ((prob(Option::CH_TEXT_INDEX_PROB) > 0 ||
+         prob(Option::CH_ADD_TEXT_INDEX) > 0) &&
+        prob(Option::TEXT_WORDS) == 0)
+      print_and_log("WARNING: text indexes without --text-words. Most String "
+                    "values are then a single word, so hasAllTokens and "
+                    "hasPhrase rarely have more than one token to look for.");
+
+    if (prob(Option::CH_TEXT_INDEX_PREPROCESSOR_PROB) > 0 &&
+        options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool() &&
+        options->at(Option::RUN_QUERY_SETTING)->getString().find(
+            "use_skip_indexes") != std::string::npos) {
+      print_and_log("--text-index-preprocessor-prob together with "
+                    "--run-query-setting use_skip_indexes: a preprocessor is "
+                    "only applied on the index path, so the two sides "
+                    "legitimately differ and every mismatch would be a false "
+                    "alarm. Set --text-index-preprocessor-prob=0, or compare "
+                    "against query_plan_direct_read_from_text_index = 0.");
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  /* ---- int skipping indexes ---- */
+  {
+    auto prob = [](Option::Opt o) { return options->at(o)->getInt(); };
+    if (prob(Option::CH_INT_INDEX_PROB) == 0 &&
+        prob(Option::CH_ADD_INT_INDEX) == 0 &&
+        (prob(Option::CH_DROP_INT_INDEX) > 0 ||
+         prob(Option::CH_MATERIALIZE_INT_INDEX) > 0))
+      print_and_log("WARNING: --drop-int-index and --materialize-int-index "
+                    "only act on int indexes that already exist. With "
+                    "--int-index-prob=0 and --add-int-index=0 they act only "
+                    "on the ones an earlier step left behind.");
+  }
+
+  /* ---- table settings altered while the run is going ---- */
+  {
+    auto prob = [](Option::Opt o) { return options->at(o)->getInt(); };
+
+    if ((prob(Option::CH_MODIFY_TABLE_SETTING) > 0 ||
+         prob(Option::CH_RESET_TABLE_SETTING) > 0) &&
+        g_alterable_table_settings.empty()) {
+      print_and_log("--modify-table-setting and --reset-table-setting only act "
+                    "on settings the pool marked alterable, and there is not "
+                    "one: prefix a line of --table-settings-file with alter:. "
+                    "Without it both would roll and do nothing and the run "
+                    "would look healthy while testing nothing. Note that "
+                    "--no-table-settings and --table-settings both bypass the "
+                    "pool entirely.");
+      exit(EXIT_FAILURE);
+    }
+
+    if (prob(Option::CH_RESET_TABLE_SETTING) > 0 &&
+        prob(Option::CH_MODIFY_TABLE_SETTING) == 0)
+      print_and_log("WARNING: --reset-table-setting without "
+                    "--modify-table-setting can only reset what a table rolled "
+                    "at CREATE TABLE, so it goes quiet once every table is "
+                    "back to the server defaults.");
+  }
+#else
+  /* the create/drop view, kill mutation and projection actions only exist in
+     the ClickHouse build. Every one of them has to be zeroed: an option with a
+     probability but no case in the dispatch switch aborts the run. */
+  opt_int_set(CH_CREATE_MV, 0);
+  opt_int_set(CH_DROP_MV, 0);
+  opt_int_set(CH_KILL_MUTATION, 0);
+  opt_int_set(CH_ADD_PROJECTION, 0);
+  opt_int_set(CH_DROP_PROJECTION, 0);
+  opt_int_set(CH_MODIFY_PROJECTION, 0);
+  opt_int_set(CH_MATERIALIZE_PROJECTION, 0);
+  opt_int_set(CH_ADD_TEXT_INDEX, 0);
+  opt_int_set(CH_DROP_TEXT_INDEX, 0);
+  opt_int_set(CH_MATERIALIZE_TEXT_INDEX, 0);
+  opt_int_set(CH_ADD_INT_INDEX, 0);
+  opt_int_set(CH_DROP_INT_INDEX, 0);
+  opt_int_set(CH_MATERIALIZE_INT_INDEX, 0);
+  opt_int_set(CH_MODIFY_TABLE_SETTING, 0);
+  opt_int_set(CH_RESET_TABLE_SETTING, 0);
+#endif
 
   if (options->at(Option::ONLY_PARTITION)->getBool())
     options->at(Option::NO_TEMPORARY)->setBool("true");
@@ -814,6 +1126,362 @@ std::vector<std::string> random_strs_generator() {
   return strs;
 }
 
+static std::string trim_ws(const std::string &str) {
+  auto begin = str.find_first_not_of(" \t\r");
+  if (begin == std::string::npos)
+    return "";
+  return str.substr(begin, str.find_last_not_of(" \t\r") - begin + 1);
+}
+
+#ifdef USE_CLICKHOUSE
+/* Append "SETTINGS <setting>" to a query. Used by compare_result_with_setting()
+   and by grammar_sql() for --ch-grammar-query-settings; ClickHouse only, the
+   MySQL build has no SETTINGS clause. */
+std::string add_settings_clause(const std::string &sql,
+                                const std::string &setting) {
+  auto stripped = trim_ws(sql);
+  /* load_grammar_sql_from() only strips trailing whitespace, so a grammar line
+     can still end in ';' and we would emit "... ; SETTINGS x = 1" */
+  while (!stripped.empty() && stripped.back() == ';')
+    stripped = trim_ws(stripped.substr(0, stripped.size() - 1));
+
+  /* ClickHouse takes one SETTINGS clause per query level and it has to come
+     last, so join the query's own clause rather than emit a second one.
+     "settings" only reads as the keyword when an assignment follows it, which
+     keeps a column or a string literal of that name from matching. A match
+     inside a subquery does not count either: that clause belongs to the
+     subquery and the outer query still needs its own, so only a match that is
+     not closed off by a ')' before the end of the string is ours to extend. */
+  static const std::regex settings_clause(
+      R"(\bsettings\s+[A-Za-z_][A-Za-z0-9_]*\s*=)", std::regex::icase);
+  bool has_settings = false;
+  for (auto it = std::sregex_iterator(stripped.begin(), stripped.end(),
+                                      settings_clause);
+       it != std::sregex_iterator(); ++it) {
+    int depth = 0;
+    for (auto c = stripped.cbegin() + it->position(); c != stripped.cend(); ++c) {
+      if (*c == '(')
+        depth++;
+      else if (*c == ')')
+        depth--;
+    }
+    if (depth >= 0)
+      has_settings = true;
+  }
+
+  return stripped + (has_settings ? ", " : " SETTINGS ") + setting;
+}
+#endif
+
+/* split on delimiter keeping each piece whole. splitStringToArray() reads with
+   >> and so stops at the first space, which would turn "a = 1" into "a". */
+static std::vector<std::string> split_and_trim(const std::string &input,
+                                               char delimiter) {
+  std::vector<std::string> result;
+  std::istringstream iss(input);
+  std::string piece;
+  while (std::getline(iss, piece, delimiter)) {
+    auto trimmed = trim_ws(piece);
+    if (!trimmed.empty())
+      result.push_back(trimmed);
+  }
+  return result;
+}
+
+/* settings pstress emits itself — the lightweight mutation paths depend on
+   them, so the settings file is not allowed to override them */
+static bool is_reserved_setting(const std::string &name) {
+  return name == "enable_block_number_column" ||
+         name == "enable_block_offset_column" ||
+         /* the three the projection workload owns; see Table::definition() on
+            why a probabilistic roll would make a run look healthy while
+            testing nothing */
+         name == "deduplicate_merge_projection_mode" ||
+         name == "lightweight_mutation_projection_mode" ||
+         name == "allow_nullable_key";
+}
+
+[[noreturn]] static void settings_file_error(const std::string &file,
+                                            int line_no,
+                                            const std::string &line,
+                                            const std::string &why) {
+  std::cerr << "Invalid table setting at " << file << ":" << line_no << ": "
+            << why << "\n  " << line << std::endl;
+  exit(EXIT_FAILURE);
+}
+
+/* one value for a spec: a random element of the list, or a random integer
+   inside the range */
+static std::string resolve_setting_value(const SettingSpec &spec) {
+  if (spec.is_range)
+    return std::to_string(rand_int(spec.hi, spec.lo));
+  if (spec.values.empty())
+    return "";
+  return spec.values.at(rand_int(spec.values.size() - 1));
+}
+
+/* Read the settings pool. Table entries are kept for per-table rolling in
+   pick_table_settings(); session entries are rolled here, once, so that every
+   thread issues the same SET — threads disagreeing about an
+   allow_experimental_* flag would make CREATE TABLE fail on some of them. */
+void load_table_settings_pool() {
+  g_table_settings.clear();
+  g_session_settings.clear();
+  g_alterable_table_settings.clear();
+  g_fixed_table_settings.clear();
+
+  if (options->at(Option::NO_TABLE_SETTINGS)->getBool())
+    return;
+
+  /* a fixed clause is used for every table, so normalize it here instead of
+     re-parsing it per table, and drop the settings pstress owns — ClickHouse
+     accepts a duplicated setting and lets the last one win, which would
+     silently turn off what the mutation paths need */
+  const auto fixed = opt_string(CH_TABLE_SETTINGS);
+  if (!fixed.empty()) {
+    for (const auto &setting : split_and_trim(fixed, ',')) {
+      auto eq = setting.find('=');
+      if (eq == std::string::npos) {
+        std::cerr << "Invalid --table-settings entry, expected <name> = <value>"
+                  << ":\n  " << setting << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      if (is_reserved_setting(trim_ws(setting.substr(0, eq)))) {
+        std::cout << "Ignoring " << trim_ws(setting.substr(0, eq))
+                  << " in --table-settings, pstress always sets it"
+                  << std::endl;
+        continue;
+      }
+      if (!g_fixed_table_settings.empty())
+        g_fixed_table_settings += ", ";
+      g_fixed_table_settings += setting;
+    }
+    return;
+  }
+
+  auto *file_opt = options->at(Option::CH_TABLE_SETTINGS_FILE);
+  const std::string file_name = file_opt->getString();
+  if (file_name.empty())
+    return;
+
+  /* the shipped pool sits next to the binary, like the dictionary file */
+  std::filesystem::path path(file_name);
+  if (path.is_relative())
+    path = std::filesystem::path(getExecutablePath()).parent_path() / path;
+  const std::string path_str = path.string();
+
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    /* only fatal when the user named this file themselves */
+    if (file_opt->cl) {
+      std::cerr << "Unable to open table settings file " << path_str
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    std::cout << "No table settings file at " << path_str
+              << ", tables will use server default settings" << std::endl;
+    return;
+  }
+
+  std::string line;
+  int line_no = 0;
+  while (std::getline(file, line)) {
+    line_no++;
+    std::string rest = trim_ws(line);
+    if (rest.empty() || rest[0] == '#')
+      continue;
+
+    bool is_session = false;
+    bool is_alterable = false;
+    if (rest.rfind("session:", 0) == 0) {
+      is_session = true;
+      rest = trim_ws(rest.substr(strlen("session:")));
+    } else if (rest.rfind("alter:", 0) == 0) {
+      /* a session setting is not a table setting, so there is nothing an
+         ALTER TABLE could do with it */
+      is_alterable = true;
+      rest = trim_ws(rest.substr(strlen("alter:")));
+    }
+
+    auto eq = rest.find('=');
+    if (eq == std::string::npos)
+      settings_file_error(
+          path_str, line_no, line,
+          "expected [session:|alter:][<prob>:]<name> = <values>");
+
+    SettingSpec spec;
+
+    /* optional probability prefix. A colon after the '=' belongs to an
+       int:<lo>..<hi> value, so only look before it. */
+    auto colon = rest.find(':');
+    if (colon != std::string::npos && colon < eq) {
+      auto prob_str = trim_ws(rest.substr(0, colon));
+      if (prob_str.empty() || prob_str.size() > 3 ||
+          prob_str.find_first_not_of("0123456789") != std::string::npos)
+        settings_file_error(path_str, line_no, line,
+                            "probability must be an integer 0-100");
+      spec.prob = std::stoi(prob_str);
+      if (spec.prob > 100)
+        settings_file_error(path_str, line_no, line,
+                            "probability must be an integer 0-100");
+      rest = trim_ws(rest.substr(colon + 1));
+      eq = rest.find('=');
+      if (eq == std::string::npos)
+        settings_file_error(path_str, line_no, line,
+                            "expected <name> = <values> after the probability");
+    }
+
+    spec.name = trim_ws(rest.substr(0, eq));
+    auto values = trim_ws(rest.substr(eq + 1));
+    if (spec.name.empty())
+      settings_file_error(path_str, line_no, line, "missing setting name");
+    if (values.empty())
+      settings_file_error(path_str, line_no, line, "missing value");
+
+    if (values.rfind("int:", 0) == 0) {
+      auto range = values.substr(strlen("int:"));
+      auto dots = range.find("..");
+      if (dots == std::string::npos)
+        settings_file_error(path_str, line_no, line,
+                            "integer range must be int:<lo>..<hi>");
+      try {
+        spec.lo = std::stol(trim_ws(range.substr(0, dots)));
+        spec.hi = std::stol(trim_ws(range.substr(dots + 2)));
+      } catch (const std::exception &) {
+        settings_file_error(path_str, line_no, line,
+                            "integer range must be int:<lo>..<hi>");
+      }
+      if (spec.hi < spec.lo)
+        settings_file_error(path_str, line_no, line,
+                            "integer range ends below where it starts");
+      spec.is_range = true;
+    } else {
+      spec.values = split_and_trim(values, '|');
+      if (spec.values.empty())
+        settings_file_error(path_str, line_no, line, "missing value");
+    }
+
+    if (is_reserved_setting(spec.name)) {
+      std::cout << "Ignoring " << spec.name << " at " << path_str << ":"
+                << line_no << ", pstress always sets it" << std::endl;
+      continue;
+    }
+
+    if (is_session) {
+      if (rand_int(99) < spec.prob)
+        g_session_settings.push_back(spec.name + " = " +
+                                     resolve_setting_value(spec));
+    } else {
+      spec.alterable = is_alterable;
+      g_table_settings.push_back(spec);
+      /* an alter: entry is still rolled onto CREATE TABLE at its probability,
+         so a table can start out with the setting; on top of that it is what
+         --modify-table-setting picks from, and MODIFY SETTING can set one the
+         table never rolled */
+      if (is_alterable)
+        g_alterable_table_settings.push_back(spec);
+    }
+  }
+  file.close();
+
+  std::cout << "Loaded " << g_table_settings.size() << " table settings from "
+            << path_str << ", " << g_alterable_table_settings.size()
+            << " of them alterable" << std::endl;
+  for (const auto &setting : g_session_settings)
+    std::cout << "Session setting: SET " << setting << std::endl;
+}
+
+/* Settings for one table: the fixed clause if given, otherwise every pool
+   entry whose probability roll passes, with one of its values. */
+std::string pick_table_settings() {
+  if (options->at(Option::NO_TABLE_SETTINGS)->getBool())
+    return "";
+
+  if (!g_fixed_table_settings.empty())
+    return g_fixed_table_settings;
+
+  std::string clause;
+  for (const auto &spec : g_table_settings) {
+    /* rand_int(99) is 0-99, so prob 100 always fires and prob 0 never does */
+    if (rand_int(99) >= spec.prob)
+      continue;
+    if (!clause.empty())
+      clause += ", ";
+    clause += spec.name + " = " + resolve_setting_value(spec);
+  }
+  return clause;
+}
+
+/* Table::settings is a flat "name = value, name = value" clause rather than a
+   map: it is what CREATE TABLE emits and what the metadata file stores, so
+   keeping it as the single copy of the truth means MODIFY/RESET SETTING need no
+   new persisted state and no metadata version bump. These three keep it in step
+   with the ALTERs that succeeded. */
+std::vector<std::string> ch_settings_names(const std::string &clause) {
+  std::vector<std::string> names;
+  for (const auto &setting : split_and_trim(clause, ',')) {
+    auto eq = setting.find('=');
+    if (eq == std::string::npos)
+      continue;
+    auto name = trim_ws(setting.substr(0, eq));
+    if (!name.empty())
+      names.push_back(name);
+  }
+  return names;
+}
+
+void ch_settings_upsert(std::string &clause, const std::string &name,
+                        const std::string &value) {
+  std::string rebuilt;
+  bool replaced = false;
+  for (const auto &setting : split_and_trim(clause, ',')) {
+    auto eq = setting.find('=');
+    const bool same =
+        eq != std::string::npos && trim_ws(setting.substr(0, eq)) == name;
+    if (!rebuilt.empty())
+      rebuilt += ", ";
+    if (same) {
+      rebuilt += name + " = " + value;
+      replaced = true;
+    } else {
+      rebuilt += setting;
+    }
+  }
+  if (!replaced) {
+    if (!rebuilt.empty())
+      rebuilt += ", ";
+    rebuilt += name + " = " + value;
+  }
+  clause = rebuilt;
+}
+
+void ch_settings_erase(std::string &clause, const std::string &name) {
+  std::string rebuilt;
+  for (const auto &setting : split_and_trim(clause, ',')) {
+    auto eq = setting.find('=');
+    if (eq != std::string::npos && trim_ws(setting.substr(0, eq)) == name)
+      continue;
+    if (!rebuilt.empty())
+      rebuilt += ", ";
+    rebuilt += setting;
+  }
+  clause = rebuilt;
+}
+
+/* One alter: entry of the pool with a fresh value for it. The value is rolled
+   the same way CREATE TABLE rolls it, so the ALTER can only ever set something
+   the table could have been created with. */
+bool ch_roll_alterable_setting(std::string &name, std::string &value) {
+  if (g_alterable_table_settings.empty())
+    return false;
+  const auto &spec = g_alterable_table_settings.at(
+      rand_int(g_alterable_table_settings.size() - 1));
+  name = spec.name;
+  value = resolve_setting_value(spec);
+  return !value.empty();
+}
+
+PSTRESS_TARGET_CLONES
 long int rand_int(long int upper, long int lower) {
   assert(upper >= lower);
   std::uniform_int_distribution<std::mt19937::result_type> dist(lower, upper);
@@ -848,6 +1516,7 @@ static std::string rand_bit(int length) {
   return bit;
 }
 
+PSTRESS_TARGET_CLONES
 static std::string generateRandomString(int n) {
   const std::string alphabet =
       "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -863,31 +1532,108 @@ static std::string generateRandomString(int n) {
 
 /* return random string in range of upper and lower. If it can't find return
  * random generated string*/
+PSTRESS_TARGET_CLONES
 std::string rand_string(size_t size) {
-  /* if bigger string is request then ensure minimum 10 */
-  if (size > 10) {
+  /* if bigger string is requested ensure minimum 10 */
+  if (size > 10)
     size = rand_int(size, 10);
-  }
+
   std::string rs;
-  while (size > 0 && !random_strs.empty()) {
-    const auto &str = random_strs.at(rand_int(random_strs.size() - 1));
-    if (size > str.size()) {
-      if (size == str.size()) {
-        return rs + str;
-      }
-      rs += str + " ";
-      size -= str.size() + 1;
+
+  if (random_strs.empty() || size == 0) {
+    rs = generateRandomString(size);
+  } else {
+    auto pick = [&]() -> const std::string & {
+      return random_strs.at(rand_int(random_strs.size() - 1));
+    };
+
+    int strategy = rand_int(9); /* 0-9 */
+
+    if (strategy < 6) {
+      /* 60%: truncate — pick one word, use up to size chars */
+      rs = pick().substr(0, size);
+    } else if (strategy < 8) {
+      /* 20%: word + numeric suffix for high cardinality */
+      const std::string &w = pick();
+      std::string suffix = std::to_string(rand_int(9999));
+      rs = (w + suffix).substr(0, size);
+    } else if (strategy == 8) {
+      /* 10%: join two words with a separator */
+      static const char seps[] = {' ', '-', '_', '/'};
+      char sep = seps[rand_int(3)];
+      std::string combined = pick() + sep + pick();
+      rs = combined.substr(0, size);
     } else {
-      break;
+      /* 10%: pure random noise */
+      rs = generateRandomString(size);
     }
   }
-  if (rs.empty())
-    return generateRandomString(size);
+
 #ifdef USE_DUCKDB
-      /* if string has ' replace it with '' */
-      rs = std::regex_replace(rs, std::regex("'"), "''");
+  rs = std::regex_replace(rs, std::regex("'"), "''");
 #endif
-      return rs;
+  return rs;
+}
+
+#ifdef USE_CLICKHOUSE
+/* --text-words: 1 to max_words dictionary words joined by a separator, mostly
+   a space, sometimes one that only some tokenizers split on. One word in ten is
+   capitalized, so a lower() preprocessor and a case sensitive needle disagree
+   on something. The dictionary has no quotes, so the value needs no escaping. */
+std::string rand_words(int max_words) {
+  static const char *const seps[] = {" ", " ", " ", " ", ", ", "-", ". ", "/",
+                                     "_"};
+  const int n = rand_int(max_words, 1);
+  std::string rs;
+  for (int i = 0; i < n; i++) {
+    if (i > 0)
+      rs += seps[rand_int(8)];
+    std::string w = random_strs.at(rand_int(random_strs.size() - 1));
+    if (!w.empty() && rand_int(9) == 0)
+      w[0] = std::toupper(static_cast<unsigned char>(w[0]));
+    rs += w;
+  }
+  return rs;
+}
+
+/* The dictionary entries that are a single token: letters and digits only.
+   It also has compounds like "wide-query-merger", which hasToken rejects as a
+   needle, and which a LIKE needle would match as several tokens. */
+static const std::vector<std::string> &single_token_words() {
+  static const std::vector<std::string> words = [] {
+    std::vector<std::string> out;
+    for (const auto &w : random_strs)
+      if (!w.empty() && std::all_of(w.begin(), w.end(), [](unsigned char c) {
+            return std::isalnum(c);
+          }))
+        out.push_back(w);
+    return out;
+  }();
+  return words;
+}
+
+/* a random single token word of the dictionary, for RAND_WORD */
+std::string rand_word() {
+  const auto &words = single_token_words();
+  return words.at(rand_int(words.size() - 1));
+}
+
+/* The first (RAND_PREFIX) or last (RAND_SUFFIX) 2 to 8 characters of a random
+   word, never the whole word, for LIKE 'abc%' and LIKE '%xyz' needles.
+   text_index_like_min_pattern_length defaults to 4, so the range straddles
+   it: shorter needles take the path that does not use the index. */
+std::string rand_word_part(bool prefix) {
+  std::string w;
+  do
+    w = rand_word();
+  while (w.size() < 3);
+  const size_t len = rand_int(std::min<size_t>(8, w.size() - 1), 2);
+  return prefix ? w.substr(0, len) : w.substr(w.size() - len);
+}
+#endif
+
+std::string table_prefix() {
+  return options->at(Option::TABLE_PREFIX)->getString();
 }
 
 /* return column type from a string */
@@ -993,8 +1739,20 @@ static std::string rand_timezone() {
 }
 static std::string rand_date() {
   std::ostringstream out;
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse Date range is 1970-01-01 .. 2149-06-06. Out-of-range values are
+     silently clamped to the boundary (date_time_overflow_behavior defaults to
+     "ignore"), so a 1000..9999 year range makes ~99% of generated dates land
+     on 2149-06-06. That collapses the column to a single value: every
+     "WHERE dt = <date>" predicate then matches the whole table and each
+     lightweight UPDATE becomes a full-table patch part. Stay in range. */
+  int year = rand_int(2149, 1970);
+  int month = (year == 2149) ? rand_int(6, 1) : rand_int(12, 1);
+#else
+  /* MySQL DATE range is 1000-01-01 .. 9999-12-31. */
   int year = rand_int(9999, 1000); // Year from 1000 to 9999
   int month = rand_int(12, 1);     // Month from 1 to 12
+#endif
   int max_day = 28;                // Default to 28 for February
   if (month == 4 || month == 6 || month == 9 || month == 11) {
     max_day = 30; // April, June, September, November
@@ -1003,6 +1761,11 @@ static std::string rand_date() {
   } else if (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
     max_day = 29; // Leap year February
   }
+#ifdef USE_CLICKHOUSE
+  if (year == 2149 && month == 6) {
+    max_day = 6; // Date tops out at 2149-06-06
+  }
+#endif
   int day = rand_int(max_day, 1); // Day based on month and leap year
   out << std::setfill('0') << std::setw(4) << year << "-" << std::setw(2)
       << month << "-" << std::setw(2) << day;
@@ -1011,8 +1774,16 @@ static std::string rand_date() {
 
 static std::string rand_datetime() {
   std::ostringstream out;
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse DateTime range is 1970-01-01 00:00:00 .. 2106-02-07 06:28:15
+     (UTC). Same clamping problem as rand_date() -- see the comment there. */
+  int year = rand_int(2106, 1970);
+  int month = (year == 2106) ? rand_int(2, 1) : rand_int(12, 1);
+#else
+  /* MySQL DATETIME range is 1000-01-01 .. 9999-12-31. */
   int year = rand_int(9999, 1000); // Year from 1000 to 9999
   int month = rand_int(12, 1);     // Month from 1 to 12
+#endif
   int max_day = 28;                // Default to 28 for February
   if (month == 4 || month == 6 || month == 9 || month == 11) {
     max_day = 30; // April, June, September, November
@@ -1021,10 +1792,26 @@ static std::string rand_datetime() {
   } else if (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
     max_day = 29; // Leap year February
   }
+#ifdef USE_CLICKHOUSE
+  if (year == 2106 && month == 2) {
+    max_day = 7; // DateTime tops out on 2106-02-07
+  }
+#endif
   int day = rand_int(max_day, 1); // Day based on month and leap year
   int hour = rand_int(23, 0);     // Hour from 0 to 23
   int minute = rand_int(59, 0);   // Minute from 0 to 59
   int second = rand_int(59, 0);   // Second from 0 to 59
+#ifdef USE_CLICKHOUSE
+  if (year == 2106 && month == 2 && day == 7) {
+    hour = rand_int(6, 0); // DateTime tops out at 2106-02-07 06:28:15
+    if (hour == 6) {
+      minute = rand_int(28, 0);
+      if (minute == 28) {
+        second = rand_int(15, 0);
+      }
+    }
+  }
+#endif
 
   out << std::setfill('0') << std::setw(4) << year << "-" << std::setw(2)
       << month << "-" << std::setw(2) << day << " " << std::setw(2) << hour
@@ -1157,18 +1944,40 @@ std::string Column::rand_value() {
   }
   /* if primary key we varchar */
   if (primary_key == true) {
+    /* --seq-pk: aim inside the keys actually handed out, rather than over
+       --range * --records, where almost every value matches no row. This is a
+       sample and never an allocation -- see Table::sample_pk(). */
+    if (table_ != nullptr && table_->seq_pk_col == this)
+      return table_->pk_literal(table_->sample_pk(), this);
     auto value = std::to_string(try_negative(rand_int(
         options->at(Option::UNIQUE_RANGE)->getFloat() * number_of_records)));
     if (current_type == Column::COLUMN_TYPES::VARCHAR) {
       std::string result;
-      result.reserve(value.size() + 2); // Pre-allocate for quotes + value
+      result.reserve(value.size() + 2);
+#ifdef USE_MYSQL
       result += '"';
       result += value;
       result += '"';
+#else
+      result += '\'';
+      result += value;
+      result += '\'';
+#endif
       return result;
     }
     return value;
   }
+
+#ifdef USE_CLICKHOUSE
+  if (current_type == Column::COLUMN_TYPES::CHAR ||
+      current_type == Column::COLUMN_TYPES::VARCHAR ||
+      current_type == Column::COLUMN_TYPES::TEXT ||
+      current_type == Column::COLUMN_TYPES::BLOB) {
+    static const int text_words = opt_int(TEXT_WORDS);
+    if (text_words > 0)
+      return "'" + rand_words(text_words) + "'";
+  }
+#endif
 
   switch (current_type) {
   case Column::COLUMN_TYPES::INTEGER:
@@ -1186,11 +1995,15 @@ std::string Column::rand_value() {
   case Column::COLUMN_TYPES::TEXT:
 #ifdef USE_MYSQL
     return "\"" + rand_string(length) + "\"";
-#elif USE_DUCKDB
+#else
     return "\'" + rand_string(length) + "\'";
 #endif
   case Column::COLUMN_TYPES::BLOB:
+#ifdef USE_MYSQL
     return "_binary\"" + rand_string(length) + "\"";
+#else
+    return "\'" + rand_string(length) + "\'";
+#endif
   case Column::COLUMN_TYPES::JSON:
     return "\'" + json_rand_doc(this) + "\'";
   case Column::COLUMN_TYPES::BIT:
@@ -1204,7 +2017,11 @@ std::string Column::rand_value() {
   case Column::COLUMN_TYPES::DATETIME:
     return "\'" + rand_datetime() + "\'";
   case Column::COLUMN_TYPES::TIMESTAMP:
+#ifdef USE_MYSQL
     return "\'" + rand_timestamp() + "\'";
+#else
+    return "\'" + rand_timestamp(0, false) + "\'";
+#endif
     break;
   case Column::COLUMN_TYPES::GENERATED:
   case Column::COLUMN_TYPES::ENUM:
@@ -1219,6 +2036,13 @@ std::string Column::rand_value() {
 
 /* return table definition */
 std::string Column::definition() {
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse columns are NOT NULL by default; use Nullable() for nullable.
+     If null-prob=0, user wants no NULLs at all — skip Nullable wrapper. */
+  bool ch_nullable = null_val && options->at(Option::NULL_PROB)->getInt() > 0;
+  std::string type_str = ch_nullable ? "Nullable(" + clause() + ")" : clause();
+  return name_ + " " + type_str;
+#else
   std::string def = name_ + " " + clause();
   if (!null_val)
     def += " NOT NULL";
@@ -1230,6 +2054,7 @@ std::string Column::definition() {
   if (not_secondary)
     def += " NOT SECONDARY";
   return def;
+#endif
 }
 
 /* add new column, part of create table or Alter table */
@@ -1622,7 +2447,7 @@ std::string Index::definition() {
 }
 
 static void validate_secondary_engine(Thd1 *thd) {
-  if (strcmp(FORK, "Duckdb") == 0) {
+  if (strcmp(FORK, "Duckdb") || strcmp(FORK, "ClickHouse") == 0) {
     return;
   }
   if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
@@ -1677,6 +2502,9 @@ void wait_till_sync(const std::string &name, Thd1 *thd) {
 Table::Table(std::string n) : name_(n), indexes_() {
   columns_ = new std::vector<Column *>;
   indexes_ = new std::vector<Index *>;
+#ifdef USE_CLICKHOUSE
+  projections_ = new std::vector<Projection *>;
+#endif
 }
 
 bool Table::load_secondary_indexes(Thd1 *thd) {
@@ -1776,11 +2604,25 @@ void Table::DropCreate(Thd1 *thd) {
   if (!execute_sql("DROP TABLE " + name_, thd)) {
     return;
   }
+  mark_mv_source_mutated("the table was dropped and recreated");
+  /* after the DROP rather than after the CREATE: the rows are gone either
+     way, and the CREATE below has several fallback forms. */
+  reset_pk_counter();
 
   if (set_session_nbo) {
     execute_sql("SET SESSION wsrep_osu_method=DEFAULT ", thd);
   }
   std::string def = definition(true, true, true);
+#ifdef USE_CLICKHOUSE
+  /* The projections went with the table and definition() does not re-emit
+     them, so drop them from the registry too; --add-projection makes new
+     ones. */
+  {
+    lock_table_mutex(thd->ddl_query);
+    ForgetProjections();
+    unlock_table_mutex();
+  }
+#endif
   if (!execute_sql(def, thd) && tablespace.size() > 0) {
     std::string tbs = " TABLESPACE=" + tablespace + "_rename";
 
@@ -1852,9 +2694,16 @@ void Table::Truncate(Thd1 *thd) {
       sql += GetRandomPartition();
       unlock_table_mutex();
     }
-    execute_sql(sql, thd);
+    if (execute_sql(sql, thd))
+      mark_mv_source_mutated("TRUNCATE PARTITION");
   } else {
-    execute_sql("TRUNCATE TABLE " + name_, thd);
+    if (execute_sql("TRUNCATE TABLE " + name_, thd)) {
+      mark_mv_source_mutated("TRUNCATE TABLE");
+      /* the rows are gone, so the key sequence starts over. Deliberately not
+         done in the TRUNCATE PARTITION branch above: that empties one
+         partition and leaves the rest of the keys in place. */
+      reset_pk_counter();
+    }
   }
 }
 
@@ -1870,6 +2719,7 @@ void Partition::AddDrop(Thd1 *thd) {
       if (execute_sql("ALTER TABLE " + name_ + " ADD PARTITION PARTITIONS " +
                           std::to_string(new_partition),
                       thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         number_of_part += new_partition;
         unlock_table_mutex();
@@ -1879,6 +2729,7 @@ void Partition::AddDrop(Thd1 *thd) {
                           ", COALESCE PARTITION " +
                           std::to_string(new_partition),
                       thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         number_of_part -= new_partition;
         unlock_table_mutex();
@@ -1894,6 +2745,7 @@ void Partition::AddDrop(Thd1 *thd) {
 
       if (execute_sql("ALTER TABLE " + name_ + " DROP PARTITION " + part_name,
                       thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         number_of_part--;
         for (auto i = positions.begin(); i != positions.end(); i++) {
@@ -1915,6 +2767,7 @@ void Partition::AddDrop(Thd1 *thd) {
                         std::to_string(new_range) + "))";
 
       if (execute_sql(sql, thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         positions.emplace_back(new_part_name, new_range);
         number_of_part++;
@@ -1932,6 +2785,7 @@ void Partition::AddDrop(Thd1 *thd) {
       unlock_table_mutex();
       if (execute_sql("ALTER TABLE " + name_ + " DROP PARTITION " + part_name,
                       thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         number_of_part--;
         for (auto i = lists.begin(); i != lists.end(); i++) {
@@ -1969,6 +2823,7 @@ void Partition::AddDrop(Thd1 *thd) {
       }
       sql += "))";
       if (execute_sql(sql, thd)) {
+        mark_mv_source_mutated("a partition was added or dropped");
         lock_table_mutex(thd->ddl_query);
         number_of_part++;
         lists.emplace_back(new_part_name);
@@ -1990,6 +2845,11 @@ Table::~Table() {
   }
   delete columns_;
   delete indexes_;
+#ifdef USE_CLICKHOUSE
+  for (auto proj : *projections_)
+    delete proj;
+  delete projections_;
+#endif
 }
 
 /* create default column */
@@ -2283,7 +3143,7 @@ void Table::CreateDefaultIndex() {
 /* Create new table and pick some attributes */
 Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
   Table *table;
-  std::string name = TABLE_PREFIX + std::to_string(id);
+  std::string name = table_prefix() + std::to_string(id);
   if (suffix) {
     name += "_" + std::to_string(rand_int(1000000));
   }
@@ -2375,8 +3235,20 @@ Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
   static auto engine = options->at(Option::ENGINE)->getString();
   table->engine = engine;
 
+#ifdef USE_CLICKHOUSE
+  /* rolled once per table and persisted, so DropCreate and the next step
+     recreate this table with the same settings */
+  table->settings = pick_table_settings();
+#endif
+
   table->CreateDefaultColumn();
   table->CreateDefaultIndex();
+#ifdef USE_CLICKHOUSE
+  table->RollSkipIndexes();
+#endif
+  table->resolve_composite_key();
+  table->resolve_seq_pk_column();
+
   if (type == FK) {
     static_cast<FK_table *>(table)->pickRefrence(table);
   }
@@ -2408,13 +3280,349 @@ bool Table::has_auto_inc_col() const {
   return false;
 }
 
+Column *Table::pk_column() const {
+  for (const auto &col : *columns_) {
+    if (col->primary_key)
+      return col;
+  }
+  return nullptr;
+}
+
+/* Decide once, when the table is built or restored, whether --seq-pk drives
+   this table's primary key. Eagerly and not on demand: worker threads share
+   the table, so a lazy resolve would be a data race. */
+void Table::resolve_seq_pk_column() {
+  seq_pk_col = nullptr;
+  if (!options->at(Option::SEQ_PK)->getBool())
+    return;
+  Column *pk = pk_column();
+  if (pk == nullptr)
+    return;
+  /* An auto-increment key is the server's counter, not ours. A key that is
+     also the partition column would send every new row past the last defined
+     partition (MySQL only -- ClickHouse forces --no-partition). */
+  if (pk->auto_increment || pk->is_partition)
+    return;
+  switch (pk->type_) {
+  case Column::INT:
+  case Column::INTEGER:
+    seq_pk_col = pk;
+    break;
+  case Column::VARCHAR:
+  case Column::CHAR:
+    /* A string key is zero-padded so that it sorts the way it counts, which
+       needs room for the padding. A column too narrow to hold it keeps random
+       values rather than getting keys that sort wrongly. */
+    if (pk->length >= seq_pk_pad_width)
+      seq_pk_col = pk;
+    break;
+  default:
+    break;
+  }
+}
+
+/* A key that may be in the table right now. Never an allocation: this feeds
+   predicates, and the grammar-SQL substitution calls rand_value() on every
+   column of every table it touches, so allocating here would race the counter
+   far ahead of the data. */
+long int Table::sample_pk(long int upper_exclusive) const {
+  long int hi = pk_next.load(std::memory_order_relaxed); /* exclusive */
+  if (upper_exclusive > 0 && upper_exclusive < hi)
+    hi = upper_exclusive;
+  if (hi <= 1)
+    return 1; /* nothing handed out yet: a predicate that matches nothing */
+  long int lo = 1;
+  if (rand_int(100, 1) <= options->at(Option::SEQ_PK_RECENT_PROB)->getInt()) {
+    /* the newest keys, still in small unmerged parts */
+    const long int tail = options->at(Option::SEQ_PK_RECENT_ROWS)->getInt();
+    if (tail > 0 && hi - lo > tail)
+      lo = hi - tail;
+  }
+  return rand_int(hi - 1, lo);
+}
+
+/* Which columns join the primary key beyond the enforcing one -- and on
+   ClickHouse the ORDER BY with it, since the two are the same list there.
+
+   Rolled here rather than inside definition(), which used to do it: definition()
+   runs again for DropCreate and at every later step, so a fresh roll there
+   handed the server a key the metadata did not describe, and nothing downstream
+   could tell which columns were in it. The eligibility tests are the ones that
+   condition carried. */
+void Table::resolve_composite_key() {
+#ifdef USE_CLICKHOUSE
+  /* A table with no primary key at all -- AddTable builds these -- still needs
+     an ORDER BY, and definition() falls back to the first column. That makes it
+     a key column on the server while no column is flagged here, so an UPDATE
+     picks it and ClickHouse rejects the whole statement with "Cannot UPDATE key
+     column". Record it, before the probability check, because the fallback is
+     not a roll: it always happens. Nothing else changes -- definition() emits
+     PRIMARY KEY only when has_pk(), so this column stays out of that clause and
+     only the ORDER BY fallback puts it in the key. */
+  if (!has_pk() && !columns_->empty())
+    columns_->at(0)->composite_key = true;
+#endif
+  const long int prob = options->at(Option::COMPOSITE_KEY_PROB)->getInt();
+  if (prob <= 0)
+    return;
+  /* A secondary-engine table whose key is the server's auto-increment counter
+     keeps the narrow key the original condition insisted on. */
+  if (!options->at(Option::SECONDARY_ENGINE)->getString().empty() &&
+      has_auto_inc_col())
+    return;
+  for (auto col : *columns_) {
+    /* the enforcing key is already in; a partition column is added by
+       definition() whether it rolls or not, so leave that to it */
+    if (col->primary_key || col->is_partition)
+      continue;
+    if (col->type_ == Column::BLOB || col->type_ == Column::JSON ||
+        col->type_ == Column::TEXT)
+      continue;
+    /* a nullable key sorts nulls first and needs allow_nullable_key; the
+       original condition avoided it and so do we */
+    if (col->null_val)
+      continue;
+    if (rand_int(100, 1) <= prob)
+      col->composite_key = true;
+  }
+}
+
+std::string Table::pk_literal(long int value, const Column *col) const {
+  std::string digits = std::to_string(value);
+  if (col->type_ == Column::INT || col->type_ == Column::INTEGER)
+    return digits;
+  /* Pad to a fixed width so lexicographic order matches numeric order, and
+     quote it -- a String column given a bare number would be stored as the
+     unpadded text and would then sort among the padded keys arbitrarily. */
+  if (digits.size() < static_cast<size_t>(seq_pk_pad_width))
+    digits.insert(0, seq_pk_pad_width - digits.size(), '0');
+#ifdef USE_MYSQL
+  return "\"" + digits + "\"";
+#else
+  return "'" + digits + "'";
+#endif
+}
+
+#ifdef USE_CLICKHOUSE
+/* Uppercase copy, for the case insensitive engine name matching below. */
+static std::string to_upper(const std::string &s) {
+  std::string u = s;
+  std::transform(u.begin(), u.end(), u.begin(), ::toupper);
+  return u;
+}
+
+/* Base name of a MergeTree family engine with any Replicated prefix removed. */
+static std::string ch_engine_base(const std::string &engine) {
+  std::string name = engine;
+  /* an empty argument list carries no information, drop it */
+  if (name.size() >= 2 && name.compare(name.size() - 2, 2, "()") == 0)
+    name.erase(name.size() - 2);
+  if (to_upper(name).rfind("REPLICATED", 0) == 0)
+    name.erase(0, strlen("Replicated"));
+  return name;
+}
+
+/* Turn --engine into the engine clause of a CREATE TABLE.
+
+   Recognises the MergeTree family members pstress knows how to drive, case
+   insensitively and with an optional empty "()"; ReplacingMergeTree is given
+   _pstress_ver as its version column so duplicate primary keys resolve
+   deterministically, which is what pstress relied on before --engine was
+   honoured. A Replicated prefix is added when --port names more than one port.
+
+   An engine spelled with its own arguments, or one not in the list, is passed
+   through exactly as written, so an engine pstress has not been taught about
+   can still be tried without a code change. */
+bool ch_version_column() {
+  return !options->at(Option::NO_VERSION_COLUMN)->getBool();
+}
+
+std::string ch_resolve_engine(const std::string &engine) {
+  std::string name = engine;
+  if (name.size() >= 2 && name.compare(name.size() - 2, 2, "()") == 0)
+    name.erase(name.size() - 2);
+  /* the user spelled out arguments, they know what they want */
+  if (name.find('(') != std::string::npos)
+    return engine;
+
+  const bool already_replicated = to_upper(name).rfind("REPLICATED", 0) == 0;
+  const std::string base = ch_engine_base(name);
+  const std::string base_upper = to_upper(base);
+
+  if (base_upper != "MERGETREE" && base_upper != "REPLACINGMERGETREE" &&
+      base_upper != "SUMMINGMERGETREE" && base_upper != "AGGREGATINGMERGETREE")
+    return engine;
+
+  const bool replicated =
+      already_replicated ||
+      options->at(Option::PORT)->getString().find(',') != std::string::npos;
+
+  std::string resolved = replicated ? "Replicated" : "";
+  resolved += base;
+  if (base_upper == "REPLACINGMERGETREE" && ch_version_column())
+    resolved += "(_pstress_ver)";
+  return resolved;
+}
+
+/* The type ClickHouse actually stores behind a pstress column clause.
+   VARCHAR(n), CHAR(n), TEXT and BLOB are all aliases for String whatever the
+   length, so the length pstress randomizes in MODIFY COLUMN is a no-op there and
+   must not count as retyping the column. DECIMAL(p,s) genuinely changes. */
+static std::string ch_stored_type(const std::string &clause) {
+  const std::string upper = to_upper(clause);
+  if (upper.rfind("VARCHAR", 0) == 0 || upper.rfind("CHAR", 0) == 0 ||
+      upper.rfind("TEXT", 0) == 0 || upper.rfind("BLOB", 0) == 0)
+    return "String";
+  return clause;
+}
+
+/* True when the engine merges rows sharing a sorting key into one, which makes
+   an exact row for row comparison against a materialized view meaningless: the
+   duplicate rows a non atomic POPULATE would leave behind are exactly what
+   these engines collapse away. */
+bool ch_engine_collapses_rows(const std::string &engine) {
+  const std::string base = to_upper(ch_engine_base(engine));
+  return base != "MERGETREE";
+}
+
+bool g_projections_enabled = false;
+bool g_text_index_phrase_search_enabled = false;
+
+
+/* Columns a projection may put in its SELECT list.
+
+   JSON is out because pstress reads it back through randomized accessor
+   expressions rather than as a value, and BLOB/TEXT are out because wide values
+   make index_granularity_bytes rather than index_granularity the binding
+   constraint on granule size, which is exactly the signal the laziness oracle
+   reads out of system.projection_parts. GENERATED columns are already disabled
+   on the ClickHouse build; excluded here anyway so a future change cannot
+   silently start emitting them. */
+static bool ch_projection_usable(const Column *c) {
+  switch (c->type_) {
+  case Column::JSON:
+  case Column::BLOB:
+  case Column::TEXT:
+  case Column::GENERATED:
+    return false;
+  default:
+    return true;
+  }
+}
+
+/* Columns a projection may sort by. Same set: everything usable is orderable
+   once allow_nullable_key is on, which Table::definition() always emits when
+   projections are enabled. */
+static bool ch_projection_keyable(const Column *c) {
+  return ch_projection_usable(c);
+}
+
+/* Build a random projection over this table, or nullptr when the table has
+   nothing to build one from. Caller must hold table_mutex.
+
+   Never SELECT *: enable_block_number_column and enable_block_offset_column are
+   always on, so a star would drag _block_number and _block_offset into the
+   projection and make its contents depend on which part a row landed in. An
+   explicit list pins the projection's shape at creation, the same reason
+   CreateMaterializedView captures its column list by hand. */
+Projection *Table::MakeRandomProjection() {
+  std::vector<Column *> usable, keyable;
+  for (auto col : *columns_) {
+    if (ch_projection_usable(col))
+      usable.push_back(col);
+    if (ch_projection_keyable(col))
+      keyable.push_back(col);
+  }
+  if (usable.empty() || keyable.empty())
+    return nullptr;
+
+  /* A projection keyed on the enforcing primary key alone reorders nothing --
+     that column is the table's own ORDER BY prefix -- so the optimizer will
+     never prefer it. Reroll once; a table whose only keyable column is the pk
+     gets no projection rather than a useless one. A composite key column is
+     still worth keying on: it sorts the table only within a prefix, so a
+     projection leading with it is a genuinely different order. */
+  std::vector<Column *> keys;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    keys.clear();
+    const int want = rand_int(std::min<size_t>(3, keyable.size()), 1);
+    std::vector<Column *> pool = keyable;
+    for (int i = 0; i < want && !pool.empty(); i++) {
+      const size_t pick = rand_int(pool.size() - 1);
+      keys.push_back(pool[pick]);
+      pool.erase(pool.begin() + pick);
+    }
+    if (!(keys.size() == 1 && keys[0]->primary_key))
+      break;
+  }
+  if (keys.size() == 1 && keys[0]->primary_key)
+    return nullptr;
+
+  auto *proj = new Projection();
+  /* A counter, so two threads can never pick the same name — a random suffix
+     collides often enough to be visible at this rate. The run's seed goes in
+     too: nothing about projections is persisted, so at --step >= 2 the counter
+     restarts at zero while the projections an earlier step created are still
+     on the server, and only the seed keeps the two apart. */
+  static std::atomic<unsigned long> next_id{0};
+  proj->name = "p_" + name_ + "_" +
+               std::to_string(options->at(Option::INITIAL_SEED)->getInt()) +
+               "_" + std::to_string(next_id++);
+
+  /* The select list is the keys plus a few more columns, so the projection is
+     worth reading from rather than just a differently sorted key. */
+  std::vector<Column *> selected = keys;
+  for (auto col : usable) {
+    if (selected.size() >= keys.size() + 4)
+      break;
+    if (std::find(selected.begin(), selected.end(), col) != selected.end())
+      continue;
+    if (rand_int(100) < 50)
+      selected.push_back(col);
+  }
+
+  std::string select_list;
+  for (auto col : selected) {
+    if (!select_list.empty())
+      select_list += ", ";
+    select_list += col->name_;
+    proj->columns.push_back(col->name_);
+  }
+
+  /* assumeNotNull() some of the time: it keeps expression keyed projections
+     covered, and it is the shape that still works on a server where
+     allow_nullable_key is unavailable. */
+  std::string order_list;
+  for (auto col : keys) {
+    const bool wrap = col->null_val && rand_int(100) < 20;
+    const std::string key =
+        wrap ? "assumeNotNull(" + col->name_ + ")" : col->name_;
+    if (!order_list.empty())
+      order_list += ", ";
+    order_list += key;
+    if (std::find(proj->columns.begin(), proj->columns.end(), col->name_) ==
+        proj->columns.end())
+      proj->columns.push_back(col->name_);
+  }
+
+  proj->body = "SELECT " + select_list + " ORDER BY " +
+               (keys.size() == 1 ? order_list : "(" + order_list + ")");
+  return proj;
+}
+
+#endif
+
 /* prepare table definition */
 std::string Table::definition(bool with_index, bool with_fk,
                               bool with_forced_secondary) {
   std::string def = "CREATE";
   if (type == TEMPORARY)
     def += " TEMPORARY";
+#ifdef USE_CLICKHOUSE
+  def += " TABLE IF NOT EXISTS " + name_ + " (";
+#else
   def += " TABLE " + name_ + " (";
+#endif
 
   assert(columns_->size() > 0);
 
@@ -2422,28 +3630,34 @@ std::string Table::definition(bool with_index, bool with_fk,
   for (auto col : *columns_) {
     def += col->definition() + ", ";
   }
+#ifdef USE_CLICKHOUSE
+  /* version column for ReplacingMergeTree — never dropped, and present unless
+     --no-version-column */
+  if (ch_version_column())
+    def += "_pstress_ver UInt64, ";
+#endif
 
 
   /* if column has primary key */
+  std::vector<std::string> pk_cols; /* all PK columns, including composite */
   if (has_pk()) {
     def += " PRIMARY KEY(";
-    auto table_has_auto_inc = has_auto_inc_col();
     for (auto col : *columns_) {
-      if (col->primary_key)
+      if (col->primary_key) {
         def += col->name_ + ", ";
+        pk_cols.push_back(col->name_);
+      }
     }
+    /* resolve_composite_key() already decided this, once, when the table was
+       built. Rolling it here would give a different key every time definition()
+       runs -- DropCreate, --step 2 -- and leave the metadata describing a table
+       the server does not have. */
     for (auto col : *columns_) {
       if (col->primary_key)
         continue;
-      else if (col->primary_key || col->is_partition ||
-               ((options->at(Option::SECONDARY_ENGINE)->getString() == "" ||
-                 table_has_auto_inc == false) &&
-                col->type_ != Column::BLOB && col->type_ != Column::JSON &&
-                col->type_ != Column::TEXT &&
-                rand_int(100) <=
-                    options->at(Option::COMPOSITE_KEY_PROB)->getInt() &&
-                col->null_val == false)) {
+      if (col->is_partition || col->composite_key) {
         def += col->name_ + ", ";
+        pk_cols.push_back(col->name_); /* track composite key cols too */
       }
     }
     def.erase(def.length() - 2);
@@ -2462,6 +3676,18 @@ std::string Table::definition(bool with_index, bool with_fk,
       def += indexes_->at(auto_inc_index)->definition() + ", ";
     }
   }
+#ifdef USE_CLICKHOUSE
+  /* Whatever with_index says: the text indexes are part of the table, and
+     Table::load() creates it with with_index = false. Copied under the lock,
+     --add-text-index and --drop-text-index change the list while the run is
+     going. */
+  {
+    std::shared_lock<std::shared_mutex> lock(table_mutex);
+    for (const auto &ti : skip_indexes_)
+      def += ti.definition() + ", ";
+  }
+#endif
+
 
   if (with_fk) {
     if (type == FK) {
@@ -2508,8 +3734,70 @@ std::string Table::definition(bool with_index, bool with_fk,
   if (row_format.size() > 0)
     def += " ROW_FORMAT=" + row_format;
 
-  if (!engine.empty())
+  if (!engine.empty()) {
+#ifdef USE_CLICKHOUSE
+    def += " ENGINE=" + ch_resolve_engine(engine);
+#else
     def += " ENGINE=" + engine;
+#endif
+  }
+
+#ifdef USE_CLICKHOUSE
+  if (!engine.empty() && !columns_->empty()) {
+    /* ORDER BY must be a superset of PRIMARY KEY (PK must be a prefix).
+       Use pk_cols which captured every column added to PRIMARY KEY above,
+       including composite key extras whose primary_key flag is not set. */
+    std::string order_cols;
+    for (const auto &c : pk_cols) {
+      if (!order_cols.empty()) order_cols += ", ";
+      order_cols += c;
+    }
+    if (order_cols.empty())
+      order_cols = columns_->at(0)->name_;
+    /* A storage ORDER BY is one expression, so more than one column has to be
+       a tuple: bare "ORDER BY a, b" is a syntax error at the comma. Same shape
+       the projection body uses. */
+    def += " ORDER BY " +
+           (pk_cols.size() > 1 ? "(" + order_cols + ")" : order_cols) +
+           " SETTINGS enable_block_number_column = 1,"
+           " enable_block_offset_column = 1";
+    if (g_projections_enabled) {
+      /* ReplacingMergeTree, which is pstress's default --engine, rejects a
+         projection outright under the default throw mode, and a lightweight
+         DELETE on a projected table fails the same way. rebuild is the only
+         mode that keeps the projection agreeing with the base table: drop makes
+         it vanish behind pstress's back and ignore leaves it stale, and either
+         would land as a replica checksum or projection oracle mismatch that is
+         not a bug.
+
+         Rolled here rather than in the settings pool on purpose. The pool rolls
+         per table against a probability, so some tables would reject every
+         projection statement and the run would look healthy while testing
+         nothing. */
+      def += ", deduplicate_merge_projection_mode = 'rebuild'";
+      def += ", lightweight_mutation_projection_mode = 'rebuild'";
+      /* --null-prob defaults to 1, so every column but the primary key is
+         Nullable. Without this a projection could only ever sort by the primary
+         key, which is the table's own ORDER BY, and would be a projection the
+         optimizer never prefers. The table's own ORDER BY never uses a nullable
+         column, so nothing else changes. */
+      def += ", allow_nullable_key = 1";
+    }
+    if (g_text_index_phrase_search_enabled)
+      def += ", allow_experimental_text_index_phrase_search = 1";
+    /* per-table settings from --table-settings-file / --table-settings.
+       Copied under the lock rather than read in place: --modify-table-setting
+       rewrites this string while the run is going, and none of definition()'s
+       three callers holds table_mutex. */
+    std::string current_settings;
+    {
+      std::shared_lock<std::shared_mutex> lock(table_mutex);
+      current_settings = settings;
+    }
+    if (!current_settings.empty())
+      def += ", " + current_settings;
+  }
+#endif
 
   if (options->at(Option::SECONDARY_ENGINE)->getString().size() > 0 &&
       (!options->at(Option::SECONDARY_AFTER_CREATE)->getBool() ||
@@ -2690,6 +3978,81 @@ void Table::Compare_between_engine(const std::string &sql, Thd1 *thd) {
   set_default();
 }
 
+#ifdef USE_CLICKHOUSE
+/* Run the same SQL twice, once as it is and once with SETTINGS
+   <--run-query-setting> appended, and compare the two result sets. A setting
+   that is not meant to change results has to return exactly the same rows,
+   which makes this a cheap oracle for things like join_algorithm.
+
+   Unlike Compare_between_engine() this is not a Table method, because a
+   grammar join spans more than one table and there is no single table to lock.
+   Nothing is locked at all, so it is on the caller's workload to be
+   deterministic: one thread, or insert only, and an ORDER BY on every grammar
+   line. */
+void compare_result_with_setting(const std::string &sql, Thd1 *thd) {
+  static const auto setting = opt_string(RUN_QUERY_SETTING);
+
+  /* A query the server rejects is not a result mismatch, and both sides can
+     legitimately fail: an algorithm may not serve a given join, or the setting
+     may be what makes the query runnable in the first place. execute_sql() has
+     already logged the SQL and the error, so note only which side it was, and
+     to the thread log rather than through print_and_log() — that counts every
+     console message and kills the run after 300, which an expected failure
+     must not do. */
+  bool baseline_ok = execute_sql(sql, thd);
+  query_result without_setting;
+  if (baseline_ok) {
+    /* copy the rows out now, the next execute_query() clears the buffer */
+    without_setting = thd->db->get_result();
+  } else {
+    g_compare_baseline_failed++;
+    thd->thread_log << "compare-with-setting: failed without the setting"
+                    << std::endl;
+  }
+
+  /* Run the variant even when the baseline failed. A setting can enable a query
+     shape the server otherwise rejects, e.g. an inequality FULL JOIN needs
+     join_algorithm='ie_join', and that run is still worth making: it exercises
+     the code under test. There is just nothing to compare it against. */
+  auto sql_with_setting = add_settings_clause(sql, setting);
+  if (!execute_sql(sql_with_setting, thd)) {
+    g_compare_setting_failed++;
+    thd->thread_log << "compare-with-setting: failed with the setting"
+                    << std::endl;
+    return;
+  }
+  if (!baseline_ok)
+    return;
+  auto with_setting = thd->db->get_result();
+
+  g_compare_done++;
+  if (!compare_query_result(
+          with_setting, without_setting, thd,
+          options->at(Option::COMPARE_CASE_INSENSTIVE)->getBool(),
+          "with_setting_result.csv", "default_result.csv")) {
+    print_and_log("result set mismatch with SETTINGS " + setting + " for " + sql,
+                  thd);
+    exit(EXIT_FAILURE);
+  }
+}
+
+/* How much of the run actually got compared. Without this a run where every
+   query failed on one side looks exactly like a clean pass. */
+void print_compare_with_setting_stats() {
+  if (!options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool())
+    return;
+  std::cout << "CompareWithSetting, compared=>" << g_compare_done
+            << ", not compared (failed without the setting)=>"
+            << g_compare_baseline_failed
+            << ", not compared (failed with the setting)=>"
+            << g_compare_setting_failed << std::endl;
+  if (g_compare_done == 0)
+    std::cout << "WARNING: not a single query was compared, the oracle never "
+                 "ran. Check the grammar file and --run-query-setting."
+              << std::endl;
+}
+#endif
+
 bool execute_sql(const std::string &sql, Thd1 *thd, bool force_sql_log_query) {
   static auto log_all = opt_bool(LOG_ALL_QUERIES);
   static auto log_success = opt_bool(LOG_SUCCEDED_QUERIES);
@@ -2794,9 +4157,13 @@ bool execute_sql(const std::string &sql, Thd1 *thd, bool force_sql_log_query) {
   }
 
   if (thd->ddl_query) {
+    auto _now = std::chrono::system_clock::now();
+    auto _tt  = std::chrono::system_clock::to_time_t(_now);
+    std::ostringstream _ts;
+    _ts << std::put_time(std::localtime(&_tt), "%H:%M:%S");
     std::lock_guard<std::mutex> lock(ddl_logs_write);
-    thd->ddl_logs << thd->thread_id << " " << sql << " " << thd->db->get_error()
-                  << std::endl;
+    thd->ddl_logs << "[" << _ts.str() << "] " << thd->thread_id << " " << sql
+                  << " " << thd->db->get_error() << std::endl;
   }
 
   return res;
@@ -2934,6 +4301,11 @@ void Table::ModifyColumn(Thd1 *thd) {
   if (col == nullptr)
     return;
 
+#ifdef USE_CLICKHOUSE
+  /* to tell a real retype from a length change that ClickHouse ignores */
+  const std::string ch_type_before = ch_stored_type(col->clause());
+#endif
+
   if (col->length != 0) {
     if (col->type_ != Column::DECIMAL)
       col->length =
@@ -2955,7 +4327,15 @@ void Table::ModifyColumn(Thd1 *thd) {
   else if (col->not_secondary == true and rand_int(3) == 0)
     col->not_secondary = false;
 
+#ifdef USE_CLICKHOUSE
+  /* Use Nullable() wrapper for nullable columns, matching CREATE TABLE DDL.
+     If null-prob=0, skip Nullable wrapper. */
+  bool ch_mod_nullable = col->null_val && options->at(Option::NULL_PROB)->getInt() > 0;
+  std::string ch_type = ch_mod_nullable ? "Nullable(" + col->clause() + ")" : col->clause();
+  sql += " " + col->name_ + " " + ch_type;
+#else
   sql += " " + col->definition() + pick_algorithm_lock();
+#endif
 
   /* if not successful rollback */
   if (!execute_sql(sql, thd)) {
@@ -2963,6 +4343,15 @@ void Table::ModifyColumn(Thd1 *thd) {
     col->auto_increment = auto_increment;
     col->compressed = compressed;
   } else {
+#ifdef USE_CLICKHOUSE
+    /* Only a real retype matters: the column then has a different type in the
+       table while every view over it keeps the type it was created with, so the
+       same value can serialise differently on the two sides. A VARCHAR length
+       change reaches the server but leaves the stored String alone, and treating
+       it as a retype would strand every view on the table for nothing. */
+    if (ch_stored_type(col->clause()) != ch_type_before)
+      mark_mv_source_mutated("MODIFY COLUMN retyped a column");
+#endif
     if (col->type_ == Column::DECIMAL) {
       static_cast<Decimal_Column *>(col)->update_max_precision();
     }
@@ -2989,13 +4378,35 @@ void Table::DropColumn(Thd1 *thd) {
     unlock_table_mutex();
     return;
   }
+#ifdef USE_CLICKHOUSE
+  /* never drop the version column used by ReplacingMergeTree */
+  if (name == "_pstress_ver") {
+    unlock_table_mutex();
+    return;
+  }
+  /* a projection over this column would make the DROP fail outright */
+  if (!DropProjectionsOnColumn(thd, name)) {
+    unlock_table_mutex();
+    return;
+  }
+  /* and so would a text index */
+  if (!DropSkipIndexesOnColumn(thd, name)) {
+    unlock_table_mutex();
+    return;
+  }
+#endif
 
   std::string sql = "ALTER TABLE " + name_ + " DROP COLUMN " + name;
 
   sql += pick_algorithm_lock();
+#ifdef USE_CLICKHOUSE
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+#endif
   unlock_table_mutex();
 
   if (execute_sql(sql, thd)) {
+    mark_mv_source_mutated("DROP COLUMN");
     lock_table_mutex(thd->ddl_query);
 
     std::vector<int> indexes_to_drop;
@@ -3136,6 +4547,10 @@ void Table::AddColumn(Thd1 *thd) {
   }
 
   sql += algorithm_lock;
+#ifdef USE_CLICKHOUSE
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+#endif
 
   unlock_table_mutex();
 
@@ -3148,12 +4563,61 @@ void Table::AddColumn(Thd1 *thd) {
         add_new_column = false;
     }
 
+    /* capture before unlock — tc may be deleted below */
+    std::string added_name = tc->name_;
+#ifdef USE_CLICKHOUSE
+    Column::COLUMN_TYPES added_type = tc->type_;
+    int added_length = tc->length;
+#endif
+
     if (add_new_column)
       AddInternalColumn(tc);
     else
       delete tc;
 
     unlock_table_mutex();
+
+#ifdef USE_CLICKHOUSE
+    if (add_new_column &&
+        options->at(Option::CH_ADD_COLUMN_BACKFILL)->getBool()) {
+      /* Generate a client-side literal value for the backfill.
+         ClickHouse rejects non-deterministic server-side functions
+         (rand64, today, now…) in mutations on Replicated tables.
+         Using a constant literal avoids that restriction entirely. */
+      std::string rand_expr;
+      switch (added_type) {
+      case Column::INT:
+      case Column::INTEGER:
+        rand_expr = std::to_string(rand_int(1000000));
+        break;
+      case Column::FLOAT:
+        rand_expr = rand_float(1000);
+        break;
+      case Column::DOUBLE:
+        rand_expr = rand_double(1000.0);
+        break;
+      case Column::BOOL:
+        rand_expr = rand_int(1) == 1 ? "1" : "0";
+        break;
+      case Column::DATE:
+        rand_expr = "'" + rand_date() + "'";
+        break;
+      case Column::DATETIME:
+      case Column::TIMESTAMP:
+        rand_expr = "'" + rand_timestamp(0, false) + "'";
+        break;
+      default: /* VARCHAR, CHAR, TEXT, BLOB, etc. */
+        rand_expr =
+            "'" + rand_string(added_length > 0 ? added_length : 10) + "'";
+        break;
+      }
+      std::string backfill = "ALTER TABLE " + name_ + " UPDATE " +
+                             added_name + " = " + rand_expr + " WHERE 1=1";
+      if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+        backfill += " SETTINGS mutations_sync = 2";
+      execute_sql(backfill, thd);
+    }
+#endif
   } else
     delete tc;
 }
@@ -3352,16 +4816,31 @@ void Table::ColumnRename(Thd1 *thd) {
     new_name = name.substr(0, name.length() - s);
   else
     new_name = name + new_name;
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse rejects a rename of a column a projection references. Drop those
+     projections rather than rewriting the stored body text: the body is kept
+     verbatim so MODIFY PROJECTION can restate it byte for byte, and a textual
+     substitution would have to reproduce ClickHouse's own formatting exactly.
+     --add-projection makes fresh ones over the renamed column. */
+  if (!DropProjectionsOnColumn(thd, name)) {
+    unlock_table_mutex();
+    return;
+  }
+#endif
   std::string sql =
       "ALTER TABLE " + name_ + " RENAME COLUMN " + name + " To " + new_name;
   sql += pick_algorithm_lock();
   unlock_table_mutex();
   if (execute_sql(sql, thd)) {
+    mark_mv_source_mutated("RENAME COLUMN");
     lock_table_mutex(thd->ddl_query);
     for (auto &col : *columns_) {
       if (col->name_.compare(name) == 0)
         col->name_ = new_name;
     }
+#ifdef USE_CLICKHOUSE
+    RenameSkipIndexColumn(name, new_name);
+#endif
     unlock_table_mutex();
   }
 }
@@ -3480,6 +4959,48 @@ std::string Table::GetRandomPartition() {
   return sql;
 }
 
+#ifdef USE_CLICKHOUSE
+/* A text search predicate over a column that has a text index: the functions
+   the index serves, and the prefix and suffix LIKE patterns. */
+static std::string ch_text_search_predicate(const std::string &col) {
+  auto w = [] { return rand_word(); };
+  switch (rand_int(13)) {
+  case 0:
+    return "hasToken(" + col + ", '" + w() + "')";
+  /* SIMILAR TO (PR 101514): LIKE wildcards plus regexp alternation, classes
+     and quantifiers. The text index condition does not serve it, so these
+     scan every granule; they are here for correctness next to the LIKE
+     shape they reduce to. */
+  case 9:
+    return col + " SIMILAR TO '%" + w() + "%'";
+  case 10:
+    return col + " SIMILAR TO '%(" + w() + "|" + w() + ")%'";
+  case 11:
+    return col + " SIMILAR TO '" + rand_word_part(true) + "[a-z0-9]*%'";
+  case 12:
+    return col + " NOT SIMILAR TO '" + w() + "%'";
+  case 1:
+    return "hasAnyTokens(" + col + ", ['" + w() + "', '" + w() + "'])";
+  case 2:
+    return "hasAllTokens(" + col + ", ['" + w() + "', '" + w() + "'])";
+  case 3:
+    return "hasPhrase(" + col + ", '" + w() + " " + w() + "')";
+  case 4:
+    return col + " LIKE '" + rand_word_part(true) + "%'";
+  case 5:
+    return col + " LIKE '%" + rand_word_part(false) + "'";
+  case 6:
+    return col + " LIKE '" + w() + "%'";
+  case 7:
+    return col + " LIKE '%" + w() + "'";
+  case 8:
+    return col + " LIKE '%" + w() + "%'";
+  default:
+    return "hasAnyTokens(" + col + ", '" + w() + " " + w() + "')";
+  }
+}
+#endif
+
 static PreparedStatementParam param_from_sql_literal(const std::string &value) {
   PreparedStatementParam param;
   if (value == "NULL") {
@@ -3576,10 +5097,17 @@ bool Table::BuildPreparedWhereBulk(
   return false;
 }
 
-std::string Table::GetWherePrecise() {
+std::string Table::GetWherePrecise(bool text_search) {
   auto col = GetRandomColumn();
   std::string where = " WHERE ";
   std::string rand_value;
+
+#ifdef USE_CLICKHOUSE
+  /* most of the time a column with a text index gets searched the way the
+     index is meant for, rather than compared for equality */
+  if (text_search && HasTextIndex(col->name_) && rand_int(99) < 80)
+    return where + ch_text_search_predicate(col->name_);
+#endif
 
   if (col->type_ == Column::JSON) {
     where += json_where(col);
@@ -3619,8 +5147,12 @@ std::string Table::GetWhereBulk() {
   }
 
   if (col->type_ == Column::BLOB && rand_int(1000) == 1) {
+#ifdef USE_MYSQL
     return " WHERE instr( " + col->name_ + ",_binary\"" + rand_string(20) +
            "%\")";
+#else
+    return " WHERE position(" + col->name_ + ", '" + rand_string(20) + "') > 0";
+#endif
   }
 
   if (col->is_col_can_be_compared()) {
@@ -3649,7 +5181,11 @@ std::string Table::GetWhereBulk() {
   }
 
   if (col->is_col_string() && rand_int(100) < 20) {
+#ifdef USE_MYSQL
     return where + " LIKE " + "\"" + rand_string(20) + "%\"";
+#else
+    return where + " LIKE '" + rand_string(20) + "%'";
+#endif
   }
 
   if (col->is_col_string() && rand_int(100) < 90) {
@@ -3666,7 +5202,11 @@ std::string Table::GetWhereBulk() {
   }
 
   if (rand_int(100) == 1) {
+#ifdef USE_CLICKHOUSE
+    return " WHERE 1=1";
+#else
     return "";
+#endif
   }
 
   return where + " = " + col->rand_value();
@@ -3678,7 +5218,7 @@ void Table::SelectRandomRow(Thd1 *thd, bool select_for_update) {
   bool use_prepared = false;
   bool ps_requested = should_use_prepared_select();
   std::string ps_fallback_reason;
-  std::string where = GetWherePrecise();
+  std::string where = GetWherePrecise(true);
   std::string prepared_where;
   std::string printable_where;
   std::vector<PreparedStatementParam> params;
@@ -3717,6 +5257,18 @@ void Table::SelectRandomRow(Thd1 *thd, bool select_for_update) {
     prepared_select.printable_sql += " FOR UPDATE SKIP LOCKED";
   }
 
+#ifdef USE_CLICKHOUSE
+  /* Under --thread-per-table this thread is the only writer of the table, so
+     the same SELECT run with and without the setting must return the same
+     rows. ORDER BY ALL keeps the comparison order independent. */
+  if (options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool() &&
+      options->at(Option::THREAD_PER_TABLE)->getBool()) {
+    sql += " ORDER BY ALL";
+    unlock_table_mutex();
+    compare_result_with_setting(sql, thd);
+    return;
+  }
+#endif
   unlock_table_mutex();
   if (!use_prepared && ps_requested && !ps_fallback_reason.empty()) {
     thd->thread_log << "PS_FALLBACK " << ps_fallback_reason << " " << sql
@@ -3773,7 +5325,11 @@ void Table::CreateFunction(Thd1 *thd) {
     for (auto &dml : function_dmls) {
       if (dml == "INSERT")
         for (int i = 0; i < rand_int(3, 1); i++)
-          sql.append("INSERT INTO " + name_ + ColumnValues(thd) + "; ");
+          /* the function body bakes its literals in once and is then called
+             many times, so an allocated key would be inserted repeatedly and
+             leave a permanent hole in the sequence */
+          sql.append("INSERT INTO " + name_ + ColumnValues(thd, 1, false) +
+                     "; ");
       else if (dml == "UPDATE")
         for (int i = 0; i < rand_int(4, 1); i++)
           sql.append("UPDATE " + add_ignore_clause() + name_ + " SET " +
@@ -3797,7 +5353,9 @@ void Table::CreateFunction(Thd1 *thd) {
 
 void Table::Replace(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
-  auto sql = "REPLACE INTO " + name_ + ColumnValues(thd);
+  /* a REPLACE carrying a brand-new key replaces nothing, so sample an
+     existing one instead of allocating */
+  auto sql = "REPLACE INTO " + name_ + ColumnValues(thd, 1, false);
   unlock_table_mutex();
   std::shared_lock<std::shared_mutex> lock(dml_mutex);
   execute_sql(sql, thd);
@@ -3813,16 +5371,40 @@ void Table::UpdateRandomROW(Thd1 *thd) {
   unlock_table_mutex();
 
   std::shared_lock<std::shared_mutex> lock(dml_mutex);
-  execute_sql(sql, thd);
+  if (execute_sql(sql, thd))
+    mark_mv_source_mutated("UPDATE");
+}
+
+/* ClickHouse: DELETE FROM is rewritten server-side into an internal update of
+   _row_exists, and lightweight_delete_mode picks how. At its alter_update
+   default that is a heavyweight mutation -- a full rewrite of every matched
+   part, executed on the background merge pool and only ever scheduled when
+   number_of_free_entries_in_pool_to_execute_mutation slots are free, so a pool
+   saturated by merges leaves the statement blocked for as long as the insert
+   load lasts (DELETE FROM waits by default, lightweight_deletes_sync = 2).
+   lightweight_update writes a patch part inline instead, like an INSERT: no
+   pool slot, nothing in system.mutations, and the patch is applied on every
+   SELECT until a merge folds it into the base part.
+
+   Rolled per statement, not set once for the run, so both implementations get
+   exercised by one invocation. Empty for every other fork -- the option is
+   zeroed there, the same way CH_ALTER_UPDATE/DELETE are. */
+static std::string lightweight_delete_settings() {
+  const long int prob = options->at(Option::CH_LIGHTWEIGHT_DELETE)->getInt();
+  if (prob > 0 && rand_int(100, 1) <= prob)
+    return " SETTINGS lightweight_delete_mode = 'lightweight_update'";
+  return "";
 }
 
 void Table::DeleteRandomRow(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
   std::string sql = "DELETE " + add_ignore_clause() + " FROM " + name_ +
-                    GetRandomPartition() + GetWherePrecise();
+                    GetRandomPartition() + GetWherePrecise() +
+                    lightweight_delete_settings();
   unlock_table_mutex();
   std::shared_lock lock(dml_mutex);
-  execute_sql(sql, thd);
+  if (execute_sql(sql, thd))
+    mark_mv_source_mutated("DELETE");
 }
 
 void Table::UpdateAllRows(Thd1 *thd) {
@@ -3832,17 +5414,828 @@ void Table::UpdateAllRows(Thd1 *thd) {
                     GetWhereBulk();
   unlock_table_mutex();
   std::shared_lock lock(dml_mutex);
-  execute_sql(sql, thd);
+  if (execute_sql(sql, thd))
+    mark_mv_source_mutated("a bulk UPDATE");
 }
 
 void Table::DeleteAllRows(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
   std::string sql = "DELETE " + add_ignore_clause() + " FROM " + name_ +
-                    GetRandomPartition() + GetWhereBulk();
+                    GetRandomPartition() + GetWhereBulk() +
+                    lightweight_delete_settings();
   unlock_table_mutex();
   std::shared_lock lock(dml_mutex);
+  if (execute_sql(sql, thd))
+    mark_mv_source_mutated("a bulk DELETE");
+}
+
+#ifdef USE_CLICKHOUSE
+/* Return a WHERE clause targeting ~50-70% of the table's row range.
+   Uses the integer PK column with a BETWEEN range covering half to
+   two-thirds of the full value span.  Falls back to GetWhereBulk()
+   when no integer PK exists. */
+std::string Table::GetWhereLargeRange() {
+  /* --seq-pk: take the bounds from the keys actually handed out. Without this
+     the range below covers 50-70% of a value span two orders of magnitude
+     wider than the data, so ALTER TABLE UPDATE/DELETE mutate almost nothing.
+     Works for a string key too, because the zero-padded values compare
+     correctly with BETWEEN -- the span-based path below cannot. */
+  if (use_sequential_pk()) {
+    const long int hi = pk_next.load(std::memory_order_relaxed) - 1;
+    if (hi < 1)
+      return GetWhereBulk();
+    const long int span = hi;
+    /* half to two thirds of the live range, placed uniformly inside it so
+       repeated mutations do not keep hitting the same low keys */
+    const long int width = span / 2 + rand_int(span / 5);
+    const long int start = 1 + rand_int(span - width);
+    return " WHERE " + seq_pk_col->name_ + " BETWEEN " +
+           pk_literal(start, seq_pk_col) + " AND " +
+           pk_literal(start + width, seq_pk_col);
+  }
+
+  Column *int_pk = nullptr;
+  for (auto col : *columns_) {
+    if (col->primary_key && col->is_col_number()) {
+      int_pk = col;
+      break;
+    }
+  }
+  if (int_pk == nullptr)
+    return GetWhereBulk();
+
+  auto unique_range = options->at(Option::UNIQUE_RANGE)->getFloat();
+  auto total_range =
+      static_cast<long int>(unique_range * (long int)number_of_records);
+  if (total_range < 2)
+    return GetWhereBulk();
+
+  /* width covers 50-70% of the full value span */
+  auto width = rand_int((long int)(total_range * 0.2)) +
+               (long int)(total_range * 0.5);
+  /* start somewhere in the lower 30% so the range fits inside total_range */
+  auto lo = try_negative(rand_int((long int)(total_range * 0.3)));
+  auto hi = lo + width;
+  return " WHERE " + int_pk->name_ + " BETWEEN " + std::to_string(lo) +
+         " AND " + std::to_string(hi);
+}
+
+/* A killed mutation fails the ALTER that was waiting on it (--ch-mutations-sync)
+   after some parts have already been rewritten, so the source is out of step
+   with its materialized views whether the statement succeeded or not. Only
+   widen the skip when kills are actually enabled — otherwise a rejected ALTER
+   really did change nothing and its views stay checkable. */
+static bool mutation_may_have_applied(bool executed) {
+  return executed || options->at(Option::CH_KILL_MUTATION)->getInt() > 0;
+}
+
+/* ALTER TABLE t UPDATE col=val WHERE ... SETTINGS mutations_sync=2
+   mutations_sync=2 waits for the mutation to complete on all replicas. */
+void Table::AlterTableUpdate(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  std::string sql = "ALTER TABLE " + name_ + " UPDATE " + SetClause() +
+                    GetWhereLargeRange();
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+  unlock_table_mutex();
+  if (mutation_may_have_applied(execute_sql(sql, thd)))
+    mark_mv_source_mutated("ALTER TABLE UPDATE");
+}
+
+/* ALTER TABLE t DELETE WHERE ... SETTINGS mutations_sync=2 */
+void Table::AlterTableDelete(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  std::string sql =
+      "ALTER TABLE " + name_ + " DELETE" + GetWhereLargeRange();
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+  unlock_table_mutex();
+  if (mutation_may_have_applied(execute_sql(sql, thd)))
+    mark_mv_source_mutated("ALTER TABLE DELETE");
+}
+
+/* deque, not vector: the strings must never be reallocated, because the char*
+   handed to mark_mv_source_mutated() has to stay valid for the whole run. Only
+   touched while loading metadata, which is single threaded. */
+const char *intern_mv_reason(const std::string &why) {
+  static std::deque<std::string> interned;
+  interned.push_back(why);
+  return interned.back().c_str();
+}
+
+static std::atomic<unsigned long> g_mv_id_counter{0};
+
+unsigned long next_mv_id() { return g_mv_id_counter++; }
+
+void bump_mv_id_floor(unsigned long id) {
+  unsigned long current = g_mv_id_counter.load();
+  while (current <= id &&
+         !g_mv_id_counter.compare_exchange_weak(current, id + 1)) {
+  }
+}
+
+size_t mv_count_for_table(const std::string &table_name) {
+  std::lock_guard<std::mutex> lk(g_materialized_views_mutex);
+  size_t count = 0;
+  for (const auto &mv : g_materialized_views)
+    if (mv.src_table == table_name)
+      count++;
+  return count;
+}
+
+/* Comma separated column list the views select. */
+static std::string mv_column_list(const std::vector<std::string> &columns) {
+  std::string list;
+  for (const auto &col : columns) {
+    if (!list.empty())
+      list += ", ";
+    list += col;
+  }
+  return list;
+}
+
+/* CREATE MATERIALIZED VIEW ... POPULATE over this table, while other threads
+   keep inserting into it. That race is the point: POPULATE has to subscribe the
+   view to new inserts and snapshot the existing rows as one cut, so every row
+   inserted concurrently ends up in the view exactly once. Once inserts stop the
+   view must therefore hold exactly the table's rows, which is what
+   ch_verify_one_mv() checks. */
+void Table::CreateMaterializedView(Thd1 *thd) {
+  if (mv_count_for_table(name_) >=
+      (size_t)options->at(Option::CH_MAX_MV_PER_TABLE)->getInt())
+    return;
+
+  /* Build the statement under the table lock so the column list cannot change
+     while we read it, then release the lock before executing. Holding it across
+     the CREATE would lock out pstress's own inserts into this table and there
+     would be no race left to test. */
+  lock_table_mutex(thd->ddl_query);
+  std::vector<std::string> columns;
+  for (auto col : *columns_)
+    columns.push_back(col->name_);
+  /* definition() appends the version column by hand, so it is a real column of
+     the table but never appears in columns_. DropColumn refuses to drop it, so
+     it is safe for the view to select it. */
+  if (ch_version_column())
+    columns.push_back("_pstress_ver");
+  unlock_table_mutex();
+
+  /* An explicit column list, never SELECT *, pins the view's shape at creation:
+     a later ADD COLUMN then cannot change what the view is expected to hold. */
+  const std::string col_list = mv_column_list(columns);
+  const std::string id = std::to_string(next_mv_id());
+  const std::string mv_name = MV_PREFIX + name_ + "_" + id;
+
+  bool atomically = true;
+  const std::string mode =
+      options->at(Option::CH_MV_POPULATE_ATOMICALLY)->getString();
+  if (mode == "off")
+    atomically = false;
+  else if (mode == "random")
+    atomically = rand_int(1) == 1;
+
+  std::string settings = "materialized_views_populate_atomically = ";
+  settings += atomically ? "1" : "0";
+  auto sleep_ms = options->at(Option::CH_MV_SNAPSHOT_SLEEP_MS)->getInt();
+  if (sleep_ms > 0)
+    settings += ", merge_tree_storage_snapshot_sleep_ms = " +
+                std::to_string(sleep_ms);
+
+  /* Shared dml_mutex so a DROP COLUMN, which takes it exclusively, cannot land
+     between building the column list and running the statement. */
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
+
+  std::string target;
+  if (rand_int(100) < options->at(Option::CH_MV_TO_PROB)->getInt()) {
+    /* POPULATE together with TO was a syntax error before the atomic populate
+       work. LIMIT 0 gives the target the exact structure of the selected
+       columns and no rows, so everything it ends up holding arrived through the
+       view and the comparison against the source still holds. */
+    target = MV_TARGET_PREFIX + name_ + "_" + id;
+    if (!execute_sql("CREATE TABLE " + target +
+                         " ENGINE = MergeTree ORDER BY tuple() AS SELECT " +
+                         col_list + " FROM " + name_ + " LIMIT 0",
+                     thd))
+      return;
+  }
+
+  std::string sql = "CREATE MATERIALIZED VIEW " + mv_name + " ";
+  if (target.empty()) {
+    /* ORDER BY tuple() keeps the view side from ever merging rows together, so
+       a duplicate a non atomic populate leaves behind stays visible, and it
+       avoids putting a Nullable column in a sorting key. */
+    sql += "ENGINE = MergeTree ORDER BY tuple() ";
+  } else {
+    sql += "TO " + target + " ";
+  }
+  sql += "POPULATE AS SELECT " + col_list + " FROM " + name_ + " SETTINGS " +
+         settings;
+
+  if (!execute_sql(sql, thd)) {
+    /* The server rolls the view back on a failed population; the target we
+       created for it is ours to clean up. */
+    if (!target.empty())
+      execute_sql("DROP TABLE IF EXISTS " + target, thd);
+    return;
+  }
+
+  MVInfo mv;
+  mv.name = mv_name;
+  mv.target = target;
+  mv.src_table = name_;
+  mv.columns = std::move(columns);
+  mv.populate_atomically = atomically;
+  std::lock_guard<std::mutex> lk(g_materialized_views_mutex);
+  g_materialized_views.push_back(std::move(mv));
+}
+
+/* Drop one of this table's materialized views, checking it against the table
+   first unless --verify-mv-before-drop is off. Checking here rather than only at
+   the end of the run means every view that ever existed gets compared, not just
+   the ones still alive when the run finishes.
+
+   The caller must already have quiesced the workload when the check is enabled:
+   count(view) against count(table) only holds when nothing is inserting. */
+void Table::DropMaterializedView(Thd1 *thd) {
+  MVInfo mv;
+  {
+    std::lock_guard<std::mutex> lk(g_materialized_views_mutex);
+    std::vector<size_t> mine;
+    for (size_t i = 0; i < g_materialized_views.size(); i++)
+      if (g_materialized_views[i].src_table == name_)
+        mine.push_back(i);
+    if (mine.empty())
+      return;
+    const size_t pick = mine[rand_int(mine.size() - 1)];
+    mv = g_materialized_views[pick];
+    g_materialized_views.erase(g_materialized_views.begin() + pick);
+  }
+
+  if (options->at(Option::CH_VERIFY_MV_BEFORE_DROP)->getBool()) {
+    auto query_one = [thd](const std::string &sql) {
+      return thd->db->get_single_value(sql);
+    };
+    ch_report_mv_check(mv, mv_skip_reason(), engine, query_one, thd);
+  }
+
+  execute_sql("DROP VIEW IF EXISTS " + mv.name, thd);
+  if (!mv.target.empty())
+    execute_sql("DROP TABLE IF EXISTS " + mv.target, thd);
+}
+
+/* ---------------------------------------------------------------------------
+   Projections. ClickHouse PR 113343 added ALTER TABLE ... MODIFY PROJECTION,
+   a metadata only alter that changes a projection's settings and leaves every
+   existing part alone. Three actions put it under load: ADD to create one,
+   MODIFY to change its settings, DROP to take it away again.
+
+   MODIFY restates the whole definition and rejects anything whose query body
+   formats differently, which is the only reason Projection::body exists: the
+   text pstress emitted has to be replayed verbatim.
+   ------------------------------------------------------------------------- */
+
+/* the server caps projections per table at max_projections = 25 */
+static const size_t CH_MAX_PROJECTIONS_PER_TABLE = 5;
+
+/* Only index_granularity is rolled. It is on ClickHouse's allow list for
+   projection settings in every version that has the feature, so there is no
+   need to probe the server for what it accepts. */
+static std::string ch_roll_projection_granularity() {
+  static const char *const values[] = {"512", "1024", "4096", "8192", "16384"};
+  return values[rand_int(4)];
+}
+
+/* ALTER TABLE t ADD PROJECTION p (SELECT ... ORDER BY ...) WITH SETTINGS (...) */
+void Table::AddProjection(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  if (projections_->size() >= CH_MAX_PROJECTIONS_PER_TABLE) {
+    unlock_table_mutex();
+    return;
+  }
+  Projection *proj = MakeRandomProjection();
+  if (proj == nullptr) {
+    unlock_table_mutex();
+    return;
+  }
+  const std::string sql = "ALTER TABLE " + name_ + " ADD PROJECTION " +
+                          proj->name + " (" + proj->body +
+                          ") WITH SETTINGS (index_granularity = " +
+                          ch_roll_projection_granularity() + ")";
+  unlock_table_mutex();
+
+  /* Shared dml_mutex so a DROP COLUMN, which takes it exclusively, cannot
+     remove one of the projection's columns between building the statement and
+     running it. */
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
+  if (!execute_sql(sql, thd)) {
+    delete proj;
+    return;
+  }
+
+  lock_table_mutex(thd->ddl_query);
+  projections_->push_back(proj);
+  unlock_table_mutex();
+}
+
+/* Copy out one of this table's projections. Returns false when it has none.
+   A copy rather than the pointer, because a concurrent DropProjection deletes
+   it the moment the table lock is released. */
+static bool ch_pick_projection(Table *table, Thd1 *thd, Projection *out) {
+  table->lock_table_mutex(thd->ddl_query);
+  if (table->projections_->empty()) {
+    table->unlock_table_mutex();
+    return false;
+  }
+  *out = *table->projections_->at(rand_int(table->projections_->size() - 1));
+  table->unlock_table_mutex();
+  return true;
+}
+
+void Table::DropProjection(Thd1 *thd) {
+  Projection picked;
+  if (!ch_pick_projection(this, thd, &picked))
+    return;
+
+  if (!execute_sql("ALTER TABLE " + name_ + " DROP PROJECTION IF EXISTS " +
+                       picked.name,
+                   thd))
+    return;
+
+  lock_table_mutex(thd->ddl_query);
+  for (auto it = projections_->begin(); it != projections_->end(); it++)
+    if ((*it)->name == picked.name) {
+      delete *it;
+      projections_->erase(it);
+      break;
+    }
+  unlock_table_mutex();
+}
+
+/* ALTER TABLE t MODIFY PROJECTION p (<the stored body>) WITH SETTINGS (...)
+   — ClickHouse PR 113343.
+
+   Deliberately no mutations_sync: this is a metadata alter, never a mutation,
+   so there is nothing to wait for. */
+void Table::ModifyProjection(Thd1 *thd) {
+  Projection picked;
+  if (!ch_pick_projection(this, thd, &picked))
+    return;
+
+  std::string sql = "ALTER TABLE " + name_ + " MODIFY PROJECTION ";
+  /* IF EXISTS some of the time: racing --drop-projection is how the "already
+     gone" path gets exercised without being an error. */
+  if (rand_int(100) < 30)
+    sql += "IF EXISTS ";
+  sql += picked.name + " (" + picked.body +
+         ") WITH SETTINGS (index_granularity = " +
+         ch_roll_projection_granularity() + ")";
+
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
   execute_sql(sql, thd);
 }
+
+/* ALTER TABLE t MATERIALIZE PROJECTION p — rebuild the projection on the parts
+   that do not carry it yet, which after an ADD is all of them.
+
+   A mutation, unlike MODIFY PROJECTION, so it takes mutations_sync. IF EXISTS
+   because --drop-projection may have removed it between the pick and here. */
+void Table::MaterializeProjection(Thd1 *thd) {
+  Projection picked;
+  if (!ch_pick_projection(this, thd, &picked))
+    return;
+
+  std::string sql = "ALTER TABLE " + name_ +
+                    " MATERIALIZE PROJECTION IF EXISTS " + picked.name;
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+  execute_sql(sql, thd);
+}
+
+/* ALTER TABLE t MODIFY SETTING <name> = <value>, with both taken from an alter:
+   line of the settings pool.
+
+   Emitted on its own and never folded into another ALTER: MODIFY SETTING is a
+   non replicated alter, and a Replicated database - which is what pstress
+   creates as soon as --port names more than one server - rejects a statement
+   mixing replicated and non replicated alters with QUERY_IS_PROHIBITED.
+
+   No mutations_sync and no dml_mutex: this changes metadata only and names no
+   column, so there is nothing to wait for and nothing a concurrent DROP COLUMN
+   could invalidate. Not a data mutation either, so the materialized views over
+   this table stay comparable. */
+void Table::ModifyTableSetting(Thd1 *thd) {
+  std::string setting, value;
+  if (!ch_roll_alterable_setting(setting, value))
+    return;
+
+  if (!execute_sql("ALTER TABLE " + name_ + " MODIFY SETTING " + setting +
+                       " = " + value,
+                   thd))
+    return;
+
+  /* the table now differs from the clause it was created with, so record it:
+     DropCreate and the next step both rebuild from Table::settings */
+  lock_table_mutex(thd->ddl_query);
+  ch_settings_upsert(settings, setting, value);
+  unlock_table_mutex();
+}
+
+/* ALTER TABLE t RESET SETTING <name> — put a setting back to the server
+   default. Only a setting the table actually carries is reset, and only one the
+   pool marked alterable: resetting a setting pstress owns, or one the table
+   never had, would either break the mutation paths or do nothing. */
+void Table::ResetTableSetting(Thd1 *thd) {
+  std::string setting;
+  {
+    std::vector<std::string> candidates;
+    lock_table_mutex(thd->ddl_query);
+    for (const auto &name : ch_settings_names(settings))
+      for (const auto &spec : g_alterable_table_settings)
+        if (spec.name == name) {
+          candidates.push_back(name);
+          break;
+        }
+    unlock_table_mutex();
+    if (candidates.empty())
+      return;
+    setting = candidates.at(rand_int(candidates.size() - 1));
+  }
+
+  if (!execute_sql("ALTER TABLE " + name_ + " RESET SETTING " + setting, thd))
+    return;
+
+  lock_table_mutex(thd->ddl_query);
+  ch_settings_erase(settings, setting);
+  unlock_table_mutex();
+}
+
+/* Drop every projection that names this column, before an ALTER that would
+   otherwise be rejected.
+
+   ClickHouse refuses to rename a column a projection references, and refuses to
+   drop one the projection could not be rebuilt without. Without this pre-pass
+   --drop-column and --rename-column would become silent permanent no-ops on
+   every projected table. Caller must hold table_mutex; returns false when a
+   drop failed, so the caller can leave the column alone rather than leave the
+   registry disagreeing with the server. */
+bool Table::DropProjectionsOnColumn(Thd1 *thd, const std::string &column) {
+  std::vector<std::string> doomed;
+  for (const auto *proj : *projections_)
+    if (std::find(proj->columns.begin(), proj->columns.end(), column) !=
+        proj->columns.end())
+      doomed.push_back(proj->name);
+
+  for (const auto &name : doomed) {
+    if (!execute_sql("ALTER TABLE " + name_ + " DROP PROJECTION IF EXISTS " +
+                         name,
+                     thd))
+      return false;
+    for (auto it = projections_->begin(); it != projections_->end(); it++)
+      if ((*it)->name == name) {
+        delete *it;
+        projections_->erase(it);
+        break;
+      }
+  }
+  return true;
+}
+
+/* Forget every projection on this table. Called when the table itself is
+   dropped and recreated, which takes its projections with it. */
+void Table::ForgetProjections() {
+  for (auto *proj : *projections_)
+    delete proj;
+  projections_->clear();
+}
+
+/* ---------------------------------------------------------------------------
+   Data skipping indexes. Text indexes go on String columns, which is what
+   VARCHAR, CHAR, TEXT and BLOB all become, one per column. minmax, set and
+   bloom_filter indexes go on int columns, one per column, never on the primary
+   key, which the ORDER BY already covers.
+   ------------------------------------------------------------------------- */
+
+static bool ch_text_indexable(const Column *c) {
+  switch (c->type_) {
+  case Column::CHAR:
+  case Column::VARCHAR:
+  case Column::TEXT:
+  case Column::BLOB:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static std::string ch_roll_text_tokenizer() {
+  const int r = rand_int(99);
+  if (r < 35)
+    return "splitByNonAlpha";
+  if (r < 45)
+    return "splitByString";
+  if (r < 55)
+    return "splitByString([' ', ',', '-', '.', '/', '_'])";
+  if (r < 67)
+    return "ngrams(" + std::to_string(rand_int(4, 2)) + ")";
+  if (r < 75)
+    return "sparseGrams(3, " + std::to_string(rand_int(6, 4)) + ")";
+  if (r < 85)
+    return "asciiCJK";
+  if (r < 93)
+    return "unicodeWord";
+  return "splitByRegexp('[^a-zA-Z0-9]+')";
+}
+
+/* Index names are <prefix>_<table>_<seed>_<n>. Nothing is persisted, so a
+   later step would restart n at 0 and collide with the indexes the server
+   still has; LoadSkipIndexesFromServer() pushes the counters past the largest
+   n it reads back. */
+static std::atomic<unsigned long> g_next_text_index_id{0};
+static std::atomic<unsigned long> g_next_int_index_id{0};
+
+static void ch_bump_index_counter(std::atomic<unsigned long> &counter,
+                                  const std::string &name) {
+  auto pos = name.rfind('_');
+  if (pos == std::string::npos)
+    return;
+  try {
+    unsigned long n = std::stoul(name.substr(pos + 1)) + 1;
+    unsigned long cur = counter.load();
+    while (n > cur && !counter.compare_exchange_weak(cur, n))
+      ;
+  } catch (const std::exception &) {
+    /* not one of ours */
+  }
+}
+
+SkipIndex Table::MakeRandomTextIndex(const std::string &column) {
+  static const int preprocessor_prob = opt_int(CH_TEXT_INDEX_PREPROCESSOR_PROB);
+  static const int phrase_prob = opt_int(CH_TEXT_INDEX_PHRASE_SEARCH_PROB);
+
+  SkipIndex ti;
+  ti.name = "ti_" + name_ + "_" +
+            std::to_string(options->at(Option::INITIAL_SEED)->getInt()) + "_" +
+            std::to_string(g_next_text_index_id++);
+  ti.column = column;
+  ti.kind = "text";
+
+  std::string args = "tokenizer = " + ch_roll_text_tokenizer();
+  if (rand_int(99) < preprocessor_prob)
+    args += ", preprocessor = " +
+            std::string(rand_int(1) ? "lower(" : "lowerUTF8(") + column + ")";
+  if (rand_int(99) < phrase_prob)
+    args += ", support_phrase_search = 1";
+  if (rand_int(4) == 0) {
+    static const char *const v[] = {"16", "128", "512", "4096"};
+    args += ", dictionary_block_size = " + std::string(v[rand_int(3)]);
+  }
+  if (rand_int(4) == 0)
+    args += ", dictionary_block_frontcoding_compression = " +
+            std::to_string(rand_int(1));
+  if (rand_int(4) == 0) {
+    static const char *const v[] = {"128", "1024", "65536", "1048576"};
+    args += ", posting_list_block_size = " + std::string(v[rand_int(3)]);
+  }
+  if (rand_int(4) == 0) {
+    static const char *const v[] = {"'none'", "'bitpacking'", "'pfor'"};
+    args += ", posting_list_codec = " + std::string(v[rand_int(2)]);
+  }
+  /* no GRANULARITY: the server stores 100000000 for a text index whatever
+     the statement says */
+  ti.type = "text(" + args + ")";
+  return ti;
+}
+
+static bool ch_int_indexable(const Column *c) {
+  return (c->type_ == Column::INT || c->type_ == Column::INTEGER) &&
+         !c->primary_key;
+}
+
+/* minmax 40%, set 30%, bloom_filter 30%. Half the indexes take the default
+   GRANULARITY, the rest one of 1, 2, 4, 8: minmax and set over a wider stripe
+   is where a stale or wrongly merged index mark would show. */
+SkipIndex Table::MakeRandomIntIndex(const std::string &column) {
+  SkipIndex ii;
+  ii.name = "ii_" + name_ + "_" +
+            std::to_string(options->at(Option::INITIAL_SEED)->getInt()) + "_" +
+            std::to_string(g_next_int_index_id++);
+  ii.column = column;
+  const int r = rand_int(99);
+  if (r < 40) {
+    ii.kind = "minmax";
+    ii.type = "minmax";
+  } else if (r < 70) {
+    /* 0 is unlimited; a small N makes the index give up on most granules,
+       which the server has to notice and read them anyway */
+    static const char *const n[] = {"0", "10", "100", "1000"};
+    ii.kind = "set";
+    ii.type = "set(" + std::string(n[rand_int(3)]) + ")";
+  } else {
+    static const char *const fp[] = {"0.001", "0.01", "0.025", "0.1"};
+    ii.kind = "bloom_filter";
+    ii.type = rand_int(1) ? "bloom_filter"
+                          : "bloom_filter(" + std::string(fp[rand_int(3)]) + ")";
+  }
+  if (rand_int(1)) {
+    static const char *const g[] = {"1", "2", "4", "8"};
+    ii.granularity = g[rand_int(3)];
+  }
+  return ii;
+}
+
+void Table::RollSkipIndexes() {
+  static const int text_prob = opt_int(CH_TEXT_INDEX_PROB);
+  static const int int_prob = opt_int(CH_INT_INDEX_PROB);
+  if (text_prob > 0)
+    for (auto col : *columns_)
+      if (ch_text_indexable(col) && rand_int(99) < text_prob)
+        skip_indexes_.push_back(MakeRandomTextIndex(col->name_));
+  if (int_prob > 0 && rand_int(99) < int_prob)
+    if (auto *col = IntIndexCandidate())
+      skip_indexes_.push_back(MakeRandomIntIndex(col->name_));
+}
+
+bool Table::HasTextIndex(const std::string &column) const {
+  for (const auto &ti : skip_indexes_)
+    if (ti.is_text() && ti.column == column)
+      return true;
+  return false;
+}
+
+bool Table::HasIntIndex(const std::string &column) const {
+  for (const auto &ii : skip_indexes_)
+    if (!ii.is_text() && ii.column == column)
+      return true;
+  return false;
+}
+
+Column *Table::IntIndexCandidate() const {
+  for (auto col : *columns_)
+    if (ch_int_indexable(col) && !HasIntIndex(col->name_))
+      return col;
+  return nullptr;
+}
+
+void Table::RenameSkipIndexColumn(const std::string &from,
+                                  const std::string &to) {
+  for (auto &ti : skip_indexes_)
+    if (ti.column == from)
+      ti.column = to;
+}
+
+bool Table::DropSkipIndexesOnColumn(Thd1 *thd, const std::string &column) {
+  for (auto it = skip_indexes_.begin(); it != skip_indexes_.end();) {
+    if (it->column != column) {
+      it++;
+      continue;
+    }
+    if (!execute_sql("ALTER TABLE " + name_ + " DROP INDEX IF EXISTS " +
+                         it->name,
+                     thd))
+      return false;
+    it = skip_indexes_.erase(it);
+  }
+  return true;
+}
+
+/* The server is the source of truth: CREATE TABLE may have failed, an earlier
+   step may have added or dropped indexes, and none of it is in the metadata. */
+bool Table::LoadSkipIndexesFromServer(Thd1 *thd) {
+  auto rows = thd->db->get_query_result(
+      "SELECT name, expr, type, type_full, granularity FROM "
+      "system.data_skipping_indices WHERE database = '" +
+      options->at(Option::DATABASE)->getString() + "' AND table = '" + name_ +
+      "' AND type IN ('text', 'minmax', 'set', 'bloom_filter') ORDER BY name");
+  std::vector<SkipIndex> found;
+  for (const auto &row : rows) {
+    if (row.size() < 5)
+      return false;
+    SkipIndex ti;
+    ti.name = row[0];
+    ti.column = row[1];
+    ti.kind = row[2];
+    ti.type = row[3];
+    ti.granularity = row[4];
+    ch_bump_index_counter(ti.is_text() ? g_next_text_index_id
+                                       : g_next_int_index_id,
+                          ti.name);
+    found.push_back(ti);
+  }
+  lock_table_mutex(true);
+  skip_indexes_ = std::move(found);
+  unlock_table_mutex();
+  return true;
+}
+
+void Table::AddTextIndex(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  std::vector<std::string> candidates;
+  for (auto col : *columns_)
+    if (ch_text_indexable(col) && !HasTextIndex(col->name_))
+      candidates.push_back(col->name_);
+  if (candidates.empty()) {
+    unlock_table_mutex();
+    return;
+  }
+  SkipIndex ti =
+      MakeRandomTextIndex(candidates.at(rand_int(candidates.size() - 1)));
+  unlock_table_mutex();
+
+  /* shared dml_mutex, so a DROP COLUMN cannot take the column away between
+     building the statement and running it */
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
+  if (!execute_sql("ALTER TABLE " + name_ + " ADD " + ti.definition(), thd))
+    return;
+
+  lock_table_mutex(thd->ddl_query);
+  skip_indexes_.push_back(ti);
+  unlock_table_mutex();
+}
+
+/* Copy out one of this table's text indexes (text = true) or int indexes.
+   A copy rather than a reference, because a concurrent drop erases it once
+   the lock is released. */
+static bool ch_pick_skip_index(Table *table, Thd1 *thd, bool text,
+                               SkipIndex *out) {
+  table->lock_table_mutex(thd->ddl_query);
+  std::vector<const SkipIndex *> family;
+  for (const auto &si : table->skip_indexes_)
+    if (si.is_text() == text)
+      family.push_back(&si);
+  if (family.empty()) {
+    table->unlock_table_mutex();
+    return false;
+  }
+  *out = *family.at(rand_int(family.size() - 1));
+  table->unlock_table_mutex();
+  return true;
+}
+
+void Table::AddIntIndex(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  auto *col = IntIndexCandidate();
+  if (col == nullptr) {
+    unlock_table_mutex();
+    return;
+  }
+  SkipIndex ii = MakeRandomIntIndex(col->name_);
+  unlock_table_mutex();
+
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
+  if (!execute_sql("ALTER TABLE " + name_ + " ADD " + ii.definition(), thd))
+    return;
+
+  lock_table_mutex(thd->ddl_query);
+  skip_indexes_.push_back(ii);
+  unlock_table_mutex();
+}
+
+void Table::DropTextIndex(Thd1 *thd) { DropSkipIndex(thd, true); }
+void Table::DropIntIndex(Thd1 *thd) { DropSkipIndex(thd, false); }
+void Table::MaterializeTextIndex(Thd1 *thd) { MaterializeSkipIndex(thd, true); }
+void Table::MaterializeIntIndex(Thd1 *thd) { MaterializeSkipIndex(thd, false); }
+
+void Table::DropSkipIndex(Thd1 *thd, bool text) {
+  SkipIndex picked;
+  if (!ch_pick_skip_index(this, thd, text, &picked))
+    return;
+
+  if (!execute_sql("ALTER TABLE " + name_ + " DROP INDEX IF EXISTS " +
+                       picked.name,
+                   thd))
+    return;
+
+  lock_table_mutex(thd->ddl_query);
+  for (auto it = skip_indexes_.begin(); it != skip_indexes_.end(); it++)
+    if (it->name == picked.name) {
+      skip_indexes_.erase(it);
+      break;
+    }
+  unlock_table_mutex();
+}
+
+/* MATERIALIZE INDEX builds the index on parts that lack it, CLEAR INDEX
+   removes it from every part while keeping it in the table definition. Either
+   way the queries keep running against a mix of indexed and unindexed parts,
+   which must not change a single result. */
+void Table::MaterializeSkipIndex(Thd1 *thd, bool text) {
+  SkipIndex picked;
+  if (!ch_pick_skip_index(this, thd, text, &picked))
+    return;
+
+  std::string sql = "ALTER TABLE " + name_ +
+                    (rand_int(3) == 0 ? " CLEAR INDEX IF EXISTS "
+                                      : " MATERIALIZE INDEX IF EXISTS ") +
+                    picked.name;
+  if (options->at(Option::CH_MUTATIONS_SYNC)->getBool())
+    sql += " SETTINGS mutations_sync = 2";
+  execute_sql(sql, thd);
+}
+
+#else
+void Table::AlterTableUpdate(Thd1 *) {}
+void Table::AlterTableDelete(Thd1 *) {}
+#endif
 
 void Table::SelectAllRow(Thd1 *thd, bool select_for_update) {
   lock_table_mutex(thd->ddl_query);
@@ -3904,12 +6297,18 @@ std::string Table::SetClause() {
       columns_->size() == 1) {
     col = columns_->at(0);
   } else {
-    while (col == nullptr) {
-      int set = rand_int(columns_->size() - 1);
-      if (columns_->at(set)->type_ != Column::GENERATED &&
-          columns_->at(set)->primary_key == false)
-        col = columns_->at(set);
-    }
+    /* A composite key column is a key column, and ClickHouse rejects an UPDATE
+       on any of them ("Cannot UPDATE key column"). --pk-in-set above is the
+       switch for deliberately trying a key column, so gate these the same way
+       rather than letting the ordinary path pick one by accident. Collected
+       into a list instead of rejection-sampled: same distribution, and it
+       cannot spin forever on a table whose every column is in the key. */
+    std::vector<Column *> settable;
+    for (auto c : *columns_)
+      if (c->type_ != Column::GENERATED && !c->primary_key && !c->composite_key)
+        settable.push_back(c);
+    col = settable.empty() ? columns_->at(0)
+                           : settable[rand_int(settable.size() - 1)];
   }
   std::string set_clause = col->name_ + " = ";
   set_clause +=
@@ -3918,7 +6317,11 @@ std::string Table::SetClause() {
   /* 10% update most of column */
   if (rand_int(100) < 10) {
     for (const auto &column : *columns_) {
-      if (column->primary_key == false && column->type_ != Column::GENERATED &&
+      /* composite_key as well as primary_key: this tail widens the SET list
+         past the column picked above, and a key column here fails the whole
+         statement on ClickHouse just as surely as one picked there. */
+      if (column->primary_key == false && column->composite_key == false &&
+          column->type_ != Column::GENERATED &&
           column->name_ != col->name_ && rand_int(100) > 50) {
         set_clause += "," + column->name_ + " = " +
                       (column->type_ == Column::JSON ? json_set(column)
@@ -4159,20 +6562,117 @@ void create_database_tablespace(Thd1 *thd) {
   }
 }
 
+#ifdef USE_CLICKHOUSE
+/* Run once per run, before any table is created.
+
+   Drops materialized views and TO targets left behind by an earlier run. pstress
+   drops and recreates its own tables at step 1 but knows nothing about views, and
+   a view left pointing at a recreated table re-binds to it by name and then fails
+   every insert whose columns do not match the ones the view was created with.
+
+   Also refuses to start when this connection would insert asynchronously without
+   waiting for the flush: the INSERT would return before the views have the rows,
+   so every comparison would report a difference that is not a bug. Asked of the
+   worker's own connection rather than a fresh one, because the session settings
+   pstress applies are what actually decide this. */
+static void ch_prepare_materialized_views(Thd1 *thd) {
+  if (options->at(Option::CH_CREATE_MV)->getInt() > 0) {
+    auto truthy = [](const std::string &v) {
+      return !v.empty() && v != "0" && v != "false";
+    };
+    std::string async_insert = "0", wait_for_async = "1";
+    for (const auto &row : thd->db->get_query_result(
+             "SELECT name, value FROM system.settings WHERE name IN "
+             "('async_insert', 'wait_for_async_insert')")) {
+      if (row.size() < 2)
+        continue;
+      if (row[0] == "async_insert")
+        async_insert = row[1];
+      else
+        wait_for_async = row[1];
+    }
+    if (truthy(async_insert) && !truthy(wait_for_async)) {
+      print_and_log("--create-mv needs an INSERT to have reached the views by "
+                    "the time it returns, but this connection has "
+                    "async_insert=" + async_insert + " with "
+                    "wait_for_async_insert=" + wait_for_async +
+                    ", so it returns before the data is flushed. Set "
+                    "wait_for_async_insert=1 or async_insert=0.",
+                    thd);
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  /* only when the tables themselves are being recreated, matching Table::load */
+  if (options->at(Option::STEP)->getInt() != 1 &&
+      !options->at(Option::PREPARE)->getBool())
+    return;
+
+  const std::string db = options->at(Option::DATABASE)->getString();
+  /* views before targets, so dropping a target has no dependant left */
+  auto leftovers = thd->db->get_query_result(
+      "SELECT name, engine FROM system.tables WHERE database = '" + db +
+      "' AND (startsWith(name, '" + MV_PREFIX + "') OR startsWith(name, '" +
+      MV_TARGET_PREFIX + "')) ORDER BY engine = 'MaterializedView' DESC");
+  for (const auto &row : leftovers) {
+    if (row.size() < 2)
+      continue;
+    const bool is_view = row[1] == "MaterializedView";
+    print_and_log("Dropping " + std::string(is_view ? "view " : "view target ") +
+                      row[0] + " left behind by an earlier run",
+                  thd, false, false);
+    execute_sql((is_view ? "DROP VIEW IF EXISTS " : "DROP TABLE IF EXISTS ") +
+                    row[0],
+                thd, false);
+  }
+}
+#endif
+
 /* load metadata */
 bool Thd1::load_metadata() {
+  /* Serialize initialization: both nodes share global all_tables/options */
+  static std::mutex load_metadata_mutex;
+  std::lock_guard<std::mutex> init_lock(load_metadata_mutex);
   sum_of_all_opts = sum_of_all_options(this);
   rng = std::mt19937(set_seed(nullptr));
 
   random_strs = random_strs_generator();
 
+#ifdef USE_CLICKHOUSE
+  /* drop settings this server does not have before any table rolls for them */
+  ch_validate_table_settings(myParam->address, myParam->port,
+                             options->at(Option::DATABASE)->getString(),
+                             options->at(Option::USER)->getString(),
+                             options->at(Option::PASSWORD)->getString());
+  /* fail once here rather than on every CREATE TABLE */
+  ch_validate_engine(myParam->address, myParam->port,
+                     options->at(Option::DATABASE)->getString(),
+                     options->at(Option::USER)->getString(),
+                     options->at(Option::PASSWORD)->getString());
+  /* and once here rather than on every CREATE MATERIALIZED VIEW */
+  ch_validate_mv_support(myParam->address, myParam->port,
+                         options->at(Option::DATABASE)->getString(),
+                         options->at(Option::USER)->getString(),
+                         options->at(Option::PASSWORD)->getString());
+  /* clear views left by an earlier run before any table is recreated */
+  static std::once_flag mv_prepare_once;
+  std::call_once(mv_prepare_once, [this]() {
+    ch_prepare_materialized_views(this);
+  });
+
+#endif
+
   if (options->at(Option::SECONDARY_ENGINE)->getString() != "") {
     validate_secondary_engine(this);
   }
 
-  /*set seed for current step*/
-  std::cout << "Running " << FORK << " version " << db->get_server_version()
-            << std::endl;
+  /*set seed for current step — print version only once across all nodes */
+  static bool version_printed = false;
+  if (!version_printed) {
+    version_printed = true;
+    std::cout << "Running " << FORK << " version " << db->get_server_version()
+              << std::endl;
+  }
 
   /* create in-memory data for general tablespaces */
   create_in_memory_data();
@@ -4183,21 +6683,32 @@ bool Thd1::load_metadata() {
     if (options->at(Option::XA_TRANSACTION)->getInt() != 0)
       execute_sql("XA COMMIT " + std::to_string(thread_id), this);
 
-    auto file = load_metadata_from_file();
-    if (file == "FAILED") {
-      exit(EXIT_FAILURE);
-    } else {
-      std::cout << "metadata loaded from " << file << std::endl;
+    if (all_tables->empty()) {
+      auto file = load_metadata_from_file();
+      if (file == "FAILED") {
+        exit(EXIT_FAILURE);
+      } else {
+        std::cout << "metadata loaded from " << file << std::endl;
+        /* Before any worker can allocate a key, and only here: this branch is
+           inside the all_tables->empty() guard, so it runs once per process
+           even in a multi-node run. Not done for step 1 or --prepare, where
+           Table::load() recreates the table and sets the counter itself.
+           --seq-pk-trust-metadata skips it and keeps the step file's counter. */
+        if (!options->at(Option::SEQ_PK_TRUST_METADATA)->getBool())
+          reconcile_pk_counters(this);
+      }
     }
   } else {
     if (strcmp(FORK, "MySQL") == 0)
       create_database_tablespace(this);
-    if (load_metadata_from_file() == "FAILED") {
-      generate_metadata_for_tables();
-      print_and_log(
-          "metadata generated randomly using seed " +
-              std::to_string(options->at(Option::INITIAL_SEED)->getInt()),
-          this);
+    if (all_tables->empty()) {
+      if (load_metadata_from_file() == "FAILED") {
+        generate_metadata_for_tables();
+        print_and_log(
+            "metadata generated randomly using seed " +
+                std::to_string(options->at(Option::INITIAL_SEED)->getInt()),
+            this);
+      }
     }
   }
 

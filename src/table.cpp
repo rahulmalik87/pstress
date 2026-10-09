@@ -1,10 +1,12 @@
 #include "random_test.hpp"
 #include <array>
 #include <document.h>
+#ifndef __APPLE__
 #include <malloc.h>
+#endif
 extern std::mutex all_table_mutex;
 extern std::vector<Table *> *all_tables;
-extern int number_of_records;
+extern size_t number_of_records;
 extern std::atomic<bool> run_query_failed;
 using namespace rapidjson;
 
@@ -59,7 +61,13 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
 
   thd->unique_keys.clear();
 
-  if (has_pk()) {
+  /* A sequential key needs no random set: the block reserved below is unique
+     by construction and already ascending. This also skips building an
+     unordered_set of every key and sorting it, which at --records=12M is the
+     most expensive thing the initial load does. thd->unique_keys is left
+     empty on purpose -- the FK parent pool falls back to iota(1..N), which is
+     exactly the parent's sequential key set. */
+  if (has_pk() && !use_sequential_pk()) {
     bool is_auto_increment = false;
     if (has_int_pk()) {
       for (const auto &col : *columns_) {
@@ -143,7 +151,14 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
     }
   }
   // to reduce space of map using in generateUniqueRandomNumbers
+#ifndef __APPLE__
   malloc_trim(0);
+#endif
+
+  /* One reservation for the whole load, after the FK path above may have
+     shrunk the record count. */
+  const long int pk_base =
+      use_sequential_pk() ? reserve_pk_block(number_of_initial_records) : -1;
 
   std::string prepare_sql = "INSERT ";
   prepare_sql += "INTO " + name_ + " (";
@@ -152,14 +167,17 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   for (const auto &column : *columns_) {
     prepare_sql += column->name_ + ", ";
   }
-
+#ifdef USE_CLICKHOUSE
+  if (ch_version_column())
+    prepare_sql += "_pstress_ver, ";
+#endif
   prepare_sql.erase(prepare_sql.length() - 2);
   prepare_sql += ")";
 
   std::string values = " VALUES";
   unsigned int records = 0;
 
-  std::vector<int> pk_insert;
+  std::vector<std::string> pk_insert;
 
   while (records < number_of_initial_records) {
     std::string value = "(";
@@ -172,10 +190,15 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
               fk_parent_unique_keys.size() - 1)]);
       } else if (column->type_ == Column::COLUMN_TYPES::GENERATED) {
         value += "DEFAULT";
+      } else if (column->primary_key && pk_base >= 0) {
+        auto pk_val = pk_literal(pk_base + records, column);
+        value += pk_val;
+        if (options->at(Option::LOG_PK_BULK_INSERT)->getBool())
+          pk_insert.push_back(pk_val);
       } else if (column->primary_key and thd->unique_keys.size() > 0) {
         value += std::to_string(thd->unique_keys.at(records));
         if (options->at(Option::LOG_PK_BULK_INSERT)->getBool())
-          pk_insert.push_back(thd->unique_keys.at(records));
+          pk_insert.push_back(std::to_string(thd->unique_keys.at(records)));
 
       } else if (column->auto_increment == true) {
         value += "NULL";
@@ -185,6 +208,10 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
 
       value += ", ";
     }
+#ifdef USE_CLICKHOUSE
+    if (ch_version_column())
+      value += "toUnixTimestamp64Micro(now64()), ";
+#endif
     value.erase(value.size() - 2);
     value += ")";
     values += value;
@@ -199,6 +226,7 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
       }
       values = " VALUES";
       log_pk_insert(thd, name_, pk_insert);
+      pk_insert.clear();
     } else {
       values += ", ";
     }
@@ -214,11 +242,38 @@ bool Table::InsertBulkRecord(Thd1 *thd) {
   return true;
 }
 
-std::string Table::ColumnValues(Thd1 *thd, int value_count) {
-  std::string cols = "(";
+std::string Table::ColumnValues(Thd1 *thd, int value_count, bool fresh_pk) {
+  /* With --insert-column-subset-prob the statement names only some columns and
+     the server fills the rest with their defaults. Key columns always stay:
+     --seq-pk hands their values out, and on ClickHouse they are the ORDER BY,
+     so defaulting them would pile every row onto one key. Outside ClickHouse a
+     NOT NULL column with no default has nothing to fall back to. */
+  std::vector<Column *> chosen;
+  const bool subset =
+      rand_int(100, 1) <=
+      options->at(Option::INSERT_COLUMN_SUBSET_PROB)->getInt();
   for (auto &column : *columns_) {
+    bool must_write = !subset || column->primary_key || column->composite_key;
+#ifndef USE_CLICKHOUSE
+    must_write = must_write || (!column->null_val &&
+                                column->default_value.empty() &&
+                                !column->auto_increment &&
+                                column->type_ != Column::COLUMN_TYPES::GENERATED);
+#endif
+    if (must_write || rand_int(1))
+      chosen.push_back(column);
+  }
+  if (chosen.empty())
+    chosen.push_back(columns_->at(rand_int(columns_->size() - 1)));
+
+  std::string cols = "(";
+  for (auto &column : chosen) {
     cols += column->name_ + ", ";
   }
+#ifdef USE_CLICKHOUSE
+  if (ch_version_column())
+    cols += "_pstress_ver, ";
+#endif
   cols.pop_back();
   cols.pop_back();
   cols += ")";
@@ -226,15 +281,38 @@ std::string Table::ColumnValues(Thd1 *thd, int value_count) {
   std::vector<std::string> pk_insert;
   if (value_count != 1)
     pk_insert.reserve(value_count);
+  /* One fetch_add for the whole statement, so the rows of a bulk INSERT carry
+     consecutive ascending keys and land as one narrow part -- the shape this
+     option exists to produce. -1 means the key is not ours to hand out and the
+     column falls through to rand_value() like any other. */
+  const long int pk_base =
+      (fresh_pk && use_sequential_pk()) ? reserve_pk_block(value_count) : -1;
+  const int dup_prob = options->at(Option::SEQ_PK_DUP_PROB)->getInt();
   std::string vals;
   for (int i = 0; i < value_count; i++) {
     vals += "(";
-    for (auto &column : *columns_) {
+    for (auto &column : chosen) {
       if (column->type_ == Column::COLUMN_TYPES::GENERATED)
         vals += "DEFAULT, ";
       else if (column->auto_increment)
         vals += "NULL, ";
-      else {
+      else if (column->primary_key && pk_base >= 0) {
+        /* Mostly the next key in the reserved block, but --seq-pk-dup-prob of
+           the time one that is already in the table, so ReplacingMergeTree
+           still has duplicates to collapse. Capped below pk_base: the counter
+           has already been advanced past this whole block, so an uncapped
+           sample could return a key this same statement is about to write,
+           which is a collision inside one INSERT rather than with an existing
+           row. */
+        const bool dup =
+            dup_prob > 0 && pk_base > 1 && rand_int(100, 1) <= dup_prob;
+        auto pk_val =
+            pk_literal(dup ? sample_pk(pk_base) : pk_base + i, column);
+        vals += pk_val + ", ";
+        if (value_count != 1 &&
+            options->at(Option::LOG_PK_BULK_INSERT)->getBool())
+          pk_insert.push_back(pk_val);
+      } else {
         auto rand_val = column->rand_value();
         vals += rand_val + ", ";
         if (value_count != 1 &&
@@ -246,6 +324,10 @@ std::string Table::ColumnValues(Thd1 *thd, int value_count) {
 
     vals.pop_back();
     vals.pop_back();
+#ifdef USE_CLICKHOUSE
+    if (ch_version_column())
+      vals += ", toUnixTimestamp64Micro(now64())";
+#endif
     vals += "), ";
   }
   log_pk_insert(thd, name_, pk_insert);
@@ -261,7 +343,13 @@ void Table::InsertRandomRow(Thd1 *thd) {
   unlock_table_mutex();
 
   std::shared_lock lock(dml_mutex);
-  execute_sql(sql, thd);
+  /* An INSERT commits to the table first and only then pushes to each
+     materialized view, so one that did not succeed - killed by --kill-transaction
+     most of the time - can leave the row in the table and out of a view. The
+     table is then legitimately ahead of its views and cannot be compared with
+     them any more. */
+  if (!execute_sql(sql, thd))
+    mark_mv_source_mutated("an INSERT that did not succeed");
 }
 void Table::InsertRandomRowBulk(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
@@ -270,7 +358,14 @@ void Table::InsertRandomRowBulk(Thd1 *thd) {
       "INSERT " + add_ignore_clause() + " INTO " + name_ +
       ColumnValues(thd, options->at(Option::INSERT_BULK_COUNT)->getInt());
   unlock_table_mutex();
-  execute_sql(sql, thd, false);
+
+  /* Hold shared dml_mutex during execute so DROP COLUMN (exclusive dml_mutex)
+     cannot remove a column between SQL build and execution. */
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
+  /* see InsertRandomRow() on why a failed insert stops the views being
+     comparable */
+  if (!execute_sql(sql, thd, false))
+    mark_mv_source_mutated("a bulk INSERT that did not succeed");
 }
 
 template <typename Writer> void Table::Serialize(Writer &writer) const {
@@ -358,6 +453,25 @@ template <typename Writer> void Table::Serialize(Writer &writer) const {
   writer.String("number_of_initial_records");
   writer.Int(number_of_initial_records);
 
+  /* --seq-pk counter. The next step must not hand out a key this one already
+     wrote. Int64, not Int: this counts every key ever handed out, and unlike
+     the record count above it genuinely outgrows 32 bits. */
+  writer.String("pk_next");
+  writer.Int64(pk_next.load());
+
+  /* ClickHouse per-table SETTINGS, empty when none were rolled */
+  writer.String("settings");
+  writer.String(settings.c_str(), static_cast<SizeType>(settings.length()));
+
+  /* Why this table can no longer be compared against its materialized views,
+     empty while it still can. Persisted because a view created in an earlier
+     step outlives the process that knows what happened to its source: without
+     this, step 2 would compare a view against a table that was mutated in step
+     1 and report a difference that is not a bug. */
+  const std::string mv_reason = mv_skip_reason();
+  writer.String("mv_mutation_reason");
+  writer.String(mv_reason.c_str(), static_cast<SizeType>(mv_reason.length()));
+
   writer.String(("columns"));
   writer.StartArray();
 
@@ -390,6 +504,18 @@ template <typename Writer> void Table::Serialize(Writer &writer) const {
 bool Table::load(Thd1 *thd, bool bulk_insert,
                  bool set_global_run_query_failed) {
   thd->ddl_query = true;
+#ifdef USE_CLICKHOUSE
+  /* For step=1 / prepare, drop existing table so we start from a clean schema.
+     With ReplicatedMergeTree, DROP syncs to all replicas automatically. */
+  if (options->at(Option::STEP)->getInt() == 1 ||
+      options->at(Option::PREPARE)->getBool()) {
+    execute_sql("DROP TABLE IF EXISTS " + name_, thd, false);
+    /* --prepare restores the previous step's metadata, counter included, and
+       then empties the table underneath it. Without this the key range would
+       describe rows that no longer exist and every predicate would miss. */
+    reset_pk_counter();
+  }
+#endif
   if (!execute_sql(definition(false), thd)) {
     if (set_global_run_query_failed) {
       print_and_log("Failed to create table " + name_, thd, true);
@@ -449,6 +575,8 @@ template <typename Writer> void Column::Serialize(Writer &writer) const {
   writer.Bool(null_val);
   writer.String("primary_key");
   writer.Bool(primary_key);
+  writer.String("composite_key");
+  writer.Bool(composite_key);
   writer.String("compressed");
   writer.Bool(compressed);
   writer.String("auto_increment");
@@ -524,6 +652,8 @@ std::string build_step_file_name(int step) {
   const std::string instance = "mysql";
 #elif USE_DUCKDB
   const std::string instance = "duckdb";
+#elif USE_CLICKHOUSE
+  const std::string instance = "clickhouse";
 #endif
   auto file = path + "/" + instance + "_" +
               options->at(Option::DATABASE)->getString() + "_metadata_step_" +
@@ -547,6 +677,36 @@ void save_metadata_to_file() {
     auto table = *j;
     table->Serialize(writer);
   }
+  writer.EndArray();
+
+  /* The materialized views this run created, so the next step can go on
+     checking them instead of skipping everything it did not create itself. */
+  writer.String("materialized_views");
+  writer.StartArray();
+#ifdef USE_CLICKHOUSE
+  {
+    std::lock_guard<std::mutex> lk(g_materialized_views_mutex);
+    for (const auto &mv : g_materialized_views) {
+      writer.StartObject();
+      writer.String("name");
+      writer.String(mv.name.c_str(), static_cast<SizeType>(mv.name.length()));
+      writer.String("target");
+      writer.String(mv.target.c_str(),
+                    static_cast<SizeType>(mv.target.length()));
+      writer.String("src_table");
+      writer.String(mv.src_table.c_str(),
+                    static_cast<SizeType>(mv.src_table.length()));
+      writer.String("populate_atomically");
+      writer.Bool(mv.populate_atomically);
+      writer.String("columns");
+      writer.StartArray();
+      for (const auto &col : mv.columns)
+        writer.String(col.c_str(), static_cast<SizeType>(col.length()));
+      writer.EndArray();
+      writer.EndObject();
+    }
+  }
+#endif
   writer.EndArray();
   writer.EndObject();
   std::ofstream of(file);
@@ -642,6 +802,26 @@ std::string load_metadata_from_file() {
     table->number_of_initial_records =
         tab["number_of_initial_records"].GetInt();
 
+    if (tab.HasMember("settings"))
+      table->settings = tab["settings"].GetString();
+
+    /* HasMember, so a step file written before --seq-pk existed still loads;
+       the counter then keeps its default of 1. pk_from_metadata records which
+       of the two happened, because only a counter that really came from a
+       previous --seq-pk run is worth reconciling against the server. */
+    if (tab.HasMember("pk_next")) {
+      table->pk_next.store(tab["pk_next"].GetInt64());
+      table->pk_from_metadata = true;
+    }
+
+#ifdef USE_CLICKHOUSE
+    if (tab.HasMember("mv_mutation_reason")) {
+      const std::string why = tab["mv_mutation_reason"].GetString();
+      if (!why.empty())
+        table->mark_mv_source_mutated(intern_mv_reason(why));
+    }
+#endif
+
     /* save columns */
     for (auto &col : tab["columns"].GetArray()) {
       Column *a;
@@ -688,6 +868,11 @@ std::string load_metadata_from_file() {
       a->auto_increment = col["auto_increment"].GetBool();
       a->length = col["length"].GetInt(),
       a->primary_key = col["primary_key"].GetBool();
+      /* HasMember, so a step file written before composite keys were persisted
+         still loads; those columns then stay out of the key, which is the shape
+         the server already has for a table created by that run. */
+      if (col.HasMember("composite_key"))
+        a->composite_key = col["composite_key"].GetBool();
       a->compressed = col["compressed"].GetBool();
       a->not_secondary = col["not secondary"].GetBool();
       table->AddInternalColumn(a);
@@ -711,10 +896,109 @@ std::string load_metadata_from_file() {
       table->AddInternalIndex(index);
     }
 
+    /* the columns are all restored now, so the sequential-key column can be
+       resolved -- same point in the table's life as in Table::table_id() */
+    table->resolve_seq_pk_column();
+
     all_tables->push_back(table);
   }
+
+#ifdef USE_CLICKHOUSE
+  /* Restore the views an earlier step created. They still exist on the server -
+     step >= 2 recreates neither the tables nor the views - so putting them back
+     in the registry is what lets them be checked instead of skipped. */
+  if (d.HasMember("materialized_views")) {
+    std::lock_guard<std::mutex> lk(g_materialized_views_mutex);
+    for (auto &mvj : d["materialized_views"].GetArray()) {
+      MVInfo mv;
+      mv.name = mvj["name"].GetString();
+      mv.target = mvj["target"].GetString();
+      mv.src_table = mvj["src_table"].GetString();
+      mv.populate_atomically = mvj["populate_atomically"].GetBool();
+      for (auto &col : mvj["columns"].GetArray())
+        mv.columns.push_back(col.GetString());
+      /* mv_<table>_<id>: keep this step's ids clear of the restored ones */
+      const auto last_us = mv.name.rfind('_');
+      if (last_us != std::string::npos) {
+        try {
+          bump_mv_id_floor(std::stoul(mv.name.substr(last_us + 1)));
+        } catch (const std::exception &) {
+        }
+      }
+      g_materialized_views.push_back(std::move(mv));
+    }
+    if (!g_materialized_views.empty())
+      print_and_log("restored " + std::to_string(g_materialized_views.size()) +
+                        " materialized views from the previous step",
+                    nullptr);
+  }
+#endif
 
   fclose(fp);
   print_and_log("metadata loaded from file " + file, nullptr);
   return file;
+}
+
+/* Raise each table's --seq-pk counter to whatever the server says is already
+   there.
+
+   The metadata value is normally the larger of the two: it counts every key
+   handed out, including the ones a failed INSERT never wrote. But the step file
+   is written exactly once, from main() after the worker threads join, so a step
+   that hit a fatal query, tripped an assert (Release builds define no NDEBUG,
+   so asserts are live) or was killed leaves no file at all -- and then step N+1
+   reads step N-1's and would re-issue keys that are in the table. Under
+   ReplacingMergeTree those new rows would silently replace older ones.
+
+   Only tables whose counter really came from a previous --seq-pk run are
+   touched. A table still holding the old random keys must not adopt their
+   maximum: that maximum is around --range * --records, and the range would then
+   span the whole random key space, putting predicates back to matching almost
+   nothing. Such a table simply starts at 1.
+
+   Must run before any worker can allocate a key. Called from
+   Thd1::load_metadata() inside the all_tables->empty() guard, which is what
+   makes it once-per-process: metadata_loaded is a single process-global flag,
+   so with two nodes the second node's loader is still running while both
+   nodes' workers are already released. */
+void reconcile_pk_counters(Thd1 *thd) {
+  for (auto &table : *all_tables) {
+    if (!table->use_sequential_pk() || !table->pk_from_metadata)
+      continue;
+    /* not const: is_col_number() is not const-qualified */
+    Column *pk = table->seq_pk_col;
+    /* toInt64OrZero, so a zero-padded string key parses as its number and an
+       empty table (max() of no rows) answers 0 rather than something that has
+       to be parsed here. */
+    const std::string expr = pk->is_col_number()
+                                 ? "max(" + pk->name_ + ")"
+                                 : "max(toInt64OrZero(" + pk->name_ + "))";
+    const std::string got =
+        thd->db->get_single_value("SELECT " + expr + " FROM " + table->name_);
+    /* empty on any failure -- a table dropped by a DROP whose CREATE failed in
+       the previous step is gone, and that is not an error here */
+    if (got.empty())
+      continue;
+    long int server_max = 0;
+    try {
+      server_max = std::stol(got);
+    } catch (const std::exception &) {
+      continue;
+    }
+    if (server_max < 1)
+      continue;
+    const long int want = server_max + 1;
+    const long int had = table->pk_next.load();
+    if (want <= had)
+      continue; /* the metadata already knew about a later key */
+    /* raise, never lower: this runs before the workers start, but the CAS
+       costs nothing and keeps the invariant true if that ever changes */
+    long int cur = had;
+    while (want > cur && !table->pk_next.compare_exchange_weak(cur, want)) {
+    }
+    print_and_log("sequential pk counter for " + table->name_ + " raised from " +
+                      std::to_string(had) + " to " + std::to_string(want) +
+                      " (highest key on the server)",
+                  thd, false, false);
+  }
 }

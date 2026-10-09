@@ -1,4 +1,8 @@
+#include "node.hpp"
 #include "random_test.hpp"
+#ifdef USE_CLICKHOUSE
+#include "ch_verify.hpp"
+#endif
 #include <filesystem>
 #include <limits.h> // for PATH_MAX
 #include <regex>
@@ -28,6 +32,20 @@ static void random_timezone(Thd1 *thd) {
 
 static void kill_query(Thd1 *thd) {
 
+#ifdef USE_CLICKHOUSE
+  /* ClickHouse: pick a random running query from system.processes for this
+     user (excluding our own current_query_id) and kill it. */
+  const std::string user = options->at(Option::USER)->getString();
+  /* current_query_id() returns the query_id of the SELECT itself, which
+     lets us exclude our own probe query from the candidate list. */
+  auto result = thd->db->get_query_result(
+      "SELECT query_id FROM system.processes "
+      "WHERE user = '" + user + "' AND query_id != current_query_id()");
+  if (result.empty())
+    return;
+  const std::string qid = result[rand_int(result.size() - 1)][0];
+  execute_sql("KILL QUERY WHERE query_id = '" + qid + "' SYNC", thd);
+#else
   auto on_exit = std::shared_ptr<void>(nullptr, [&](...) {
     if (options->at(Option::SELECT_IN_SECONDARY)->getBool()) {
       execute_sql("SET @@SESSION.USE_SECONDARY_ENGINE=FORCED", thd);
@@ -54,8 +72,51 @@ static void kill_query(Thd1 *thd) {
   if (!execute_sql(query, thd)) {
     return;
   }
-  return;
+#endif
 }
+
+#ifdef USE_CLICKHOUSE
+/* ClickHouse: cancel a random mutation that has not finished yet.
+
+   A mutation is a background rewrite of every part, tracked in
+   system.mutations until is_done. More of the workload produces one than the
+   --ch-alter-update/--ch-alter-delete options it was written for: DROP COLUMN
+   and a retyping MODIFY COLUMN are mutations too. A lightweight UPDATE is not
+   one -- it writes patch parts, which never appear in system.mutations -- so no
+   roll ever targets it.
+
+   DELETE FROM is only a candidate when --ch-lightweight-delete leaves it as
+   one. That option defaults to 100, which asks for lightweight_delete_mode =
+   lightweight_update on every delete and so keeps DELETE FROM out of
+   system.mutations entirely; at the alter_update default it would instead be
+   rewritten into ALTER TABLE ... UPDATE _row_exists = 0 and become by far the
+   largest source of candidates. Enabling --ch-kill-mutation without also
+   lowering --ch-lightweight-delete therefore leaves only the DDL mutations to
+   target, and the roll does nothing most of the time.
+
+   Killing a mutation mid-flight leaves the table with some parts rewritten and
+   some not, and fails the statement still waiting on it (any ALTER under
+   --ch-mutations-sync, and every DELETE FROM, which waits by default under
+   lightweight_deletes_sync = 2) — which is exactly the state we want the server,
+   the replication queue and the next mutation over the same parts to survive.
+
+   Any unfinished mutation in this run's database is a candidate, including ones
+   stuck retrying after a failure, which is the case KILL MUTATION exists for. */
+static void kill_mutation(Thd1 *thd) {
+  const std::string db = options->at(Option::DATABASE)->getString();
+  auto result = thd->db->get_query_result(
+      "SELECT table, mutation_id FROM system.mutations "
+      "WHERE database = '" + db + "' AND is_done = 0");
+  if (result.empty())
+    return;
+  const auto &row = result[rand_int(result.size() - 1)];
+  if (row.size() < 2)
+    return;
+  execute_sql("KILL MUTATION WHERE database = '" + db + "' AND table = '" +
+                  row[0] + "' AND mutation_id = '" + row[1] + "'",
+              thd);
+}
+#endif
 
 std::string getExecutablePath() {
   char buffer[PATH_MAX];
@@ -176,6 +237,17 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
         working_table = enforce_table;
         table_check = 0;
       }
+#ifdef USE_CLICKHOUSE
+      /* --thread-per-table makes this thread the only writer of its table, so
+         the two runs of --compare-result-with-setting see the same rows as
+         long as both read that table and nothing else. A table picked at
+         random could be changing under another thread's inserts. */
+      if (options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool() &&
+          options->at(Option::THREAD_PER_TABLE)->getBool()) {
+        working_table = enforce_table;
+        table_check = 0;
+      }
+#endif
       working_table->lock_table_mutex(thd->ddl_query);
       table.found_name = working_table->name_;
 
@@ -189,6 +261,19 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
         // if column is defined as NOT SECONDARY skip it
         if (col->not_secondary)
           continue;
+
+#ifdef USE_CLICKHOUSE
+        /* T1_TEXTIDX_n wants a column with a text index, whatever its
+           pstress type; fill that first, so an indexed VARCHAR column is not
+           spent on a T1_VARCHAR_n the line may not even have */
+        if (table.column_count.at(grammar_table::TEXTIDX) >
+                (int)table.columns.at(grammar_table::TEXTIDX).size() &&
+            working_table->HasTextIndex(col->name_)) {
+          table.columns.at(grammar_table::TEXTIDX)
+              .emplace_back(col->name_, col->rand_value());
+          continue;
+        }
+#endif
 
         // if a valid column is not found in the table
         if (col_type == grammar_table::MAX)
@@ -256,6 +341,40 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
 
   sql = std::regex_replace(sql, std::regex("RAND_INT"),
                            std::to_string(rand_int(100)));
+
+#ifdef USE_CLICKHOUSE
+  /* RAND_WORD_0-9 is one dictionary word reused wherever the line repeats it,
+     a bare RAND_WORD a fresh word at every occurrence */
+  for (int i = 0; i < 10; i++)
+    sql = std::regex_replace(sql, std::regex("RAND_WORD_" + std::to_string(i)),
+                             rand_word());
+  for (auto pos = sql.find("RAND_WORD"); pos != std::string::npos;
+       pos = sql.find("RAND_WORD", pos))
+    sql.replace(pos, 9, rand_word());
+  /* RAND_PREFIX / RAND_SUFFIX: the start or the end of a word, fresh at every
+     occurrence */
+  for (const std::string ph : {"RAND_PREFIX", "RAND_SUFFIX"})
+    for (auto pos = sql.find(ph); pos != std::string::npos;
+         pos = sql.find(ph, pos))
+      sql.replace(pos, ph.size(), rand_word_part(ph == "RAND_PREFIX"));
+#endif
+
+#ifdef USE_CLICKHOUSE
+  /* Bound every grammar query. Done before the compare branch so both of its
+     runs carry the same limit and differ only in --run-query-setting, which
+     add_settings_clause() then merges into this clause. */
+  static const auto grammar_settings =
+      opt_string(CH_GRAMMAR_QUERY_SETTINGS);
+  if (!grammar_settings.empty())
+    sql = add_settings_clause(sql, grammar_settings);
+
+  /* Not COMPARE_RESULT, so the enforce_table override above does not kick in
+     and a T1 JOIN T2 keeps hitting two independently picked tables. */
+  if (options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool()) {
+    compare_result_with_setting(sql, thd);
+    return;
+  }
+#endif
 
   if (options->at(Option::COMPARE_RESULT)->getBool()) {
     enforce_table->Compare_between_engine(sql, thd);
@@ -333,7 +452,7 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
   auto ddl_query = thd->ddl_query;
 
   if (options->at(Option::THREAD_DOING_ONLY_SELECT)->getInt() != 0) {
-    if (options->at(Option::SINGLE_THREAD_DDL)->getBool() && thread_id == 1 &&
+    if (options->at(Option::SINGLE_THREAD_DDL)->getBool() && thread_id == 0 &&
         ddl_query) {
       // do not block ddl query if user want single thread ddl
     } else if (option != Option::SELECT_ALL_ROW &&
@@ -353,7 +472,7 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
   }
 
 
-  if (thread_id != 1 && options->at(Option::SINGLE_THREAD_DDL)->getBool() &&
+  if (thread_id != 0 && options->at(Option::SINGLE_THREAD_DDL)->getBool() &&
       ddl_query == true)
     return true;
 
@@ -364,7 +483,7 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
  * renamed*/
 static Table *pick_table(Table::TABLE_TYPES type, int id) {
   std::lock_guard<std::mutex> lock(all_table_mutex);
-  std::string name = TABLE_PREFIX + std::to_string(id);
+  std::string name = table_prefix() + std::to_string(id);
   if (type == Table::FK) {
     name += FK_SUFFIX;
   } else if (type == Table::PARTITION) {
@@ -418,6 +537,15 @@ bool Thd1::run_some_query() {
 
   if (options->at(Option::PREPARE)->getBool() ||
       options->at(Option::STEP)->getInt() == 1) {
+    /* Distribute tables across all nodes and threads.
+       Global thread ID = node_index * threads_per_node + thread_id
+       Stride = total threads across all nodes
+       Example: 30 tables, 2 nodes, 5 threads each (10 total)
+         node0/t0 -> 1,11,21   node0/t1 -> 2,12,22 ... node1/t0 -> 6,16,26 */
+    int total_threads = myParam->num_nodes * myParam->threads;
+    int global_thread_id = myParam->node_index * myParam->threads + thread_id;
+    starting_index = 1 + global_thread_id;
+
     while (starting_index <= options->at(Option::TABLES)->getInt()) {
       for (const auto &tableType : tableTypes) {
         auto table = pick_table(tableType, starting_index);
@@ -436,7 +564,7 @@ bool Thd1::run_some_query() {
         return false;
       }
       table_processed++;
-      starting_index += options->at(Option::THREADS)->getInt();
+      starting_index += total_threads;
     }
 
     // wait for all tables to finish loading
@@ -456,6 +584,32 @@ bool Thd1::run_some_query() {
   /* table initial data is created, empty the unique_keys */
   unique_keys.resize(0);
 
+#ifdef USE_CLICKHOUSE
+  /* Verify metadata matches actual ClickHouse schema at the start of each
+     step, after tables are created/loaded and before the workload begins.
+     std::call_once ensures this runs exactly once across all threads/nodes. */
+  static std::once_flag startup_schema_check;
+  static std::atomic<bool> startup_schema_ok{true};
+  std::call_once(startup_schema_check, [&]() {
+    /* the skipping indexes are not in the metadata, read back what the
+       server has before the workload starts relying on the list */
+    for (auto *table : *all_tables)
+      table->LoadSkipIndexesFromServer(this);
+    if (options->at(Option::CH_SKIP_SCHEMA_VERIFY)->getBool())
+      return;
+    bool ok = ch_verify_schema({myParam->address}, {myParam->port},
+                               options->at(Option::DATABASE)->getString(),
+                               options->at(Option::USER)->getString(),
+                               options->at(Option::PASSWORD)->getString());
+    if (!ok) {
+      std::cerr << "ERROR: Schema mismatch at startup — aborting.\n";
+      startup_schema_ok.store(false);
+    }
+  });
+  if (!startup_schema_ok.load())
+    return false;
+#endif
+
   if (options->at(Option::JUST_LOAD_DDL)->getBool() ||
       options->at(Option::PREPARE)->getBool())
     return true;
@@ -464,7 +618,9 @@ bool Thd1::run_some_query() {
   if (!lock_stream.test_and_set()) {
     print_and_log("Starting load in " +
                       std::to_string(options->at(Option::THREADS)->getInt()) +
-                      " threads. GTID " +
+                      " threads for " +
+                      std::to_string(options->at(Option::NUMBER_OF_SECONDS_WORKLOAD)->getInt()) +
+                      " seconds. GTID " +
                       db->get_single_value("select @@global.gtid_executed"),
                   this);
   }
@@ -502,6 +658,11 @@ bool Thd1::run_some_query() {
       continue;
     }
 
+#ifdef USE_CLICKHOUSE
+    /* Hold a shared lock for the duration of this iteration so the replica
+       verifier (which takes a unique_lock) can pause workers between queries. */
+    std::shared_lock<std::shared_mutex> _verify_lk(g_ch_verify_mutex);
+#endif
 
     /* check if we need to make sql as part of existing or new trx */
     if (trx_left > 0) {
@@ -667,6 +828,70 @@ bool Thd1::run_some_query() {
     case Option::UPDATE_ALL_ROWS:
       table->UpdateAllRows(this);
       break;
+    case Option::CH_ALTER_UPDATE:
+      table->AlterTableUpdate(this);
+      break;
+    case Option::CH_ALTER_DELETE:
+      table->AlterTableDelete(this);
+      break;
+#ifdef USE_CLICKHOUSE
+    case Option::CH_CREATE_MV:
+      table->CreateMaterializedView(this);
+      break;
+    case Option::CH_DROP_MV:
+      if (options->at(Option::CH_VERIFY_MV_BEFORE_DROP)->getBool()) {
+        /* Checking a view against its table compares row counts, which only
+           means anything when nothing is inserting, so pause every worker the
+           way the replica verifier does. This iteration already holds the same
+           mutex shared and a shared_mutex cannot be upgraded, so the shared lock
+           has to go first — taking the exclusive one while still holding it
+           would deadlock against ourselves. The exclusive lock then waits out
+           every other worker's current iteration, after which no insert is in
+           flight and the view has received everything the table has. */
+        _verify_lk.unlock();
+        std::unique_lock<std::shared_mutex> pause_lk(g_ch_verify_mutex);
+        table->DropMaterializedView(this);
+      } else {
+        table->DropMaterializedView(this);
+      }
+      break;
+    case Option::CH_ADD_PROJECTION:
+      table->AddProjection(this);
+      break;
+    case Option::CH_DROP_PROJECTION:
+      table->DropProjection(this);
+      break;
+    case Option::CH_MODIFY_PROJECTION:
+      table->ModifyProjection(this);
+      break;
+    case Option::CH_MATERIALIZE_PROJECTION:
+      table->MaterializeProjection(this);
+      break;
+    case Option::CH_ADD_TEXT_INDEX:
+      table->AddTextIndex(this);
+      break;
+    case Option::CH_DROP_TEXT_INDEX:
+      table->DropTextIndex(this);
+      break;
+    case Option::CH_MATERIALIZE_TEXT_INDEX:
+      table->MaterializeTextIndex(this);
+      break;
+    case Option::CH_ADD_INT_INDEX:
+      table->AddIntIndex(this);
+      break;
+    case Option::CH_DROP_INT_INDEX:
+      table->DropIntIndex(this);
+      break;
+    case Option::CH_MATERIALIZE_INT_INDEX:
+      table->MaterializeIntIndex(this);
+      break;
+    case Option::CH_MODIFY_TABLE_SETTING:
+      table->ModifyTableSetting(this);
+      break;
+    case Option::CH_RESET_TABLE_SETTING:
+      table->ResetTableSetting(this);
+      break;
+#endif
     case Option::OPTIMIZE:
       table->Optimize(this);
       break;
@@ -728,6 +953,11 @@ bool Thd1::run_some_query() {
     case Option::KILL_TRANSACTION:
       kill_query(this);
       break;
+#ifdef USE_CLICKHOUSE
+    case Option::CH_KILL_MUTATION:
+      kill_mutation(this);
+      break;
+#endif
     case Option::RANDOM_TIMEZONE:
       random_timezone(this);
       break;
