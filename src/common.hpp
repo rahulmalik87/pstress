@@ -305,6 +305,10 @@ struct Option {
     CH_SKIP_SCHEMA_VERIFY,
     /* Appended for the same reason as CH_LIGHTWEIGHT_DELETE. */
     PREPARED_STMT_PROB,
+    /* Appended for the same reason as CH_LIGHTWEIGHT_DELETE. Prints every
+       option as JSON and exits, so a script can discover what this binary
+       accepts without parsing --help. */
+    DUMP_OPTIONS_JSON,
     MAX
   } option;
 
@@ -424,6 +428,7 @@ struct Option {
   void set_cl() { cl = true; }
 
   std::string name;
+  std::string enum_name; // Option::Opt identifier, e.g. "INITIAL_RECORDS_IN_TABLE"
   std::string help;
   std::string short_help;
   std::string default_value = "";
@@ -455,7 +460,9 @@ void add_options();
 void add_server_options(std::string str);
 void add_server_options_file(std::string file_name);
 void read_option_prob_file(const std::string &prob_file);
-Option *newOption(Option::Type t, Option::Opt o, std::string s);
+/* --dump-options-json: every registered option with its name, enum, type,
+   default, effective value, flags and help, as one JSON array. */
+void dump_options_json(std::ostream &out);
 std::set<int> splitStringToIntSet(const std::string &input);
 /* convert string to array of ints */
 template <typename T>

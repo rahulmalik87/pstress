@@ -134,10 +134,18 @@ int main(int argc, char *argv[]) {
   signal(SIGFPE, crashHandler);  // Floating-point exception
   signal(SIGILL, crashHandler);  // Illegal instruction
 
-  std::cout << "Command: ";
-  for (int i = 0; i < argc; i++)
-    std::cout << argv[i] << " ";
-  std::cout << std::endl;
+  /* --dump-options-json wants nothing but JSON on stdout, so the banner is
+     skipped when it is anywhere on the command line. */
+  bool dump_options = false;
+  for (int i = 1; i < argc; i++)
+    if (strcmp(argv[i], "--dump-options-json") == 0)
+      dump_options = true;
+  if (!dump_options) {
+    std::cout << "Command: ";
+    for (int i = 0; i < argc; i++)
+      std::cout << argv[i] << " ";
+    std::cout << std::endl;
+  }
 
   std::vector<std::thread> nodes;
   add_options();
@@ -249,8 +257,10 @@ int main(int argc, char *argv[]) {
 
 #ifdef USE_CLICKHOUSE
   /* after the seed is set so the session settings are reproducible, and before
-     any thread connects so the SETs are ready to apply */
-  load_table_settings_pool();
+     any thread connects so the SETs are ready to apply. Skipped for the option
+     dump, which must print nothing but JSON. */
+  if (!dump_options)
+    load_table_settings_pool();
 #endif
 
 #ifdef USE_DUCKDB
@@ -345,6 +355,14 @@ int main(int argc, char *argv[]) {
                 << std::endl;
   }
 #endif
+
+  /* After the command line and the per-fork defaults, before anything connects:
+     the dump shows the values a run with these arguments would start with. */
+  if (options->at(Option::DUMP_OPTIONS_JSON)->getBool()) {
+    dump_options_json(std::cout);
+    delete_options();
+    exit(0);
+  }
 
   /* Auto-detect step from logdir if --step was not explicitly given.
      Scans for the highest existing metadata step file and runs the next one. */
