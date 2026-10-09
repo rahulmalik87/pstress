@@ -303,6 +303,8 @@ struct Option {
     NO_VERSION_COLUMN,
     SEQ_PK_TRUST_METADATA,
     CH_SKIP_SCHEMA_VERIFY,
+    /* Appended for the same reason as CH_LIGHTWEIGHT_DELETE. */
+    PREPARED_STMT_PROB,
     MAX
   } option;
 

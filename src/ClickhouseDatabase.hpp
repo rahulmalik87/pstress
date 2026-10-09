@@ -281,6 +281,14 @@ public:
     return run_query(query, ch_result_row_limit());
   }
 
+  /* Prepared statements are a MySQL C API feature; the native ClickHouse
+     protocol has none, so the caller falls back to the plain SELECT. */
+  bool execute_prepared_query(
+      const std::string &, const std::vector<PreparedStatementParam> &,
+      std::string *, unsigned long long *, bool *) override {
+    return false;
+  }
+
   query_result get_result() override { return last_result; }
 
   /* Callers here do read every row, but these are metadata queries against

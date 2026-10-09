@@ -450,6 +450,17 @@ struct Table {
   void SetSecondaryEngine(Thd1 *thd);
   std::string GetRandomPartition();
   Column *GetRandomColumn();
+  struct PreparedSelect {
+    std::string prepared_sql;
+    std::string printable_sql;
+    std::vector<PreparedStatementParam> params;
+  };
+  bool BuildPreparedWherePrecise(std::string &prepared_where,
+                                 std::string &printable_where,
+                                 std::vector<PreparedStatementParam> &params);
+  bool BuildPreparedWhereBulk(std::string &prepared_where,
+                              std::string &printable_where,
+                              std::vector<PreparedStatementParam> &params);
   /* text_search: on ClickHouse, a column with a text index may be searched
      with hasToken/LIKE instead of matched for equality. Only SELECT asks for
      it: an UPDATE or DELETE has to stay a point predicate. */

@@ -59,6 +59,12 @@ public:
       return !result->HasError();
     }
 
+    bool execute_prepared_query(
+        const std::string &, const std::vector<PreparedStatementParam> &,
+        std::string *, unsigned long long *, bool *) override {
+      return false;
+    }
+
     int get_affected_rows() override {
       if (result &&
           result->type == duckdb::QueryResultType::MATERIALIZED_RESULT) {
