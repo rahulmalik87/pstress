@@ -27,6 +27,10 @@ public:
   virtual int get_error_number() = 0;
   virtual ~DatabaseInterface() = default;
   virtual int get_server_version() = 0;
+  /* Connections the backend rebuilt after a socket-level failure and used to
+     retry the failed statement; 0 where the backend has no such recovery.
+     Reported in the thread log so a run that leaned on it says so. */
+  virtual size_t idle_reconnects_count() { return 0; }
 };
 
 /*

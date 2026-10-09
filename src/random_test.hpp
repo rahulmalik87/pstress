@@ -81,7 +81,8 @@ std::string rand_word();
 std::string rand_word_part(bool prefix);
 #endif
 const int maximum_records_in_each_parititon_list = 30;
-const std::string TABLE_PREFIX = "tt_";
+/* --table-prefix, "tt_" unless given */
+std::string table_prefix();
 const std::string PARTITION_SUFFIX = "_p";
 const std::string FK_SUFFIX = "_fk";
 const std::string TEMP_SUFFIX = "_t";
@@ -99,7 +100,7 @@ struct Table;
 #ifdef USE_CLICKHOUSE
 /* defined further down, next to MVInfo; Table only holds pointers to it */
 struct Projection;
-struct TextIndex;
+struct SkipIndex;
 #endif
 struct Column {
 public:
@@ -576,28 +577,43 @@ struct Table {
   void DropProjection(Thd1 *thd);
   void ModifyProjection(Thd1 *thd);
   void MaterializeProjection(Thd1 *thd);
-  /* Text indexes on String columns, at most one per column. Guarded by
-     table_mutex. Not persisted in the metadata: at the start of every step
-     LoadTextIndexesFromServer() rebuilds the list from
+  /* Data skipping indexes: text indexes on String columns and minmax, set or
+     bloom_filter indexes on int columns, at most one of each family per
+     column. Guarded by table_mutex. Not persisted in the metadata: at the
+     start of every step LoadSkipIndexesFromServer() rebuilds the list from
      system.data_skipping_indices, so the server is the source of truth. */
-  std::vector<TextIndex> text_indexes_;
-  /* roll the text indexes CREATE TABLE emits, see --text-index-prob. Called
-     once when the table is built, before anything else can see it. */
-  void RollTextIndexes();
+  std::vector<SkipIndex> skip_indexes_;
+  /* roll the indexes CREATE TABLE emits, see --text-index-prob and
+     --int-index-prob. Called once when the table is built, before anything
+     else can see it. */
+  void RollSkipIndexes();
   /* a random text index over column, see --text-index-preprocessor-prob */
-  TextIndex MakeRandomTextIndex(const std::string &column);
+  SkipIndex MakeRandomTextIndex(const std::string &column);
+  /* a random minmax, set or bloom_filter index over an int column */
+  SkipIndex MakeRandomIntIndex(const std::string &column);
   /* Caller must hold table_mutex. */
   bool HasTextIndex(const std::string &column) const;
-  /* Drop the text index on this column before an ALTER ClickHouse would
+  bool HasIntIndex(const std::string &column) const;
+  /* The first int column that is not the primary key and has no int index
+     yet, the column --int-index-prob and --add-int-index put theirs on.
+     nullptr when there is none. Caller must hold table_mutex. */
+  Column *IntIndexCandidate() const;
+  /* Drop every skipping index on this column before an ALTER ClickHouse would
      otherwise reject (DROP COLUMN). Caller must hold table_mutex; false when
-     the drop failed, so the caller can leave the column alone. */
-  bool DropTextIndexesOnColumn(Thd1 *thd, const std::string &column);
+     a drop failed, so the caller can leave the column alone. */
+  bool DropSkipIndexesOnColumn(Thd1 *thd, const std::string &column);
   /* RENAME COLUMN rewrites the index expression on the server, follow it */
-  void RenameTextIndexColumn(const std::string &from, const std::string &to);
-  bool LoadTextIndexesFromServer(Thd1 *thd);
+  void RenameSkipIndexColumn(const std::string &from, const std::string &to);
+  bool LoadSkipIndexesFromServer(Thd1 *thd);
   void AddTextIndex(Thd1 *thd);
   void DropTextIndex(Thd1 *thd);
   void MaterializeTextIndex(Thd1 *thd);
+  void AddIntIndex(Thd1 *thd);
+  void DropIntIndex(Thd1 *thd);
+  void MaterializeIntIndex(Thd1 *thd);
+  /* shared by the text and the int flavours: text selects which family */
+  void DropSkipIndex(Thd1 *thd, bool text);
+  void MaterializeSkipIndex(Thd1 *thd, bool text);
   /* ALTER TABLE ... MODIFY SETTING / RESET SETTING one of the settings the pool
      marked alterable, keeping Table::settings in step so a later DROP/CREATE
      and the next step rebuild the table the way it is now. */
@@ -983,6 +999,11 @@ std::string getExecutablePath();
 /* --compare-result-with-setting: run sql with and without
    --run-query-setting and compare the two result sets */
 void compare_result_with_setting(const std::string &sql, Thd1 *thd);
+#ifdef USE_CLICKHOUSE
+/* Append or merge "SETTINGS <setting>" into a query */
+std::string add_settings_clause(const std::string &sql,
+                                const std::string &setting);
+#endif
 /* one line at the end of the run saying how much was really compared */
 void print_compare_with_setting_stats();
 extern std::atomic<long> g_compare_done;
@@ -1052,14 +1073,19 @@ struct Projection {
   std::vector<std::string> columns;
 };
 
-/* One text index pstress put on a String column (or found there at the start
-   of a step). type is the full index type, "text(tokenizer = ...)", and
-   granularity is empty for the server default. */
-struct TextIndex {
+/* One data skipping index pstress put on a column (or found there at the
+   start of a step). kind is the bare index type as system.data_skipping_indices
+   reports it ("text", "minmax", "set", "bloom_filter"), type the full type with
+   its arguments, "text(tokenizer = ...)" or "set(100)", and granularity is
+   empty for the server default. A text index only goes on a String column, the
+   other kinds on an int column. */
+struct SkipIndex {
   std::string name;
   std::string column;
+  std::string kind;
   std::string type;
   std::string granularity;
+  bool is_text() const { return kind == "text"; }
   std::string definition() const {
     std::string def = "INDEX " + name + " " + column + " TYPE " + type;
     if (!granularity.empty())

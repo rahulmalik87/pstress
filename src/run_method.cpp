@@ -360,6 +360,14 @@ static void grammar_sql(Thd1 *thd, Table *enforce_table) {
 #endif
 
 #ifdef USE_CLICKHOUSE
+  /* Bound every grammar query. Done before the compare branch so both of its
+     runs carry the same limit and differ only in --run-query-setting, which
+     add_settings_clause() then merges into this clause. */
+  static const auto grammar_settings =
+      opt_string(CH_GRAMMAR_QUERY_SETTINGS);
+  if (!grammar_settings.empty())
+    sql = add_settings_clause(sql, grammar_settings);
+
   /* Not COMPARE_RESULT, so the enforce_table override above does not kick in
      and a T1 JOIN T2 keeps hitting two independently picked tables. */
   if (options->at(Option::COMPARE_RESULT_WITH_SETTING)->getBool()) {
@@ -475,7 +483,7 @@ static bool is_query_blocked(Thd1 *thd, Option::Opt option) {
  * renamed*/
 static Table *pick_table(Table::TABLE_TYPES type, int id) {
   std::lock_guard<std::mutex> lock(all_table_mutex);
-  std::string name = TABLE_PREFIX + std::to_string(id);
+  std::string name = table_prefix() + std::to_string(id);
   if (type == Table::FK) {
     name += FK_SUFFIX;
   } else if (type == Table::PARTITION) {
@@ -583,10 +591,12 @@ bool Thd1::run_some_query() {
   static std::once_flag startup_schema_check;
   static std::atomic<bool> startup_schema_ok{true};
   std::call_once(startup_schema_check, [&]() {
-    /* the text indexes are not in the metadata, read back what the server
-       has before the workload starts relying on the list */
+    /* the skipping indexes are not in the metadata, read back what the
+       server has before the workload starts relying on the list */
     for (auto *table : *all_tables)
-      table->LoadTextIndexesFromServer(this);
+      table->LoadSkipIndexesFromServer(this);
+    if (options->at(Option::CH_SKIP_SCHEMA_VERIFY)->getBool())
+      return;
     bool ok = ch_verify_schema({myParam->address}, {myParam->port},
                                options->at(Option::DATABASE)->getString(),
                                options->at(Option::USER)->getString(),
@@ -865,6 +875,15 @@ bool Thd1::run_some_query() {
       break;
     case Option::CH_MATERIALIZE_TEXT_INDEX:
       table->MaterializeTextIndex(this);
+      break;
+    case Option::CH_ADD_INT_INDEX:
+      table->AddIntIndex(this);
+      break;
+    case Option::CH_DROP_INT_INDEX:
+      table->DropIntIndex(this);
+      break;
+    case Option::CH_MATERIALIZE_INT_INDEX:
+      table->MaterializeIntIndex(this);
       break;
     case Option::CH_MODIFY_TABLE_SETTING:
       table->ModifyTableSetting(this);

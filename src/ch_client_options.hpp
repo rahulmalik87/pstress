@@ -31,7 +31,7 @@ inline void ch_apply_client_options(clickhouse::ClientOptions &opts,
      killed. Probing keeps the flow from going idle at all, and when the peer
      really is gone the failed probes make the read fail in ~75s. */
   opts.TcpKeepAlive(true)
-      .SetTcpKeepAliveIdle(std::chrono::seconds(60))
+      .SetTcpKeepAliveIdle(std::chrono::seconds(15))
       .SetTcpKeepAliveInterval(std::chrono::seconds(5))
       .SetTcpKeepAliveCount(3);
 

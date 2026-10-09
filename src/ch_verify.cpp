@@ -48,10 +48,15 @@ static void wait_for_replication(std::vector<std::unique_ptr<clickhouse::Client>
                                  const std::string &db) {
   for (int i = 0; i < 60; i++) {
     bool all_drained = true;
+    /* Ask every replica on every pass, not just up to the first busy one: the
+       answer is the same, but a connection that sits unused while another
+       replica's queue drains is a connection the server may close as idle, and
+       the first query do_verify() sends it then fails. */
     for (auto &c : clients) {
       std::string cnt = ch_query_single(
           *c, "SELECT count() FROM system.replication_queue WHERE database='" + db + "'");
-      if (cnt != "0") { all_drained = false; break; }
+      if (cnt != "0")
+        all_drained = false;
     }
     if (all_drained) break;
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -185,10 +190,20 @@ void ch_verify_replicas(const std::vector<std::string> &addrs,
      boundary. Workers hold shared_lock per iteration via g_ch_verify_mutex. */
   std::unique_lock<std::shared_mutex> pause_lk(g_ch_verify_mutex);
 
-  auto clients = make_clients(addrs, ports, db, user, pass);
-  std::cout << "\n==> Waiting for replication to catch up..." << std::endl;
-  wait_for_replication(clients, db);
-  do_verify(clients, db);
+  /* A verification query that throws (a connection the server closed, a
+     replica that went away) must come out as a failed verification, not as an
+     uncaught exception: that would call std::terminate and take the run down
+     with a bare "Crash! Signal: 6" instead of a message. */
+  try {
+    auto clients = make_clients(addrs, ports, db, user, pass);
+    std::cout << "\n==> Waiting for replication to catch up..." << std::endl;
+    wait_for_replication(clients, db);
+    do_verify(clients, db);
+  } catch (const std::exception &e) {
+    std::cout << "[" << now_str()
+              << "] ==> Replica verification: FAIL (could not complete: "
+              << e.what() << ")" << std::endl;
+  }
 }
 
 /* ------------------------------------------------------------------------- */

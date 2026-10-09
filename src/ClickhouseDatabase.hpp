@@ -123,8 +123,44 @@ private:
      be rebuilt from run_query() without going back out to Thd1. */
   std::unique_ptr<workerParams> conn_params;
 
-  /* Run a query, keeping at most max_rows of its result set. */
+  /* Connections this worker rebuilt after a socket-level failure; see
+     idle_reconnects_count(). */
+  size_t idle_reconnects = 0;
+
+  /* Did the last run_query_once() fail because the connection itself broke,
+     as opposed to the server answering with an error? */
+  bool connection_broken = false;
+
+  /* Run a query, keeping at most max_rows of its result set.
+
+     The ClickHouse Cloud front end closes a native connection that has carried
+     no bytes for about 45 seconds (TCP keepalive does not count), and it can
+     hand a reconnecting client a flow whose server side never comes up; the
+     client sees an SSL or socket error, or a server-side NetException about
+     reading from its socket, and nothing reaches the server. Workers idle that
+     long routinely: while two threads load --records, while a verifier holds
+     every worker paused, while one waits on a table lock. So a query that
+     failed at the connection level is run once more on a fresh connection, and
+     the recovery is counted and reported in the thread log. Only a reconnect
+     that fails outright stays fatal (CR_SERVER_LOST), which is still what a
+     server that has gone away looks like. */
   bool run_query(const std::string &query, size_t max_rows) {
+    const bool ok = run_query_once(query, max_rows);
+    if (ok || !connection_broken)
+      return ok;
+    client.reset();
+    if (!conn_params || !connect(*conn_params)) {
+      last_error_number = CR_SERVER_LOST;
+      return false;
+    }
+    idle_reconnects++;
+    const bool retried = run_query_once(query, max_rows);
+    if (!retried && connection_broken)
+      last_error_number = CR_SERVER_LOST;
+    return retried;
+  }
+
+  bool run_query_once(const std::string &query, size_t max_rows) {
     /* clear() keeps the outer vector's capacity, which after one 12M-row select
        is 288MB per thread that is never handed back. Drop the buffer outright
        once it has grown past anything worth reusing. */
@@ -135,7 +171,8 @@ private:
     last_row_count = 0;
     last_error.clear();
     last_error_number = 0;
-    /* Only reachable when the reconnect below also failed. */
+    connection_broken = false;
+    /* Only reachable when the reconnect in run_query() also failed. */
     if (!client) {
       last_error = "not connected";
       last_error_number = CR_SERVER_LOST;
@@ -162,22 +199,27 @@ private:
       return true;
     } catch (const clickhouse::ServerException &e) {
       /* The server answered, and the answer was an error. Nothing is wrong with
-         the connection, so the worker keeps using it. */
+         the connection, so the worker keeps using it - unless the "error" is
+         the server reporting that it could not read this very connection
+         (a NetException such as "Timeout exceeded while reading from socket"),
+         which the front end produces for a half-dead flow; the next statement
+         on it fails at the SSL layer, so treat it as a broken connection now. */
       last_error = e.what();
-      last_error_number = 1;
+      if (last_error.find("DB::NetException") != std::string::npos) {
+        connection_broken = true;
+        last_error_number = CR_SERVER_LOST;
+      } else {
+        last_error_number = 1;
+      }
       return false;
     } catch (const std::exception &e) {
       /* Anything else came from the socket or the protocol decoder, both of
          which leave the stream mid-packet: every later query on this client
-         would be reading the tail of this one. Throw the connection away and
-         build a fresh one so the worker can carry on with its next query -
-         this query stays failed, it is not retried. CR_SERVER_LOST is what
-         gets the loss logged and the run's exit status failed. */
+         would be reading the tail of this one. run_query() throws the
+         connection away and retries on a fresh one. */
       last_error = e.what();
       last_error_number = CR_SERVER_LOST;
-      client.reset();
-      if (conn_params)
-        connect(*conn_params);
+      connection_broken = true;
       return false;
     }
   }
@@ -264,6 +306,8 @@ public:
   std::string get_error() override { return last_error; }
 
   int get_error_number() override { return last_error_number; }
+
+  size_t idle_reconnects_count() override { return idle_reconnects; }
 
   int get_server_version() override {
     std::string ver = get_single_value("SELECT version()");

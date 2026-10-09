@@ -477,8 +477,9 @@ int main(int argc, char *argv[]) {
       ch_verify_replicas(addrs, ports, chdb, chuser, chpass, tnames);
     }
 
-    /* Always verify schema (metadata vs actual ClickHouse columns) */
-    ch_verify_schema(addrs, ports, chdb, chuser, chpass);
+    /* metadata vs actual ClickHouse columns, unless --skip-schema-verify */
+    if (!options->at(Option::CH_SKIP_SCHEMA_VERIFY)->getBool())
+      ch_verify_schema(addrs, ports, chdb, chuser, chpass);
 
     /* Every worker has joined, so nothing is inserting and each view has
        received everything its table holds: the point where a view that mirrors

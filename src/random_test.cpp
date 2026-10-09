@@ -796,6 +796,19 @@ int sum_of_all_options(Thd1 *thd) {
     }
   }
 
+  /* ---- int skipping indexes ---- */
+  {
+    auto prob = [](Option::Opt o) { return options->at(o)->getInt(); };
+    if (prob(Option::CH_INT_INDEX_PROB) == 0 &&
+        prob(Option::CH_ADD_INT_INDEX) == 0 &&
+        (prob(Option::CH_DROP_INT_INDEX) > 0 ||
+         prob(Option::CH_MATERIALIZE_INT_INDEX) > 0))
+      print_and_log("WARNING: --drop-int-index and --materialize-int-index "
+                    "only act on int indexes that already exist. With "
+                    "--int-index-prob=0 and --add-int-index=0 they act only "
+                    "on the ones an earlier step left behind.");
+  }
+
   /* ---- table settings altered while the run is going ---- */
   {
     auto prob = [](Option::Opt o) { return options->at(o)->getInt(); };
@@ -834,6 +847,9 @@ int sum_of_all_options(Thd1 *thd) {
   opt_int_set(CH_ADD_TEXT_INDEX, 0);
   opt_int_set(CH_DROP_TEXT_INDEX, 0);
   opt_int_set(CH_MATERIALIZE_TEXT_INDEX, 0);
+  opt_int_set(CH_ADD_INT_INDEX, 0);
+  opt_int_set(CH_DROP_INT_INDEX, 0);
+  opt_int_set(CH_MATERIALIZE_INT_INDEX, 0);
   opt_int_set(CH_MODIFY_TABLE_SETTING, 0);
   opt_int_set(CH_RESET_TABLE_SETTING, 0);
 #endif
@@ -1118,10 +1134,11 @@ static std::string trim_ws(const std::string &str) {
 }
 
 #ifdef USE_CLICKHOUSE
-/* Append "SETTINGS <setting>" to a query. Only compare_result_with_setting()
-   uses this, and -Wall -Werror rejects an unused static in a MySQL build. */
-static std::string add_settings_clause(const std::string &sql,
-                                       const std::string &setting) {
+/* Append "SETTINGS <setting>" to a query. Used by compare_result_with_setting()
+   and by grammar_sql() for --ch-grammar-query-settings; ClickHouse only, the
+   MySQL build has no SETTINGS clause. */
+std::string add_settings_clause(const std::string &sql,
+                                const std::string &setting) {
   auto stripped = trim_ws(sql);
   /* load_grammar_sql_from() only strips trailing whitespace, so a grammar line
      can still end in ';' and we would emit "... ; SETTINGS x = 1" */
@@ -1614,6 +1631,10 @@ std::string rand_word_part(bool prefix) {
   return prefix ? w.substr(0, len) : w.substr(w.size() - len);
 }
 #endif
+
+std::string table_prefix() {
+  return options->at(Option::TABLE_PREFIX)->getString();
+}
 
 /* return column type from a string */
 Column::COLUMN_TYPES Column::col_type(std::string type) {
@@ -3122,7 +3143,7 @@ void Table::CreateDefaultIndex() {
 /* Create new table and pick some attributes */
 Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
   Table *table;
-  std::string name = TABLE_PREFIX + std::to_string(id);
+  std::string name = table_prefix() + std::to_string(id);
   if (suffix) {
     name += "_" + std::to_string(rand_int(1000000));
   }
@@ -3223,7 +3244,7 @@ Table *Table::table_id(TABLE_TYPES type, int id, bool suffix) {
   table->CreateDefaultColumn();
   table->CreateDefaultIndex();
 #ifdef USE_CLICKHOUSE
-  table->RollTextIndexes();
+  table->RollSkipIndexes();
 #endif
   table->resolve_composite_key();
   table->resolve_seq_pk_column();
@@ -3662,7 +3683,7 @@ std::string Table::definition(bool with_index, bool with_fk,
      going. */
   {
     std::shared_lock<std::shared_mutex> lock(table_mutex);
-    for (const auto &ti : text_indexes_)
+    for (const auto &ti : skip_indexes_)
       def += ti.definition() + ", ";
   }
 #endif
@@ -4325,7 +4346,7 @@ void Table::DropColumn(Thd1 *thd) {
     return;
   }
   /* and so would a text index */
-  if (!DropTextIndexesOnColumn(thd, name)) {
+  if (!DropSkipIndexesOnColumn(thd, name)) {
     unlock_table_mutex();
     return;
   }
@@ -4774,7 +4795,7 @@ void Table::ColumnRename(Thd1 *thd) {
         col->name_ = new_name;
     }
 #ifdef USE_CLICKHOUSE
-    RenameTextIndexColumn(name, new_name);
+    RenameSkipIndexColumn(name, new_name);
 #endif
     unlock_table_mutex();
   }
@@ -4899,9 +4920,21 @@ std::string Table::GetRandomPartition() {
    the index serves, and the prefix and suffix LIKE patterns. */
 static std::string ch_text_search_predicate(const std::string &col) {
   auto w = [] { return rand_word(); };
-  switch (rand_int(9)) {
+  switch (rand_int(13)) {
   case 0:
     return "hasToken(" + col + ", '" + w() + "')";
+  /* SIMILAR TO (PR 101514): LIKE wildcards plus regexp alternation, classes
+     and quantifiers. The text index condition does not serve it, so these
+     scan every granule; they are here for correctness next to the LIKE
+     shape they reduce to. */
+  case 9:
+    return col + " SIMILAR TO '%" + w() + "%'";
+  case 10:
+    return col + " SIMILAR TO '%(" + w() + "|" + w() + ")%'";
+  case 11:
+    return col + " SIMILAR TO '" + rand_word_part(true) + "[a-z0-9]*%'";
+  case 12:
+    return col + " NOT SIMILAR TO '" + w() + "%'";
   case 1:
     return "hasAnyTokens(" + col + ", ['" + w() + "', '" + w() + "'])";
   case 2:
@@ -5698,8 +5731,10 @@ void Table::ForgetProjections() {
 }
 
 /* ---------------------------------------------------------------------------
-   Text indexes. ClickHouse allows one per column and only on String, which is
-   what VARCHAR, CHAR, TEXT and BLOB all become.
+   Data skipping indexes. Text indexes go on String columns, which is what
+   VARCHAR, CHAR, TEXT and BLOB all become, one per column. minmax, set and
+   bloom_filter indexes go on int columns, one per column, never on the primary
+   key, which the ORDER BY already covers.
    ------------------------------------------------------------------------- */
 
 static bool ch_text_indexable(const Column *c) {
@@ -5733,18 +5768,38 @@ static std::string ch_roll_text_tokenizer() {
   return "splitByRegexp('[^a-zA-Z0-9]+')";
 }
 
-TextIndex Table::MakeRandomTextIndex(const std::string &column) {
+/* Index names are <prefix>_<table>_<seed>_<n>. Nothing is persisted, so a
+   later step would restart n at 0 and collide with the indexes the server
+   still has; LoadSkipIndexesFromServer() pushes the counters past the largest
+   n it reads back. */
+static std::atomic<unsigned long> g_next_text_index_id{0};
+static std::atomic<unsigned long> g_next_int_index_id{0};
+
+static void ch_bump_index_counter(std::atomic<unsigned long> &counter,
+                                  const std::string &name) {
+  auto pos = name.rfind('_');
+  if (pos == std::string::npos)
+    return;
+  try {
+    unsigned long n = std::stoul(name.substr(pos + 1)) + 1;
+    unsigned long cur = counter.load();
+    while (n > cur && !counter.compare_exchange_weak(cur, n))
+      ;
+  } catch (const std::exception &) {
+    /* not one of ours */
+  }
+}
+
+SkipIndex Table::MakeRandomTextIndex(const std::string &column) {
   static const int preprocessor_prob = opt_int(CH_TEXT_INDEX_PREPROCESSOR_PROB);
   static const int phrase_prob = opt_int(CH_TEXT_INDEX_PHRASE_SEARCH_PROB);
-  /* seed and counter, for the same reason as the projection names: nothing is
-     persisted, so a later step restarts the counter */
-  static std::atomic<unsigned long> next_id{0};
 
-  TextIndex ti;
+  SkipIndex ti;
   ti.name = "ti_" + name_ + "_" +
             std::to_string(options->at(Option::INITIAL_SEED)->getInt()) + "_" +
-            std::to_string(next_id++);
+            std::to_string(g_next_text_index_id++);
   ti.column = column;
+  ti.kind = "text";
 
   std::string args = "tokenizer = " + ch_roll_text_tokenizer();
   if (rand_int(99) < preprocessor_prob)
@@ -5773,31 +5828,85 @@ TextIndex Table::MakeRandomTextIndex(const std::string &column) {
   return ti;
 }
 
-void Table::RollTextIndexes() {
-  static const int prob = opt_int(CH_TEXT_INDEX_PROB);
-  if (prob <= 0)
-    return;
-  for (auto col : *columns_)
-    if (ch_text_indexable(col) && rand_int(99) < prob)
-      text_indexes_.push_back(MakeRandomTextIndex(col->name_));
+static bool ch_int_indexable(const Column *c) {
+  return (c->type_ == Column::INT || c->type_ == Column::INTEGER) &&
+         !c->primary_key;
+}
+
+/* minmax 40%, set 30%, bloom_filter 30%. Half the indexes take the default
+   GRANULARITY, the rest one of 1, 2, 4, 8: minmax and set over a wider stripe
+   is where a stale or wrongly merged index mark would show. */
+SkipIndex Table::MakeRandomIntIndex(const std::string &column) {
+  SkipIndex ii;
+  ii.name = "ii_" + name_ + "_" +
+            std::to_string(options->at(Option::INITIAL_SEED)->getInt()) + "_" +
+            std::to_string(g_next_int_index_id++);
+  ii.column = column;
+  const int r = rand_int(99);
+  if (r < 40) {
+    ii.kind = "minmax";
+    ii.type = "minmax";
+  } else if (r < 70) {
+    /* 0 is unlimited; a small N makes the index give up on most granules,
+       which the server has to notice and read them anyway */
+    static const char *const n[] = {"0", "10", "100", "1000"};
+    ii.kind = "set";
+    ii.type = "set(" + std::string(n[rand_int(3)]) + ")";
+  } else {
+    static const char *const fp[] = {"0.001", "0.01", "0.025", "0.1"};
+    ii.kind = "bloom_filter";
+    ii.type = rand_int(1) ? "bloom_filter"
+                          : "bloom_filter(" + std::string(fp[rand_int(3)]) + ")";
+  }
+  if (rand_int(1)) {
+    static const char *const g[] = {"1", "2", "4", "8"};
+    ii.granularity = g[rand_int(3)];
+  }
+  return ii;
+}
+
+void Table::RollSkipIndexes() {
+  static const int text_prob = opt_int(CH_TEXT_INDEX_PROB);
+  static const int int_prob = opt_int(CH_INT_INDEX_PROB);
+  if (text_prob > 0)
+    for (auto col : *columns_)
+      if (ch_text_indexable(col) && rand_int(99) < text_prob)
+        skip_indexes_.push_back(MakeRandomTextIndex(col->name_));
+  if (int_prob > 0 && rand_int(99) < int_prob)
+    if (auto *col = IntIndexCandidate())
+      skip_indexes_.push_back(MakeRandomIntIndex(col->name_));
 }
 
 bool Table::HasTextIndex(const std::string &column) const {
-  for (const auto &ti : text_indexes_)
-    if (ti.column == column)
+  for (const auto &ti : skip_indexes_)
+    if (ti.is_text() && ti.column == column)
       return true;
   return false;
 }
 
-void Table::RenameTextIndexColumn(const std::string &from,
+bool Table::HasIntIndex(const std::string &column) const {
+  for (const auto &ii : skip_indexes_)
+    if (!ii.is_text() && ii.column == column)
+      return true;
+  return false;
+}
+
+Column *Table::IntIndexCandidate() const {
+  for (auto col : *columns_)
+    if (ch_int_indexable(col) && !HasIntIndex(col->name_))
+      return col;
+  return nullptr;
+}
+
+void Table::RenameSkipIndexColumn(const std::string &from,
                                   const std::string &to) {
-  for (auto &ti : text_indexes_)
+  for (auto &ti : skip_indexes_)
     if (ti.column == from)
       ti.column = to;
 }
 
-bool Table::DropTextIndexesOnColumn(Thd1 *thd, const std::string &column) {
-  for (auto it = text_indexes_.begin(); it != text_indexes_.end();) {
+bool Table::DropSkipIndexesOnColumn(Thd1 *thd, const std::string &column) {
+  for (auto it = skip_indexes_.begin(); it != skip_indexes_.end();) {
     if (it->column != column) {
       it++;
       continue;
@@ -5806,32 +5915,36 @@ bool Table::DropTextIndexesOnColumn(Thd1 *thd, const std::string &column) {
                          it->name,
                      thd))
       return false;
-    it = text_indexes_.erase(it);
+    it = skip_indexes_.erase(it);
   }
   return true;
 }
 
 /* The server is the source of truth: CREATE TABLE may have failed, an earlier
    step may have added or dropped indexes, and none of it is in the metadata. */
-bool Table::LoadTextIndexesFromServer(Thd1 *thd) {
+bool Table::LoadSkipIndexesFromServer(Thd1 *thd) {
   auto rows = thd->db->get_query_result(
-      "SELECT name, expr, type_full, granularity FROM "
+      "SELECT name, expr, type, type_full, granularity FROM "
       "system.data_skipping_indices WHERE database = '" +
       options->at(Option::DATABASE)->getString() + "' AND table = '" + name_ +
-      "' AND type = 'text' ORDER BY name");
-  std::vector<TextIndex> found;
+      "' AND type IN ('text', 'minmax', 'set', 'bloom_filter') ORDER BY name");
+  std::vector<SkipIndex> found;
   for (const auto &row : rows) {
-    if (row.size() < 4)
+    if (row.size() < 5)
       return false;
-    TextIndex ti;
+    SkipIndex ti;
     ti.name = row[0];
     ti.column = row[1];
-    ti.type = row[2];
-    ti.granularity = row[3];
+    ti.kind = row[2];
+    ti.type = row[3];
+    ti.granularity = row[4];
+    ch_bump_index_counter(ti.is_text() ? g_next_text_index_id
+                                       : g_next_int_index_id,
+                          ti.name);
     found.push_back(ti);
   }
   lock_table_mutex(true);
-  text_indexes_ = std::move(found);
+  skip_indexes_ = std::move(found);
   unlock_table_mutex();
   return true;
 }
@@ -5846,7 +5959,7 @@ void Table::AddTextIndex(Thd1 *thd) {
     unlock_table_mutex();
     return;
   }
-  TextIndex ti =
+  SkipIndex ti =
       MakeRandomTextIndex(candidates.at(rand_int(candidates.size() - 1)));
   unlock_table_mutex();
 
@@ -5857,26 +5970,56 @@ void Table::AddTextIndex(Thd1 *thd) {
     return;
 
   lock_table_mutex(thd->ddl_query);
-  text_indexes_.push_back(ti);
+  skip_indexes_.push_back(ti);
   unlock_table_mutex();
 }
 
-/* Copy out one of this table's text indexes. A copy rather than a reference,
-   because a concurrent DropTextIndex erases it once the lock is released. */
-static bool ch_pick_text_index(Table *table, Thd1 *thd, TextIndex *out) {
+/* Copy out one of this table's text indexes (text = true) or int indexes.
+   A copy rather than a reference, because a concurrent drop erases it once
+   the lock is released. */
+static bool ch_pick_skip_index(Table *table, Thd1 *thd, bool text,
+                               SkipIndex *out) {
   table->lock_table_mutex(thd->ddl_query);
-  if (table->text_indexes_.empty()) {
+  std::vector<const SkipIndex *> family;
+  for (const auto &si : table->skip_indexes_)
+    if (si.is_text() == text)
+      family.push_back(&si);
+  if (family.empty()) {
     table->unlock_table_mutex();
     return false;
   }
-  *out = table->text_indexes_.at(rand_int(table->text_indexes_.size() - 1));
+  *out = *family.at(rand_int(family.size() - 1));
   table->unlock_table_mutex();
   return true;
 }
 
-void Table::DropTextIndex(Thd1 *thd) {
-  TextIndex picked;
-  if (!ch_pick_text_index(this, thd, &picked))
+void Table::AddIntIndex(Thd1 *thd) {
+  lock_table_mutex(thd->ddl_query);
+  auto *col = IntIndexCandidate();
+  if (col == nullptr) {
+    unlock_table_mutex();
+    return;
+  }
+  SkipIndex ii = MakeRandomIntIndex(col->name_);
+  unlock_table_mutex();
+
+  std::shared_lock<std::shared_mutex> lock(dml_mutex);
+  if (!execute_sql("ALTER TABLE " + name_ + " ADD " + ii.definition(), thd))
+    return;
+
+  lock_table_mutex(thd->ddl_query);
+  skip_indexes_.push_back(ii);
+  unlock_table_mutex();
+}
+
+void Table::DropTextIndex(Thd1 *thd) { DropSkipIndex(thd, true); }
+void Table::DropIntIndex(Thd1 *thd) { DropSkipIndex(thd, false); }
+void Table::MaterializeTextIndex(Thd1 *thd) { MaterializeSkipIndex(thd, true); }
+void Table::MaterializeIntIndex(Thd1 *thd) { MaterializeSkipIndex(thd, false); }
+
+void Table::DropSkipIndex(Thd1 *thd, bool text) {
+  SkipIndex picked;
+  if (!ch_pick_skip_index(this, thd, text, &picked))
     return;
 
   if (!execute_sql("ALTER TABLE " + name_ + " DROP INDEX IF EXISTS " +
@@ -5885,9 +6028,9 @@ void Table::DropTextIndex(Thd1 *thd) {
     return;
 
   lock_table_mutex(thd->ddl_query);
-  for (auto it = text_indexes_.begin(); it != text_indexes_.end(); it++)
+  for (auto it = skip_indexes_.begin(); it != skip_indexes_.end(); it++)
     if (it->name == picked.name) {
-      text_indexes_.erase(it);
+      skip_indexes_.erase(it);
       break;
     }
   unlock_table_mutex();
@@ -5897,9 +6040,9 @@ void Table::DropTextIndex(Thd1 *thd) {
    removes it from every part while keeping it in the table definition. Either
    way the queries keep running against a mix of indexed and unindexed parts,
    which must not change a single result. */
-void Table::MaterializeTextIndex(Thd1 *thd) {
-  TextIndex picked;
-  if (!ch_pick_text_index(this, thd, &picked))
+void Table::MaterializeSkipIndex(Thd1 *thd, bool text) {
+  SkipIndex picked;
+  if (!ch_pick_skip_index(this, thd, text, &picked))
     return;
 
   std::string sql = "ALTER TABLE " + name_ +
@@ -6334,8 +6477,10 @@ bool Thd1::load_metadata() {
         /* Before any worker can allocate a key, and only here: this branch is
            inside the all_tables->empty() guard, so it runs once per process
            even in a multi-node run. Not done for step 1 or --prepare, where
-           Table::load() recreates the table and sets the counter itself. */
-        reconcile_pk_counters(this);
+           Table::load() recreates the table and sets the counter itself.
+           --seq-pk-trust-metadata skips it and keeps the step file's counter. */
+        if (!options->at(Option::SEQ_PK_TRUST_METADATA)->getBool())
+          reconcile_pk_counters(this);
       }
     }
   } else {

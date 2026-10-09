@@ -607,6 +607,13 @@ void add_options() {
   opt->help = "Dictionary file for random string";
   opt->setString("english_dictionary.txt");
 
+  /* table name prefix */
+  opt = newOption(Option::STRING, Option::TABLE_PREFIX, "table-prefix");
+  opt->help = "Prefix of the generated table names, followed by the table "
+              "number: tt_1, tt_2, ... Give two runs that share a database "
+              "different prefixes so neither drops the other's tables.";
+  opt->setString("tt_");
+
   /* total number of queries */
   opt = newOption(Option::INT, Option::TOTAL_QUERIES, "total-queries");
   opt->help = "Total number of queries to be executed";
@@ -1095,6 +1102,18 @@ void add_options() {
   opt->setBool(false);
   opt->setArgs(no_argument);
 
+  opt = newOption(Option::BOOL, Option::SEQ_PK_TRUST_METADATA,
+                  "seq-pk-trust-metadata");
+  opt->help =
+      "With --seq-pk, at step >= 2 take each table's next key from the step "
+      "file as written instead of raising it to SELECT max(pk) from the "
+      "server. Skips one full-column scan per table at startup, which is slow "
+      "with many tables or many parts. Only safe when the previous step wrote "
+      "its step file: if that step died, keys already in the table get "
+      "reissued and, under ReplacingMergeTree, silently replace older rows.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
   opt = newOption(Option::BOOL, Option::CH_MUTATIONS_SYNC, "ch-mutations-sync");
   opt->help = "Append SETTINGS mutations_sync=2 to ClickHouse ALTER mutations "
               "(ADD/DROP COLUMN, ALTER UPDATE/DELETE). Pass flag to enable.";
@@ -1132,8 +1151,11 @@ void add_options() {
   opt->help = "Create a ClickHouse materialized view with POPULATE over a "
               "random table while the workload runs. The view mirrors the "
               "table, so once inserts stop it must hold exactly the table's "
-              "rows; --verify-mv checks that at the end of the run.";
-  opt->setInt(0);
+              "rows; --verify-mv checks that at the end of the run. Atomic "
+              "POPULATE is a per-server guarantee, so against a multi-replica "
+              "ClickHouse Cloud endpoint the check reports a false MISMATCH: "
+              "pass --create-mv=0 there, or use a single-replica service.";
+  opt->setInt(1);
   opt->setSQL();
   opt->short_help = "CreateMV";
   opt->setDDL();
@@ -1143,7 +1165,7 @@ void add_options() {
               "--verify-mv-before-drop (the default) the view is checked "
               "against its table first, which pauses all workers for the "
               "duration of the check, so keep this probability low.";
-  opt->setInt(0);
+  opt->setInt(1);
   opt->setSQL();
   opt->short_help = "DropMV";
   opt->setDDL();
@@ -1190,6 +1212,15 @@ void add_options() {
               "for the check. Pass off for stall free create/drop churn.";
   opt->setBool(true);
 
+  opt = newOption(Option::BOOL, Option::CH_SKIP_SCHEMA_VERIFY,
+                  "skip-schema-verify");
+  opt->help = "Skip comparing pstress metadata against the server's columns, "
+              "both at startup (where a mismatch aborts the run) and at the "
+              "end of the run. Saves a system.columns read per table, which "
+              "adds up with many tables.";
+  opt->setBool(false);
+  opt->setArgs(no_argument);
+
   opt = newOption(Option::BOOL, Option::CH_VERIFY_MV, "verify-mv");
   opt->help = "At the end of the run, compare every materialized view against "
               "its source table and fail the run on a mismatch.";
@@ -1208,7 +1239,7 @@ void add_options() {
               "ReplacingMergeTree refuses projections outright, and without "
               "lightweight_mutation_projection_mode = rebuild a lightweight "
               "DELETE on a projected table fails.";
-  opt->setInt(0);
+  opt->setInt(2);
   opt->setSQL();
   opt->short_help = "AddProjection";
   opt->setDDL();
@@ -1217,7 +1248,7 @@ void add_options() {
   opt->help = "ALTER TABLE t DROP PROJECTION p. Keep this below "
               "--modify-projection or most MODIFYs will find their target "
               "already gone.";
-  opt->setInt(0);
+  opt->setInt(1);
   opt->setSQL();
   opt->short_help = "DropProjection";
   opt->setDDL();
@@ -1229,7 +1260,7 @@ void add_options() {
               "Restates the stored definition verbatim and changes only the "
               "settings, which is the one thing the statement allows. Needs "
               "--add-projection to have something to act on.";
-  opt->setInt(0);
+  opt->setInt(2);
   opt->setSQL();
   opt->short_help = "ModifyProjection";
   opt->setDDL();
@@ -1240,7 +1271,7 @@ void add_options() {
               "projection on parts that do not have it yet. Unlike MODIFY this "
               "is a mutation, so it honours --ch-mutations-sync and can be "
               "cancelled mid-flight by --ch-kill-mutation.";
-  opt->setInt(0);
+  opt->setInt(1);
   opt->setSQL();
   opt->short_help = "MaterializeProjection";
   opt->setDDL();
@@ -1298,6 +1329,45 @@ void add_options() {
   opt->setInt(0);
   opt->setSQL();
   opt->short_help = "MaterializeTextIndex";
+  opt->setDDL();
+
+  /* ClickHouse skipping indexes on int columns: minmax, set(N) or
+     bloom_filter(p). They go on the first int column that is not the primary
+     key, one per column, and the primary key is left alone because the ORDER
+     BY already indexes it. An index can only change how many granules are
+     read, never which rows come back, so compare against use_skip_indexes = 0
+     with --compare-result-with-setting. */
+  opt = newOption(Option::INT, Option::CH_INT_INDEX_PROB, "int-index-prob");
+  opt->help = "Probability out of 100 that CREATE TABLE gives the table's "
+              "first non primary key int column a skipping index of a random "
+              "type: minmax, set(N) or bloom_filter(p), with a random "
+              "GRANULARITY.";
+  opt->setInt(50);
+
+  opt = newOption(Option::INT, Option::CH_ADD_INT_INDEX, "add-int-index");
+  opt->help = "ALTER TABLE t ADD INDEX ... TYPE minmax|set|bloom_filter on the "
+              "first int column that has no such index yet. Existing parts "
+              "stay unindexed until --materialize-int-index reaches them.";
+  opt->setInt(2);
+  opt->setSQL();
+  opt->short_help = "AddIntIndex";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_DROP_INT_INDEX, "drop-int-index");
+  opt->help = "ALTER TABLE t DROP INDEX on one of the table's int indexes.";
+  opt->setInt(1);
+  opt->setSQL();
+  opt->short_help = "DropIntIndex";
+  opt->setDDL();
+
+  opt = newOption(Option::INT, Option::CH_MATERIALIZE_INT_INDEX,
+                  "materialize-int-index");
+  opt->help = "ALTER TABLE t MATERIALIZE INDEX on one of the table's int "
+              "indexes, or a quarter of the time CLEAR INDEX. Both are "
+              "mutations and honour --ch-mutations-sync.";
+  opt->setInt(1);
+  opt->setSQL();
+  opt->short_help = "MaterializeIntIndex";
   opt->setDDL();
 
   opt = newOption(Option::INT, Option::TEXT_WORDS, "text-words");
@@ -1406,6 +1476,19 @@ void add_options() {
               "busy service can take 20+ minutes. 0 waits forever, which is how "
               "a finished run can hang until it is killed.";
   opt->setInt(600);
+
+  opt = newOption(Option::STRING, Option::CH_GRAMMAR_QUERY_SETTINGS,
+                  "ch-grammar-query-settings");
+  opt->help = "Setting clause appended as SETTINGS <clause> to every grammar "
+              "SQL query (--grammar-sql). The grammar joins are unbounded and "
+              "a join key that is mostly one value (0 from ADD COLUMN or a "
+              "column left out of INSERT) turns a self-join into billions of "
+              "rows, so the default cuts such a query off instead of letting "
+              "it pin the server for hours. Comma separate to set more than "
+              "one, e.g. \"max_execution_time=60, max_rows_in_join=100000000\". "
+              "Merged into a SETTINGS clause the grammar line already has. "
+              "Empty string sends the queries as written.";
+  opt->setString("max_execution_time=120");
 
   /* Drop column */
   opt = newOption(Option::INT, Option::DROP_COLUMN, "drop-column");

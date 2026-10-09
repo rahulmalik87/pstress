@@ -227,6 +227,7 @@ struct Option {
     INSERT_BULK_COUNT,
     NON_INT_PK,
     DICTIONARY_FILE,
+    TABLE_PREFIX,
     TOTAL_QUERIES,
     VARCHAR_COLUMN_MAX_WIDTH,
     COMPOSITE_KEY_PROB,
@@ -267,6 +268,11 @@ struct Option {
     CH_ADD_TEXT_INDEX,
     CH_DROP_TEXT_INDEX,
     CH_MATERIALIZE_TEXT_INDEX,
+    /* minmax / set / bloom_filter skipping index on the first int column */
+    CH_INT_INDEX_PROB,
+    CH_ADD_INT_INDEX,
+    CH_DROP_INT_INDEX,
+    CH_MATERIALIZE_INT_INDEX,
     TEXT_WORDS,
     /* ClickHouse table settings changed while the run is going: MODIFY sets an
        alterable pool entry to a fresh value, RESET takes the override away
@@ -274,6 +280,10 @@ struct Option {
     CH_MODIFY_TABLE_SETTING,
     CH_RESET_TABLE_SETTING,
     CH_SOCKET_TIMEOUT,
+    /* SETTINGS clause appended to every grammar SQL query, so one bad
+       template (a self-join on a column that is mostly 0) is cut off by the
+       server instead of pinning it for hours. */
+    CH_GRAMMAR_QUERY_SETTINGS,
     /* Sequential primary keys: an INSERT takes its key from a per-table
        increasing counter instead of a random value, and predicates aim inside
        the range of keys handed out so far. On ClickHouse the primary key is the
@@ -291,6 +301,8 @@ struct Option {
     /* Appended for the same reason as CH_LIGHTWEIGHT_DELETE. */
     INSERT_COLUMN_SUBSET_PROB,
     NO_VERSION_COLUMN,
+    SEQ_PK_TRUST_METADATA,
+    CH_SKIP_SCHEMA_VERIFY,
     MAX
   } option;
 

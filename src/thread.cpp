@@ -91,6 +91,9 @@ void Node::workerThread(int number) {
     std::cerr << errmsg.str() << std::endl;
     exit(EXIT_FAILURE);
   }
+  if (thd->db->idle_reconnects_count() > 0)
+    thread_log << "connection drops recovered by reconnect and retry => "
+               << thd->db->idle_reconnects_count() << std::endl;
   if (thd->query_buffer.size() > 0) {
     thread_log << "last N SQL executed by thread " << std::endl;
     for (const auto &sql : thd->query_buffer.get_all()) {
