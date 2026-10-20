@@ -245,12 +245,23 @@ public:
 
       bool replicated = opt_string(PORT).find(',') != std::string::npos;
       std::string db = myParams.database;
-      if (replicated) {
-        client->Execute("CREATE DATABASE IF NOT EXISTS " + db +
-                        " ENGINE = Replicated('/clickhouse/databases/" + db +
-                        "', '{shard}', '{replica}')");
-      } else {
-        client->Execute("CREATE DATABASE IF NOT EXISTS " + db);
+      /* Every worker thread runs this CREATE at the same instant. On ClickHouse
+         Cloud two of them can reach different replicas, both pass the IF NOT
+         EXISTS check, and the loser of the Keeper race gets
+         DATABASE_ALREADY_EXISTS "Database X was created by another replica"
+         (SharedDatabaseCatalog) instead of a no-op. That is the outcome IF NOT
+         EXISTS promises, so treat it as success. */
+      try {
+        if (replicated) {
+          client->Execute("CREATE DATABASE IF NOT EXISTS " + db +
+                          " ENGINE = Replicated('/clickhouse/databases/" + db +
+                          "', '{shard}', '{replica}')");
+        } else {
+          client->Execute("CREATE DATABASE IF NOT EXISTS " + db);
+        }
+      } catch (const clickhouse::ServerException &e) {
+        if (e.GetCode() != 82 /* DATABASE_ALREADY_EXISTS */)
+          throw;
       }
 
       opts.SetDefaultDatabase(db);
