@@ -15,14 +15,15 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y cmake g++ make git libabsl-dev
+          sudo apt-get install -y cmake g++ make git libabsl-dev libssl-dev zlib1g-dev
 
       - name: Build and install clickhouse-cpp
         run: |
           git clone --depth=1 https://github.com/ClickHouse/clickhouse-cpp.git /tmp/clickhouse-cpp
           cmake -S /tmp/clickhouse-cpp -B /tmp/clickhouse-cpp/build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWITH_OPENSSL=ON
           cmake --build /tmp/clickhouse-cpp/build --parallel $(nproc)
           sudo cmake --install /tmp/clickhouse-cpp/build
 
@@ -40,9 +41,19 @@ jobs:
         run: |
           ldd bld/src/pstress-ch
           ls -lh bld/src/pstress-ch
+          # Without OpenSSL in clickhouse-cpp, --secure silently opens a
+          # plaintext socket; refuse to publish such a binary.
+          ldd bld/src/pstress-ch | grep -q libssl
+          bld/src/pstress-ch --help | head -2
 
       - name: Upload binary to GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload v1.0-clickhouse bld/src/pstress-ch --clobber
+          # pstress-ch is always the latest; pstress-ch-<sha> stays behind so a
+          # consumer can pin the exact build it tested with.
+          SHA=$(git rev-parse --short=7 HEAD)
+          cp bld/src/pstress-ch "bld/src/pstress-ch-${SHA}"
+          gh release upload v1.0-clickhouse \
+            bld/src/pstress-ch "bld/src/pstress-ch-${SHA}" \
+            src/english_dictionary.txt --clobber
