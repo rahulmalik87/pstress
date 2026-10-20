@@ -96,8 +96,14 @@ void read_section_settings(struct workerParams *wParams, std::string secName,
    flag wins. Unknown keys abort, so a typo cannot silently run another test. */
 static void apply_config_file_options(const std::string &confFile) {
   INIReader reader(confFile);
-  if (reader.ParseError() < 0) {
+  int parse = reader.ParseError();
+  if (parse < 0) {
     std::cerr << "Can't load " << confFile << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  if (parse > 0) {
+    std::cerr << "Malformed INI in " << confFile << " at line " << parse
+              << std::endl;
     exit(EXIT_FAILURE);
   }
   const std::string section = "pstress";
@@ -116,6 +122,9 @@ static void apply_config_file_options(const std::string &confFile) {
                 << confFile << std::endl;
       exit(EXIT_FAILURE);
     }
+    /* Same aliasing as the getopt switch: connections read ADDRESS. */
+    if (op->getOption() == Option::HOST)
+      op = options->at(Option::ADDRESS);
     if (op->cl)
       continue;
     const std::string value = reader.Get(section, key, "");

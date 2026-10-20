@@ -383,7 +383,11 @@ struct Option {
       throw std::runtime_error("Cannot set INT for non-INT option " + name);
     }
     try {
-      value = std::stol(n);
+      size_t used = 0;
+      long int parsed = std::stol(n, &used);
+      if (used != n.size())
+        throw std::invalid_argument("trailing characters");
+      value = parsed;
     } catch (const std::exception &e) {
       throw std::runtime_error("Invalid integer value for option " + name +
                                ": " + n);
@@ -410,7 +414,11 @@ struct Option {
       throw std::runtime_error("Cannot set FLOAT for non-FLOAT option " + name);
     }
     try {
-      value = std::stof(n);
+      size_t used = 0;
+      float parsed = std::stof(n, &used);
+      if (used != n.size())
+        throw std::invalid_argument("trailing characters");
+      value = parsed;
     } catch (const std::exception &e) {
       throw std::runtime_error("Invalid float value for option " + name + ": " +
                                n);
