@@ -91,12 +91,14 @@ static const char *const CH_VERIFY_SETTINGS =
 static bool do_verify(std::vector<std::unique_ptr<clickhouse::Client>> &clients,
                       const std::string &db) {
   std::vector<std::string> table_names;
-  /* The inner table of a materialized view is named .inner_id.<uuid>, which
-     cannot be spelled in a FROM without quoting; count the view instead, which
-     reads through to it. A view with TO likewise reads through to its target. */
+  /* Only tables on a Replicated engine are guaranteed to hold the same rows on
+     every replica. A materialized view's inner table, a view's TO target or
+     any plain MergeTree table is created on each replica but filled only by
+     the inserts that server itself ran, so two replicas legitimately differ
+     and comparing them reports a mismatch that is not one. */
   clients[0]->Execute(
       clickhouse::Query("SELECT name FROM system.tables WHERE database='" + db +
-                        "' AND name NOT LIKE '.%' ORDER BY name")
+                        "' AND engine LIKE 'Replicated%' ORDER BY name")
           .OnData([&](const clickhouse::Block &block) {
             for (size_t r = 0; r < block.GetRowCount(); ++r)
               table_names.push_back(
@@ -153,7 +155,7 @@ make_clients(const std::vector<std::string> &addrs,
         .SetDefaultDatabase(db);
     ch_apply_client_options(opts, options->at(Option::SECURE)->getBool(),
                             options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
-    clients.push_back(std::make_unique<clickhouse::Client>(opts));
+    clients.push_back(ch_connect_client(opts));
   }
   return clients;
 }
@@ -681,7 +683,7 @@ bool ch_verify_schema(const std::vector<std::string> &addrs,
                           options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
   std::unique_ptr<clickhouse::Client> client_ptr;
   try {
-    client_ptr = std::make_unique<clickhouse::Client>(opts);
+    client_ptr = ch_connect_client(opts);
   } catch (const std::exception &e) {
     std::cerr << "ERROR: cannot connect to " << host << ":" << port << " — "
               << e.what()

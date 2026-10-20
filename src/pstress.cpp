@@ -91,6 +91,76 @@ void read_section_settings(struct workerParams *wParams, std::string secName,
   wParams->infile = reader.Get(secName, "infile", "pquery.sql");
   wParams->logdir = reader.Get(secName, "logdir", "/tmp");
 }
+/* The [pstress] section of --config-file: every key is a long option name and
+   is applied as if given on the command line, except that a real command line
+   flag wins. Unknown keys abort, so a typo cannot silently run another test. */
+static void apply_config_file_options(const std::string &confFile) {
+  INIReader reader(confFile);
+  if (reader.ParseError() < 0) {
+    std::cerr << "Can't load " << confFile << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  const std::string section = "pstress";
+  for (const auto &key : reader.GetKeys(section)) {
+    Option *op = nullptr;
+    for (auto &i : *options) {
+      std::string name = i == nullptr ? "" : i->getName();
+      std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+      if (i != nullptr && name == key) {
+        op = i;
+        break;
+      }
+    }
+    if (op == nullptr || op->getOption() == Option::CONFIGFILE) {
+      std::cerr << "Unknown option '" << key << "' in [" << section << "] of "
+                << confFile << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    if (op->cl)
+      continue;
+    const std::string value = reader.Get(section, key, "");
+    try {
+      if (op->getArgs() == no_argument) {
+        op->setBool(value.empty() ? std::string("true") : value);
+      } else if (op->getArgs() == optional_argument) {
+        op->setBool(true);
+        if (!value.empty())
+          op->setString(value);
+      } else {
+        switch (op->getType()) {
+        case Option::INT:
+          op->setInt(value);
+          break;
+        case Option::STRING:
+          op->setString(value);
+          break;
+        case Option::BOOL:
+          op->setBool(value);
+          break;
+        case Option::FLOAT:
+          op->setFloat(value);
+          break;
+        }
+      }
+    } catch (const std::exception &e) {
+      std::cerr << "Bad value in [" << section << "] of " << confFile << ": "
+                << e.what() << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    op->set_cl();
+  }
+}
+
+/* True when the config file has at least one [node] section with run = yes,
+   the legacy pquery layout where each section is a server to load. */
+static bool config_file_has_nodes(const std::string &confFile) {
+  INIReader reader(confFile);
+  for (const auto &secName : reader.GetSections())
+    if (reader.GetBoolean(secName, "run", false))
+      return true;
+  return false;
+}
+
 void create_worker(struct workerParams *Params) {
   Node newNode;
   newNode.setAllParams(Params);
@@ -134,10 +204,18 @@ int main(int argc, char *argv[]) {
   signal(SIGFPE, crashHandler);  // Floating-point exception
   signal(SIGILL, crashHandler);  // Illegal instruction
 
-  std::cout << "Command: ";
-  for (int i = 0; i < argc; i++)
-    std::cout << argv[i] << " ";
-  std::cout << std::endl;
+  /* --dump-options-json wants nothing but JSON on stdout, so the banner is
+     skipped when it is anywhere on the command line. */
+  bool dump_options = false;
+  for (int i = 1; i < argc; i++)
+    if (strcmp(argv[i], "--dump-options-json") == 0)
+      dump_options = true;
+  if (!dump_options) {
+    std::cout << "Command: ";
+    for (int i = 0; i < argc; i++)
+      std::cout << argv[i] << " ";
+    std::cout << std::endl;
+  }
 
   std::vector<std::thread> nodes;
   add_options();
@@ -225,6 +303,18 @@ int main(int argc, char *argv[]) {
       }
     }
   } // while
+
+  /* Apply the [pstress] section before the seed, the fork defaults and the
+     step detection below, so a file value is indistinguishable from a flag. */
+  auto confFile = options->at(Option::CONFIGFILE)->getString();
+  if (!confFile.empty()) {
+    apply_config_file_options(confFile);
+    /* Without legacy [node] sections the file only carries options and the
+       nodes come from --address/--port as usual. */
+    if (!config_file_has_nodes(confFile))
+      confFile.clear();
+  }
+
   auto initial_seed = opt_int(INITIAL_SEED);
   if (initial_seed == 0) {
     // Generate a random seed using a random device
@@ -249,8 +339,10 @@ int main(int argc, char *argv[]) {
 
 #ifdef USE_CLICKHOUSE
   /* after the seed is set so the session settings are reproducible, and before
-     any thread connects so the SETs are ready to apply */
-  load_table_settings_pool();
+     any thread connects so the SETs are ready to apply. Skipped for the option
+     dump, which must print nothing but JSON. */
+  if (!dump_options)
+    load_table_settings_pool();
 #endif
 
 #ifdef USE_DUCKDB
@@ -265,8 +357,6 @@ int main(int argc, char *argv[]) {
     }
   }
 #endif
-
-  auto confFile = options->at(Option::CONFIGFILE)->getString();
 
 #ifdef USE_CLICKHOUSE
   /* Apply ClickHouse defaults early — ch_verify_startup() runs before worker
@@ -345,6 +435,14 @@ int main(int argc, char *argv[]) {
                 << std::endl;
   }
 #endif
+
+  /* After the command line and the per-fork defaults, before anything connects:
+     the dump shows the values a run with these arguments would start with. */
+  if (options->at(Option::DUMP_OPTIONS_JSON)->getBool()) {
+    dump_options_json(std::cout);
+    delete_options();
+    exit(0);
+  }
 
   /* Auto-detect step from logdir if --step was not explicitly given.
      Scans for the highest existing metadata step file and runs the next one. */

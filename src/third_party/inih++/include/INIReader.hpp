@@ -46,10 +46,14 @@ class INIReader
 // Returns all the sections (groups) from the associated INI file
     std::vector<std::string> GetSections() const;
 
+// Returns the names of every key in a section, lower-cased, in file order
+    std::vector<std::string> GetKeys(std::string section) const;
+
   private:
     int _error;
     std::map<std::string, std::string> _values;
     std::vector<std::string> _sections;
+    std::vector<std::string> _keys;                 // "section.name", file order
     static std::string MakeKey(std::string section, std::string name);
     static int ValueHandler(void* user, const char* section, const char* name,
       const char* value);

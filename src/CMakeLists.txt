@@ -6,7 +6,9 @@ if(CLICKHOUSE)
 else()
   INCLUDE_DIRECTORIES( ${DB_INCLUDE_DIR} )
 endif()
-ADD_EXECUTABLE(${BINARY_NAME}-${PSTRESS_EXT} pstress.cpp help.cpp node.cpp thread.cpp random_test.cpp json.cpp table.cpp run_method.cpp ch_verify.cpp)
+ADD_EXECUTABLE(${BINARY_NAME}-${PSTRESS_EXT} pstress.cpp help.cpp options_table.cpp node.cpp thread.cpp
+  random_test.cpp random_values.cpp column.cpp table_create.cpp table_alter.cpp table_dml.cpp
+  ch_features.cpp ch_table_settings.cpp json.cpp table.cpp run_method.cpp ch_verify.cpp)
 if(CLICKHOUSE)
   TARGET_LINK_LIBRARIES( ${BINARY_NAME}-${PSTRESS_EXT} ${DB_LIBRARY} ${OTHER_LIBS} inih++
     /usr/local/lib/libcityhash.a /usr/local/lib/liblz4.a /usr/local/lib/libzstdstatic.a)

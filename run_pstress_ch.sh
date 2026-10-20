@@ -40,7 +40,7 @@
 set -euo pipefail
 
 RELEASE_URL="https://github.com/rahulmalik87/pstress/releases/download/v1.0-clickhouse/pstress-ch"
-DICT_URL="https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/src/english_dictionary.txt"
+DICT_URL="https://raw.githubusercontent.com/rahulmalik87/pstress/master/src/english_dictionary.txt"
 
 # ── Connection / test defaults ───────────────────────────────────────────────
 CH_HOST="${CH_HOST:-127.0.0.1}"

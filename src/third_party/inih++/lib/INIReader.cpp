@@ -90,6 +90,17 @@ INIReader::GetSections() const
   return _sections;
   }
 
+std::vector<std::string>
+INIReader::GetKeys(string section) const
+  {
+  string prefix = MakeKey(section, "");
+  std::vector<std::string> names;
+  for (const string& key : _keys)
+    if (key.compare(0, prefix.size(), prefix) == 0)
+      names.push_back(key.substr(prefix.size()));
+  return names;
+  }
+
 string
 INIReader::MakeKey(string section, string name) {
   string key = section + "." + name;
@@ -103,6 +114,8 @@ INIReader::ValueHandler(void* user, const char* section, const char* name,
 const char* value) {
   INIReader* reader = (INIReader*)user;
   string key = MakeKey(section, name);
+  if (reader->_values.count(key) == 0)
+    reader->_keys.push_back(key);
   if (reader->_values[key].size() > 0)
     reader->_values[key] += "\n";
   reader->_values[MakeKey(section, name)] = value;
