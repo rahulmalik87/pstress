@@ -254,7 +254,29 @@ public:
       }
 
       opts.SetDefaultDatabase(db);
-      client = ch_connect_client(opts);
+      /* On ClickHouse Cloud the reconnect can land on another replica whose
+         shared catalog has not applied the CREATE DATABASE yet, which answers
+         "Database X was created by another replica" (or UNKNOWN_DATABASE).
+         A ServerException is not retried by ch_connect_client, so wait for the
+         catalog here, bounded. */
+      for (int attempt = 1;; attempt++) {
+        try {
+          client = ch_connect_client(opts);
+          break;
+        } catch (const clickhouse::ServerException &e) {
+          const std::string what = e.what();
+          const bool catalog_lag =
+              what.find("created by another replica") != std::string::npos ||
+              e.GetCode() == 81 /* UNKNOWN_DATABASE */;
+          if (!catalog_lag || attempt >= 60)
+            throw;
+          if (attempt == 1)
+            std::cerr << "Database " << db
+                      << " not visible on this replica yet, waiting: " << what
+                      << std::endl;
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+      }
 
       /* session settings from the settings file, e.g. the allow_experimental_*
          flags that gate experimental table settings. Applied to every
