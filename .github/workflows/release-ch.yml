@@ -53,23 +53,26 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # pstress-ch is always the latest; pstress-ch-<sha> stays behind so a
-          # consumer can pin the exact build it tested with. The sha asset is
-          # uploaded without --clobber: clickhouse-cpp comes from a moving
-          # branch, so a rerun for the same commit must not replace the bytes
-          # a consumer already tested.
-          SHA=$(git rev-parse --short=7 HEAD)
-          cp bld/src/pstress-ch "bld/src/pstress-ch-${SHA}"
-          # pstress auto-loads every .txt/.sql beside the executable, and the
-          # table-settings pool draws from the RNG per table, so a consumer
-          # without the same side files gets a different schema for the same
-          # seed. Ship them all with the binary.
+          # Latest assets are clobbered on every push. pstress auto-loads every
+          # .txt/.sql beside the executable and the table-settings pool draws
+          # from the RNG per table, so the side files travel with the binary.
           gh release upload v1.0-clickhouse \
             bld/src/pstress-ch src/english_dictionary.txt \
             src/clickhouse_*.txt src/clickhouse_*.sql --clobber
+          # pstress-ch-<sha>.tar.gz is one immutable bundle of the binary and
+          # the side files it was built with, so a consumer that pins a sha
+          # reproduces the same schema for the same seed. Never overwritten:
+          # clickhouse-cpp comes from a moving branch, so a rerun for the same
+          # commit could produce different bytes.
+          SHA=$(git rev-parse --short=7 HEAD)
+          BUNDLE="pstress-ch-${SHA}.tar.gz"
           if gh release view v1.0-clickhouse --json assets \
-               --jq '.assets[].name' | grep -qx "pstress-ch-${SHA}"; then
-            echo "pstress-ch-${SHA} already published, keeping it"
+               --jq '.assets[].name' | grep -qx "${BUNDLE}"; then
+            echo "${BUNDLE} already published, keeping it"
           else
-            gh release upload v1.0-clickhouse "bld/src/pstress-ch-${SHA}"
+            mkdir -p "bundle/pstress-ch-${SHA}"
+            cp bld/src/pstress-ch src/english_dictionary.txt \
+               src/clickhouse_*.txt src/clickhouse_*.sql "bundle/pstress-ch-${SHA}/"
+            tar -C bundle -czf "${BUNDLE}" "pstress-ch-${SHA}"
+            gh release upload v1.0-clickhouse "${BUNDLE}"
           fi
