@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <iostream>
+#include <typeinfo>
 #include <limits>
 #include <memory>
 #include <string>
@@ -259,9 +260,19 @@ public:
         } else {
           client->Execute("CREATE DATABASE IF NOT EXISTS " + db);
         }
-      } catch (const clickhouse::ServerException &e) {
-        if (e.GetCode() != 82 /* DATABASE_ALREADY_EXISTS */)
+      } catch (const std::exception &e) {
+        /* Matched on the message as well as the code: the code seen on the
+           wire is not always DATABASE_ALREADY_EXISTS. */
+        const auto *se = dynamic_cast<const clickhouse::ServerException *>(&e);
+        const bool lost_create_race =
+            (se != nullptr && se->GetCode() == 82 /* DATABASE_ALREADY_EXISTS */) ||
+            std::string(e.what()).find("created by another replica") !=
+                std::string::npos;
+        if (!lost_create_race)
           throw;
+        std::cerr << "CREATE DATABASE " << db
+                  << " lost the race to another replica, continuing: "
+                  << e.what() << std::endl;
       }
 
       opts.SetDefaultDatabase(db);
@@ -299,9 +310,14 @@ public:
 
       conn_params = std::make_unique<workerParams>(myParams);
       return true;
+    } catch (const clickhouse::ServerException &e) {
+      std::cerr << "ClickHouse connect error [" << myParams.address << ":"
+                << port << "]: server code " << e.GetCode() << ": " << e.what()
+                << ch_connect_hint(myParams.address, port, secure) << std::endl;
+      return false;
     } catch (const std::exception &e) {
       std::cerr << "ClickHouse connect error [" << myParams.address << ":"
-                << port << "]: " << e.what()
+                << port << "]: " << typeid(e).name() << ": " << e.what()
                 << ch_connect_hint(myParams.address, port, secure) << std::endl;
       return false;
     }
