@@ -155,7 +155,7 @@ make_clients(const std::vector<std::string> &addrs,
         .SetDefaultDatabase(db);
     ch_apply_client_options(opts, options->at(Option::SECURE)->getBool(),
                             options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
-    clients.push_back(std::make_unique<clickhouse::Client>(opts));
+    clients.push_back(ch_connect_client(opts));
   }
   return clients;
 }
@@ -683,7 +683,7 @@ bool ch_verify_schema(const std::vector<std::string> &addrs,
                           options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
   std::unique_ptr<clickhouse::Client> client_ptr;
   try {
-    client_ptr = std::make_unique<clickhouse::Client>(opts);
+    client_ptr = ch_connect_client(opts);
   } catch (const std::exception &e) {
     std::cerr << "ERROR: cannot connect to " << host << ":" << port << " — "
               << e.what()

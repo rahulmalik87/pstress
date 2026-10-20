@@ -241,7 +241,7 @@ public:
       ch_apply_client_options(
           opts, secure, options->at(Option::CH_SOCKET_TIMEOUT)->getInt());
       /* Connect without default database first to create it if needed */
-      client = std::make_unique<clickhouse::Client>(opts);
+      client = ch_connect_client(opts);
 
       bool replicated = opt_string(PORT).find(',') != std::string::npos;
       std::string db = myParams.database;
@@ -254,7 +254,7 @@ public:
       }
 
       opts.SetDefaultDatabase(db);
-      client = std::make_unique<clickhouse::Client>(opts);
+      client = ch_connect_client(opts);
 
       /* session settings from the settings file, e.g. the allow_experimental_*
          flags that gate experimental table settings. Applied to every

@@ -8,8 +8,9 @@ run *is* the verification described below.
 
 ## Branches, releases, identity
 
-- Active branch: `ps-master-clickhouse`. `master` is the MySQL lineage.
-- **Pushing `ps-master-clickhouse` republishes the public binary**
+- Active branch: `master` (`ps-master-clickhouse` was merged into it and
+  deleted on 2026-10-09).
+- **Pushing `master` republishes the public binary**
   (`.github/workflows/release-ch.yml` uploads to release `v1.0-clickhouse`).
   Treat a push as a release: build and smoke-run locally first.
 - Commit only when asked. Author is `Rahul Malik <contact.rmalik@gmail.com>`
@@ -116,6 +117,11 @@ pstress headers in any file that mixes them (pstress has its own `::Column`).
   against the default. ClickHouse defaults for address/user/database/port/
   grammar-file are applied in `pstress.cpp` after parsing, guarded by `->cl`.
 - `--host` is an alias remapped to `ADDRESS` in the getopt switch.
+- `--config-file` is INI. A `[pstress]` section sets any option by long name
+  (`apply_config_file_options` in `pstress.cpp`, right after the getopt loop,
+  so file values also set `->cl`); a command-line flag wins over the file and
+  an unknown key aborts. `[node]` sections with `run = yes` are the legacy
+  pquery per-server layout and only engage when one is present.
 
 ## ClickHouse invariants (cross-file, no compiler enforcement)
 

@@ -361,9 +361,9 @@ struct Option {
       throw std::runtime_error("Cannot set BOOL for non-BOOL option " + name);
     }
     std::transform(s.begin(), s.end(), s.begin(), ::toupper);
-    if (s == "ON" || s == "TRUE" || s == "1") {
+    if (s == "ON" || s == "TRUE" || s == "YES" || s == "1") {
       value = true;
-    } else if (s == "OFF" || s == "FALSE" || s == "0") {
+    } else if (s == "OFF" || s == "FALSE" || s == "NO" || s == "0") {
       value = false;
     } else {
       throw std::runtime_error("Invalid boolean value for option " + name +

@@ -265,12 +265,19 @@ void show_config_help(void) {
   print_version();
 
   std::cout << " - Usage: pstress --config-file=pstress.cfg" << std::endl;
-  std::cout << " - CLI params has been replaced by config file (INI format)"
-            << std::endl;
-  std::cout << " - You can redefine any global param=value pair in "
-               "host-specific section"
+  std::cout << " - INI format. A [pstress] section holds any long option by "
+               "name (tables = 10, seconds = 0, create-mv = 0); a flag on the "
+               "command line overrides the file. [node] sections are the "
+               "legacy per-server layout below; without one with run = yes "
+               "the nodes come from --address/--port."
             << std::endl;
   std::cout << "\nConfig example:\n" << std::endl;
+  std::cout << "[pstress]\n"
+            << "tables = 10\n"
+            << "records = 100K\n"
+            << "seconds = 0\n"
+            << "create-mv = 0\n"
+            << "no-json = true\n\n";
   std::cout <<
 
       "[node0.domain.tld]\n"

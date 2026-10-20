@@ -55,12 +55,12 @@ A pre-built portable binary is available for **Linux x86_64** and **macOS** (via
 
 **Linux x86_64:**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/run_pstress_ch.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/master/run_pstress_ch.sh)
 ```
 
 **macOS (Intel or Apple Silicon — requires [Docker Desktop](https://www.docker.com/products/docker-desktop/)):**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/run_pstress_ch.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/master/run_pstress_ch.sh)
 ```
 
 The same command works on both platforms. On macOS the script automatically runs the binary inside Docker and routes `localhost` to `host.docker.internal` so a local ClickHouse server is reachable.
@@ -68,7 +68,7 @@ The same command works on both platforms. On macOS the script automatically runs
 **Customise with environment variables:**
 ```bash
 CH_HOST=10.0.0.5 CH_PORT=9000 TABLES=20 THREADS=20 DURATION=600 \
-  bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/run_pstress_ch.sh) \
+  bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/master/run_pstress_ch.sh) \
   --ch-alter-update 5 --ch-alter-delete 3 --ch-mutations-sync
 ```
 
@@ -93,12 +93,12 @@ Any additional arguments after the URL are passed directly to `pstress-ch`.
 `reproduce_ch.sh` runs a fixed three-step workload designed to reproduce a known stress scenario against a two-replica setup. Any extra flags you pass are forwarded to all three runs.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/reproduce_ch.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/master/reproduce_ch.sh)
 ```
 
 **With extra flags (e.g. synchronous mutations):**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/ps-master-clickhouse/reproduce_ch.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/rahulmalik87/pstress/master/reproduce_ch.sh) \
   --ch-mutations-sync
 ```
 
@@ -160,6 +160,19 @@ cmake .. -DCLICKHOUSE=ON \
 ```bash
 ./bld/src/pstress-ch --port 9000 --tables 10 --threads 5 --seconds 60 \
   --logdir /tmp/pstress-ch
+```
+
+**Options from a config file** (INI, sample in `src/pstress-ch.cfg`; any long option by name under `[pstress]`, a command-line flag overrides the file):
+```ini
+[pstress]
+tables = 10
+records = 100K
+seconds = 0
+create-mv = 0
+no-json = true
+```
+```bash
+./bld/src/pstress-ch --config-file load.cfg --port 9000 --logdir /tmp/pstress-ch
 ```
 
 **Single node — subsequent run (auto-detected step, resume workload):**

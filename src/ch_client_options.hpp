@@ -4,7 +4,10 @@
    that declare ::Column — see the note at the top of ch_verify.cpp. */
 #include <clickhouse/client.h>
 #include <chrono>
+#include <iostream>
+#include <memory>
 #include <string>
+#include <thread>
 
 /* Settings every clickhouse-cpp client pstress creates needs: how the socket
    behaves, plus the TLS setup for --secure.
@@ -50,6 +53,41 @@ inline void ch_apply_client_options(clickhouse::ClientOptions &opts,
   opts.SetSSLOptions(clickhouse::ClientOptions::SSLOptions());
   /* A Cloud service resuming from idle needs longer than the 5s default. */
   opts.SetConnectionConnectTimeout(std::chrono::seconds(30));
+}
+
+/* Open a connection, retrying failures that happen below the ClickHouse
+   protocol: TLS handshake, socket, DNS.
+
+   The ClickHouse Cloud ingress proxy drops some of a burst of new connections
+   to one service: it ACKs the ClientHello and answers with FIN+RST before any
+   ServerHello, which OpenSSL reports as "unexpected eof while reading" with no
+   server certificate. Forty workers connecting in the same instant lose one or
+   two connections most of the time, and pstress used to exit on the first one.
+   A single sequential connection never fails, so a short back-off and a retry
+   is enough.
+
+   A ServerException is the server itself answering - wrong password, unknown
+   database, a rejected SET - and is thrown straight through: retrying would
+   only repeat the same answer. Anything else is retried CONNECT_ATTEMPTS
+   times with a growing pause, and the last error is thrown to the caller,
+   which reports it the way it did before. */
+inline std::unique_ptr<clickhouse::Client>
+ch_connect_client(const clickhouse::ClientOptions &opts) {
+  constexpr int CONNECT_ATTEMPTS = 5;
+  for (int attempt = 1;; attempt++) {
+    try {
+      return std::make_unique<clickhouse::Client>(opts);
+    } catch (const clickhouse::ServerException &) {
+      throw;
+    } catch (const std::exception &e) {
+      if (attempt >= CONNECT_ATTEMPTS)
+        throw;
+      std::cerr << "ClickHouse connect attempt " << attempt << "/"
+                << CONNECT_ATTEMPTS << " to " << opts.host << ":" << opts.port
+                << " failed: " << e.what() << " - retrying" << std::endl;
+      std::this_thread::sleep_for(std::chrono::milliseconds(500 * attempt));
+    }
+  }
 }
 
 /* Native-protocol default port: 9440 is TLS, 9000 plaintext. */
