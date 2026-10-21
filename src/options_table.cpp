@@ -1052,16 +1052,22 @@ const OptionSpec kOptionSpecs[] = {
 
   /* Add drop Partition */
   OPT(ADD_DROP_PARTITION, "add-drop-partition", INT, "3", required_argument, OPT_SQL | OPT_DDL, "AddDropPartition",
-      "randomly add drop new partitions"),
+      "randomly add drop new partitions. ClickHouse: ALTER TABLE t DROP "
+      "PARTITION v, or DETACH then ATTACH; the next INSERT recreates "
+      "whatever was dropped. Counts as failed on a table that has no "
+      "partitions."),
 
   /* maximum number Partition */
   OPT(MAX_PARTITIONS, "max-partitions", INT, "25", required_argument, 0, "",
-      "maximum number of partitions in table. choose between 1 and 8192"),
+      "maximum number of partitions in table. choose between 1 and 8192. "
+      "ClickHouse: defaults to 8 and refuses more than 64, each INSERT "
+      "writes one part per partition it touches"),
 
   /* Total number of partition supported */
   OPT(PARTITION_SUPPORTED, "partition-types", STRING, "all", required_argument, 0, "",
       "total partition supported, all for LIST, HASH, KEY, RANGE or to provide "
-      "or pass for example --partition-types LIST,HASH,RANGE without space"),
+      "or pass for example --partition-types LIST,HASH,RANGE without space. "
+      "Ignored on ClickHouse, which has one kind: PARTITION BY a column"),
 
   /* Optimize Table */
   OPT(OPTIMIZE, "optimize", INT, "3", required_argument, OPT_SQL | OPT_DDL, "Optimize",
@@ -1226,6 +1232,24 @@ const OptionSpec kOptionSpecs[] = {
       "Print every option (name, type, default, current value, flags, "
       "help) as a JSON array on stdout and exit. Values reflect the "
       "other command line options given alongside it."),
+
+  /* ClickHouse PARTITION BY tables. --partition-prob of the tables get a
+     p_col INT column and PARTITION BY p_col; the column takes values
+     0 .. N-1 with N rolled per table from 2 to --max-partitions, so the
+     partition count is fixed at CREATE TABLE whatever the row count does. */
+  OPT(CH_PARTITION_CLOCK_PROB, "partition-clock-prob", INT, "50", required_argument, 0, "",
+      "ClickHouse: probability out of 100 that a PARTITION BY table fills "
+      "its partitions clock-wise, one after another every "
+      "--partition-clock-seconds like a time-series table, with 10% of "
+      "the rows spread over the others as late data. The rest of the "
+      "tables spread every INSERT uniformly over all partitions, so every "
+      "part spans the full range of every other column and only the "
+      "partition key can prune."),
+
+  OPT(CH_PARTITION_CLOCK_SECONDS, "partition-clock-seconds", INT, "30", required_argument, 0, "",
+      "ClickHouse: how long a clock-wise PARTITION BY table keeps "
+      "inserting into one partition before moving to the next. Wraps "
+      "around after the last partition."),
 };
 
 void register_option(const OptionSpec &s) {

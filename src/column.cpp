@@ -153,6 +153,8 @@ std::string Column::rand_value() {
       return list_partition_random_value(static_cast<Partition *>(table_));
     } else if (curr_part_type == Partition::RANGE) {
       return range_partition_random_value(static_cast<Partition *>(table_));
+    } else if (curr_part_type == Partition::CH_KEY) {
+      return static_cast<Partition *>(table_)->ch_partition_value();
     }
   }
 

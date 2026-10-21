@@ -725,8 +725,10 @@ SkipIndex Table::MakeRandomTextIndex(const std::string &column) {
 }
 
 static bool ch_int_indexable(const Column *c) {
+  /* not the partition column either: the part-level min-max index already
+     covers it, and a skip index on top would hide whether that one works */
   return (c->type_ == Column::INT || c->type_ == Column::INTEGER) &&
-         !c->primary_key;
+         !c->primary_key && !c->is_partition;
 }
 
 /* minmax 40%, set 30%, bloom_filter 30%. Half the indexes take the default
