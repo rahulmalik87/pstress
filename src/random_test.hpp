@@ -783,7 +783,9 @@ struct FK_table : Table {
 /* Partition table */
 struct Partition : public Table {
 public:
-  enum PART_TYPE { RANGE, LIST, HASH, KEY } part_type;
+  /* CH_KEY is ClickHouse's PARTITION BY on a dedicated small-int column; the
+     other four are MySQL partitioning and never roll on the ClickHouse fork. */
+  enum PART_TYPE { RANGE, LIST, HASH, KEY, CH_KEY } part_type;
 
   Partition(std::string n);
 
@@ -803,6 +805,8 @@ public:
       return "HASH";
     case KEY:
       return "KEY";
+    case CH_KEY:
+      return "CH_KEY";
     }
     return "FAIL";
   }
@@ -816,8 +820,23 @@ public:
       part_type = HASH;
     else if (sb_type.compare("KEY") == 0)
       part_type = KEY;
+    else if (sb_type.compare("CH_KEY") == 0)
+      part_type = CH_KEY;
   }
   int number_of_part;
+
+  /* CH_KEY only. The partition column takes values 0 .. number_of_part - 1,
+     so the number of partitions is fixed at CREATE TABLE and never follows the
+     row count: more rows only make the existing partitions bigger. ClickHouse
+     creates a partition on first insert and DROP PARTITION removes one, so
+     number_of_part is the size of the value domain, not a count of what the
+     server has right now. It never changes after the constructor, so it is
+     read without table_mutex. */
+  bool ch_clock = false; /* clock or uniform value distribution, see below */
+  std::string ch_partition_value() const;
+  std::string ch_random_partition() const {
+    return std::to_string(rand_int(number_of_part - 1));
+  }
   /* type of partition supported for current run */
   static std::vector<PART_TYPE> supported;
 
@@ -856,6 +875,13 @@ public:
     return par_columns;
   }
 };
+
+/* A ClickHouse PARTITION BY table. False for every MySQL partition kind and
+   for every table on the MySQL and DuckDB forks. */
+inline bool ch_partitioned(const Table *t) {
+  return t->type == Table::PARTITION &&
+         static_cast<const Partition *>(t)->part_type == Partition::CH_KEY;
+}
 
 /* Temporary table */
 struct Temporary_table : Table {

@@ -141,6 +141,16 @@ pstress headers in any file that mixes them (pstress has its own `::Column`).
    `--null-prob > 0`. That condition is duplicated in `Column::definition()`,
    `ModifyColumn` and `ch_verify_schema()`; all three must agree or startup
    schema verification aborts the run.
+5. Partition tables (`--partition-prob`, name suffix `_p`) are
+   `Partition::CH_KEY`: a `p_col INT` column with `is_partition` set and
+   `PARTITION BY ip_col`, values `0 .. number_of_part - 1` with
+   `number_of_part` rolled from 2 to `--max-partitions` (8 by default here,
+   64 max). The column must stay **out of** `PRIMARY KEY` / `ORDER BY`, or the
+   primary index prunes what the part min-max index should; and it is a key
+   column to the server, so `SetClause`, `DropColumn`, `ModifyColumn` and
+   `ColumnRename` all skip it. `ch_partitioned(table)` is the test; the four
+   MySQL kinds never roll on this fork. Half the tables fill partitions
+   clock-wise (`--partition-clock-prob`), the rest uniformly.
 
 ## Verification model (this is the oracle)
 

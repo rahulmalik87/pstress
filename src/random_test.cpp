@@ -405,7 +405,11 @@ int sum_of_all_options(Thd1 *thd) {
   /*check which all partition type supported */
   auto part_supp = opt_string(PARTITION_SUPPORTED);
   Partition::supported.reserve(4);
-  if (part_supp.compare("all") == 0) {
+  if (strcmp(FORK, "ClickHouse") == 0) {
+    /* one kind of partitioning, PARTITION BY a column; --partition-types is
+       MySQL vocabulary and is ignored here */
+    Partition::supported.push_back(Partition::CH_KEY);
+  } else if (part_supp.compare("all") == 0) {
     Partition::supported.push_back(Partition::KEY);
     Partition::supported.push_back(Partition::LIST);
     Partition::supported.push_back(Partition::HASH);
@@ -427,6 +431,16 @@ int sum_of_all_options(Thd1 *thd) {
       options->at(Option::MAX_PARTITIONS)->getInt() > 8192) {
     print_and_log(
         "invalid range for --max-partition. Choose between 1 and 8192");
+    exit(EXIT_FAILURE);
+  }
+  /* Every multi-row INSERT into a uniform CH_KEY table makes one part per
+     partition, times --threads. Past a few dozen partitions merges fall behind
+     and the server answers TOO_MANY_PARTS, and max_partitions_per_insert_block
+     (default 100) rejects the INSERT outright before that. */
+  if (strcmp(FORK, "ClickHouse") == 0 &&
+      options->at(Option::MAX_PARTITIONS)->getInt() > 64) {
+    print_and_log("--max-partitions above 64 is refused on ClickHouse: each "
+                  "INSERT writes one part per partition it touches");
     exit(EXIT_FAILURE);
   };
 
@@ -522,13 +536,16 @@ int sum_of_all_options(Thd1 *thd) {
     options->at(Option::NO_ENUM)->setBool(true);
     options->at(Option::NO_DESC_INDEX)->setBool(true);
     options->at(Option::INDEXES)->setInt(0);
-    options->at(Option::NO_PARTITION)->setBool(true);
+    /* Partition tables stay on: --partition-prob of the tables get a
+       PARTITION BY on a dedicated column (Partition::CH_KEY). 25, the MySQL
+       default for --max-partitions, is too many parts per INSERT here. */
+    if (!options->at(Option::MAX_PARTITIONS)->cl)
+      options->at(Option::MAX_PARTITIONS)->setInt(8);
     options->at(Option::IGNORE_DML_CLAUSE)->setInt(0);
     options->at(Option::REPLACE_ROW)->setInt(0);
     options->at(Option::SELECT_FOR_UPDATE)->setInt(0);
     options->at(Option::SELECT_FOR_UPDATE_BULK)->setInt(0);
     options->at(Option::CALL_FUNCTION)->setInt(0);
-    options->at(Option::ADD_DROP_PARTITION)->setInt(0);
     options->at(Option::RENAME_INDEX)->setInt(0);
     options->at(Option::ALTER_DISCARD_TABLESPACE)->setInt(0);
     options->at(Option::ALTER_DATABASE_COLLATION)->setInt(0);

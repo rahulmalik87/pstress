@@ -72,7 +72,11 @@ void Table::DropCreate(Thd1 *thd) {
 }
 
 void Table::Optimize(Thd1 *thd) {
-  if (type == PARTITION && rand_int(4) == 1) {
+  if (ch_partitioned(this) && rand_int(4) == 1) {
+    execute_sql("OPTIMIZE TABLE " + name_ + " PARTITION " +
+                    static_cast<Partition *>(this)->ch_random_partition(),
+                thd);
+  } else if (type == PARTITION && !ch_partitioned(this) && rand_int(4) == 1) {
     lock_table_mutex(thd->ddl_query);
     int partition =
         rand_int(static_cast<Partition *>(this)->number_of_part - 1);
@@ -85,7 +89,11 @@ void Table::Optimize(Thd1 *thd) {
 }
 
 void Table::Check(Thd1 *thd) {
-  if (type == PARTITION && rand_int(4) == 1) {
+  if (ch_partitioned(this) && rand_int(4) == 1) {
+    get_check_result("CHECK TABLE " + name_ + " PARTITION " +
+                         static_cast<Partition *>(this)->ch_random_partition(),
+                     thd);
+  } else if (type == PARTITION && !ch_partitioned(this) && rand_int(4) == 1) {
     lock_table_mutex(thd->ddl_query);
     int partition =
         rand_int(static_cast<Partition *>(this)->number_of_part - 1);
@@ -98,7 +106,7 @@ void Table::Check(Thd1 *thd) {
 }
 
 void Table::Analyze(Thd1 *thd) {
-  if (type == PARTITION && rand_int(4) == 1) {
+  if (type == PARTITION && !ch_partitioned(this) && rand_int(4) == 1) {
     lock_table_mutex(thd->ddl_query);
     int partition =
         rand_int(static_cast<Partition *>(this)->number_of_part - 1);
@@ -111,8 +119,9 @@ void Table::Analyze(Thd1 *thd) {
 }
 
 void Table::Truncate(Thd1 *thd) {
-  /* 99% truncate the some partition */
-  if (type == PARTITION && rand_int(100) > 1) {
+  /* 99% truncate the some partition. ClickHouse spells that DROP PARTITION,
+     which Partition::AddDrop already does, so a CH_KEY table truncates whole. */
+  if (type == PARTITION && !ch_partitioned(this) && rand_int(100) > 1) {
     auto sql = "ALTER TABLE " + name_ + " TRUNCATE ";
     if (rand_int(1000) == 1) {
       sql += "ALL";
@@ -136,6 +145,23 @@ void Table::Truncate(Thd1 *thd) {
 
 /* add or drop average 10% of max partitions */
 void Partition::AddDrop(Thd1 *thd) {
+  if (part_type == CH_KEY) {
+    /* Nothing to add: ClickHouse creates a partition when the first row with
+       that value arrives, and the value domain is fixed, so the next INSERT
+       repopulates whatever is dropped here. DETACH followed by ATTACH takes
+       the detached-parts path and leaves the rows in place; rows inserted
+       into that partition in between land in new parts and are unaffected. */
+    const std::string part = ch_random_partition();
+    if (rand_int(99) < 70) {
+      if (execute_sql("ALTER TABLE " + name_ + " DROP PARTITION " + part, thd))
+        mark_mv_source_mutated("a partition was dropped");
+    } else if (execute_sql("ALTER TABLE " + name_ + " DETACH PARTITION " + part,
+                           thd)) {
+      mark_mv_source_mutated("a partition was detached");
+      execute_sql("ALTER TABLE " + name_ + " ATTACH PARTITION " + part, thd);
+    }
+    return;
+  }
   if (part_type == KEY || part_type == HASH) {
     int new_partition =
         rand_int(options->at(Option::MAX_PARTITIONS)->getInt()) / 10;
@@ -315,6 +341,13 @@ void Table::ModifyColumn(Thd1 *thd) {
   int i = 0;
   while (i < 50 && col == nullptr) {
     auto col1 = columns_->at(rand_int(columns_->size() - 1));
+#ifdef USE_CLICKHOUSE
+    /* the server refuses to retype a partition key column */
+    if (col1->is_partition) {
+      i++;
+      continue;
+    }
+#endif
     switch (col1->type_) {
     case Column::BLOB:
     case Column::GENERATED:
@@ -430,6 +463,11 @@ void Table::DropColumn(Thd1 *thd) {
 #ifdef USE_CLICKHOUSE
   /* never drop the version column used by ReplacingMergeTree */
   if (name == "_pstress_ver") {
+    unlock_table_mutex();
+    return;
+  }
+  /* nor the partition key column, which the server refuses to drop */
+  if (columns_->at(ps)->is_partition) {
     unlock_table_mutex();
     return;
   }
@@ -838,6 +876,13 @@ void Table::ColumnRename(Thd1 *thd) {
   lock_table_mutex(thd->ddl_query);
   auto ps = rand_int(columns_->size() - 1);
   auto name = columns_->at(ps)->name_;
+#ifdef USE_CLICKHOUSE
+  /* "Trying to ALTER RENAME key column which is a part of key expression" */
+  if (columns_->at(ps)->is_partition) {
+    unlock_table_mutex();
+    return;
+  }
+#endif
   /* ALTER column to _rename or back to orignal_name */
   std::string new_name = "_rename";
   static auto s = new_name.size();

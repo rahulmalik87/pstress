@@ -9,7 +9,9 @@
 #ifdef USE_CLICKHOUSE
 #include "ch_verify.hpp"
 #endif
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <map>
@@ -130,6 +132,12 @@ Partition::Partition(std::string n) : Table(n) {
 
   number_of_part = rand_int(options->at(Option::MAX_PARTITIONS)->getInt(), 2);
 
+  if (part_type == CH_KEY) {
+    ch_clock = rand_int(99) <
+               options->at(Option::CH_PARTITION_CLOCK_PROB)->getInt();
+    return;
+  }
+
   /* randomly pick ranges for partition */
   if (part_type == RANGE) {
     auto unique_values = generateUniqueRandomNumbers(number_of_part);
@@ -155,6 +163,33 @@ Partition::Partition(std::string n) : Table(n) {
       }
     }
   }
+}
+
+/* The value a row gets in the partition column of a CH_KEY table.
+
+   Uniform: every row picks a partition at random, so a multi-row INSERT fans
+   out into one part per partition and every part spans the full range of
+   every other column. That is the shape where only the partition key can
+   prune, which is what the part-level min-max index is for.
+
+   Clock: the run walks through the partitions in order, one every
+   --partition-clock-seconds, the way a time-series table fills. 90% of the
+   rows land in the current partition; the rest are spread uniformly, as late
+   data would be, which also gives the initial load a row in every partition
+   so they all exist from the start. Older partitions stop changing, so their
+   parts merge down and min-max ranges on the other columns end up correlated
+   with partition order. */
+std::string Partition::ch_partition_value() const {
+  if (ch_clock && rand_int(99) < 90) {
+    static const auto run_start = std::chrono::steady_clock::now();
+    static const long period = std::max<long>(
+        1, options->at(Option::CH_PARTITION_CLOCK_SECONDS)->getInt());
+    const long elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now() - run_start)
+                             .count();
+    return std::to_string((elapsed / period) % number_of_part);
+  }
+  return std::to_string(rand_int(number_of_part - 1));
 }
 
 std::string FK_table::fk_constrain(bool add_fk) {
@@ -206,8 +241,12 @@ void Table::CreateDefaultColumn() {
     Column *col;
     col = new Column{"p_col", this, Column::INT};
     auto curr_part_type = static_cast<Partition *>(this)->part_type;
+    /* CH_KEY always partitions by this column: ClickHouse has no partitioning
+       by the primary key to fall back on, and the column must stay out of the
+       ORDER BY or the primary index would prune what min-max should. */
     if (!table_will_have_int_pk or curr_part_type == Partition::LIST or
-        curr_part_type == Partition::RANGE or rand_int(2) == 1) {
+        curr_part_type == Partition::RANGE or
+        curr_part_type == Partition::CH_KEY or rand_int(2) == 1) {
       col->is_partition = true;
       found_partition = true;
     }
@@ -633,7 +672,7 @@ void Table::resolve_seq_pk_column() {
     return;
   /* An auto-increment key is the server's counter, not ours. A key that is
      also the partition column would send every new row past the last defined
-     partition (MySQL only -- ClickHouse forces --no-partition). */
+     partition (MySQL only -- a ClickHouse partition column is never the key). */
   if (pk->auto_increment || pk->is_partition)
     return;
   switch (pk->type_) {
@@ -776,10 +815,17 @@ std::string Table::definition(bool with_index, bool with_fk,
        built. Rolling it here would give a different key every time definition()
        runs -- DropCreate, --step 2 -- and leave the metadata describing a table
        the server does not have. */
+    /* MySQL needs the partition column in every unique key, so it joins the
+       PRIMARY KEY here. ClickHouse is the opposite: PARTITION BY is its own
+       clause, and a partition column inside ORDER BY would let the primary
+       index prune every query that the part-level min-max index should be
+       pruning, which is the path --compare-result-with-setting against
+       use_skip_indexes = 0 and the partition work are meant to exercise. */
+    const bool partition_in_key = !ch_partitioned(this);
     for (auto col : *columns_) {
       if (col->primary_key)
         continue;
-      if (col->is_partition || col->composite_key) {
+      if ((col->is_partition && partition_in_key) || col->composite_key) {
         def += col->name_ + ", ";
         pk_cols.push_back(col->name_); /* track composite key cols too */
       }
@@ -876,8 +922,21 @@ std::string Table::definition(bool with_index, bool with_fk,
       if (!order_cols.empty()) order_cols += ", ";
       order_cols += c;
     }
-    if (order_cols.empty())
-      order_cols = columns_->at(0)->name_;
+    if (order_cols.empty()) {
+      /* the partition column is the first one on a CH_KEY table and must not
+         become the sort key, see partition_in_key above */
+      for (auto col : *columns_) {
+        if (!col->is_partition) {
+          order_cols = col->name_;
+          break;
+        }
+      }
+      if (order_cols.empty())
+        order_cols = "tuple()";
+    }
+    if (ch_partitioned(this))
+      def += " PARTITION BY " +
+             static_cast<Partition *>(this)->get_part_column();
     /* A storage ORDER BY is one expression, so more than one column has to be
        a tuple: bare "ORDER BY a, b" is a syntax error at the comma. Same shape
        the projection body uses. */
@@ -930,7 +989,8 @@ std::string Table::definition(bool with_index, bool with_fk,
            options->at(Option::SECONDARY_ENGINE)->getString();
   }
 
-  if (type == PARTITION) {
+  /* MySQL partition clauses; the ClickHouse one went in before ORDER BY */
+  if (type == PARTITION && !ch_partitioned(this)) {
     auto par = static_cast<Partition *>(this);
     def += " PARTITION BY " + par->get_part_type() + " (" +
            par->get_part_column() + ")";
@@ -949,6 +1009,8 @@ std::string Table::definition(bool with_index, bool with_fk,
       def.pop_back();
       def.pop_back();
       def += ")";
+      break;
+    case Partition::CH_KEY:
       break;
     case Partition::LIST:
       def += "(";

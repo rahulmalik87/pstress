@@ -309,6 +309,9 @@ struct Option {
        option as JSON and exits, so a script can discover what this binary
        accepts without parsing --help. */
     DUMP_OPTIONS_JSON,
+    /* Appended for the same reason as CH_LIGHTWEIGHT_DELETE. */
+    CH_PARTITION_CLOCK_PROB,
+    CH_PARTITION_CLOCK_SECONDS,
     MAX
   } option;
 

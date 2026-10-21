@@ -383,7 +383,10 @@ template <typename Writer> void Table::Serialize(Writer &writer) const {
     writer.String(part_type.c_str(), static_cast<SizeType>(part_type.length()));
     writer.String("number_of_part");
     writer.Int(part_table->number_of_part);
-    if (part_table->part_type == Partition::RANGE) {
+    if (part_table->part_type == Partition::CH_KEY) {
+      writer.String("ch_clock");
+      writer.Bool(part_table->ch_clock);
+    } else if (part_table->part_type == Partition::RANGE) {
       writer.String("part_range");
       writer.StartArray();
       for (auto par : part_table->positions) {
@@ -750,7 +753,10 @@ std::string load_metadata_from_file() {
       std::string part_type = tab["part_type"].GetString();
       table = new Partition(name, part_type, tab["number_of_part"].GetInt());
 
-      if (part_type.compare("RANGE") == 0) {
+      if (part_type.compare("CH_KEY") == 0) {
+        static_cast<Partition *>(table)->ch_clock =
+            tab.HasMember("ch_clock") && tab["ch_clock"].GetBool();
+      } else if (part_type.compare("RANGE") == 0) {
         for (auto &par_range : tab["part_range"].GetArray()) {
           static_cast<Partition *>(table)->positions.emplace_back(
               par_range[0].GetString(), par_range[1].GetInt());

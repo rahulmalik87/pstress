@@ -168,6 +168,10 @@ Column *Table::GetRandomColumn() {
 
 std::string Table::GetRandomPartition() {
   std::string sql = "";
+  /* MySQL's "t PARTITION (p0, p1)" has no ClickHouse equivalent; a CH_KEY
+     table is reached through a WHERE on its partition column instead */
+  if (ch_partitioned(this))
+    return sql;
   if (type == PARTITION && rand_int(10) < 2) {
     sql += " PARTITION (";
     auto part = static_cast<Partition *>(this);
@@ -815,15 +819,17 @@ std::string Table::SetClause() {
       columns_->size() == 1) {
     col = columns_->at(0);
   } else {
-    /* A composite key column is a key column, and ClickHouse rejects an UPDATE
-       on any of them ("Cannot UPDATE key column"). --pk-in-set above is the
+    /* A composite key column is a key column, and so is the partition column
+       of a CH_KEY table, and ClickHouse rejects an UPDATE on any of them
+       ("Cannot UPDATE key column"). --pk-in-set above is the
        switch for deliberately trying a key column, so gate these the same way
        rather than letting the ordinary path pick one by accident. Collected
        into a list instead of rejection-sampled: same distribution, and it
        cannot spin forever on a table whose every column is in the key. */
     std::vector<Column *> settable;
     for (auto c : *columns_)
-      if (c->type_ != Column::GENERATED && !c->primary_key && !c->composite_key)
+      if (c->type_ != Column::GENERATED && !c->primary_key &&
+          !c->composite_key && !c->is_partition)
         settable.push_back(c);
     col = settable.empty() ? columns_->at(0)
                            : settable[rand_int(settable.size() - 1)];
@@ -839,6 +845,7 @@ std::string Table::SetClause() {
          past the column picked above, and a key column here fails the whole
          statement on ClickHouse just as surely as one picked there. */
       if (column->primary_key == false && column->composite_key == false &&
+          column->is_partition == false &&
           column->type_ != Column::GENERATED &&
           column->name_ != col->name_ && rand_int(100) > 50) {
         set_clause += "," + column->name_ + " = " +
