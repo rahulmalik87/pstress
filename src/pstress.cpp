@@ -486,38 +486,46 @@ int main(int argc, char *argv[]) {
 #elif USE_CLICKHOUSE
   std::string name = "clickhouse";
 #endif
-  if (confFile.empty() && ports.size() == 1) {
-    /*single node and command line */
-    workerParams *wParams = new workerParams(ports[0]);
-    wParams->myName = name;
-    create_worker(wParams);
-    delete wParams;
-  } else if (confFile.empty() && ports.size() > 1) {
+  if (confFile.empty()) {
+    /* One node per --port, each in its own thread. A single port keeps the
+       plain node name (it is part of the log and metadata file names) and
+       skips the startup replica check; it still gets the verifier thread so
+       the stall watchdog runs on single-endpoint services such as Cloud. */
 #ifdef USE_CLICKHOUSE
-    /* Verify replicas are consistent before starting workload */
-    ch_verify_startup(addrs, ports,
-                      options->at(Option::DATABASE)->getString(),
-                      options->at(Option::USER)->getString(),
-                      options->at(Option::PASSWORD)->getString());
+    if (ports.size() > 1)
+      ch_verify_startup(addrs, ports,
+                        options->at(Option::DATABASE)->getString(),
+                        options->at(Option::USER)->getString(),
+                        options->at(Option::PASSWORD)->getString());
 #endif
     for (size_t i = 0; i < ports.size(); i++) {
       workerParams *wParams = new workerParams(ports[i], i, ports.size());
       wParams->address = (addrs.size() == 1) ? addrs[0] : addrs[i];
-      wParams->myName = name + "." + wParams->address + "." + std::to_string(ports[i]);
+      wParams->myName = ports.size() == 1 ? name
+                        : name + "." + wParams->address + "." +
+                              std::to_string(ports[i]);
       nodes.push_back(std::thread(create_worker, wParams));
     }
 #ifdef USE_CLICKHOUSE
     /* Periodic replica verification thread: pauses workers, checksums, resumes */
     std::atomic<bool> nodes_done(false);
     int verify_interval = options->at(Option::CH_VERIFY_INTERVAL)->getInt();
+    int stall_seconds = options->at(Option::CH_STALL_SECONDS)->getInt();
     std::thread verifier_thread;
-    if (verify_interval > 0) {
+    if (verify_interval > 0 || stall_seconds > 0) {
       verifier_thread = std::thread([&]() {
         while (!nodes_done.load(std::memory_order_relaxed)) {
-          for (int s = 0; s < verify_interval; s++) {
+          /* The stall check runs every second (two atomics per worker, no
+             server traffic unless it fires); the replica check only on its
+             interval, and never when only the watchdog is enabled. */
+          int wait = verify_interval > 0 ? verify_interval : 1;
+          for (int s = 0; s < wait; s++) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (nodes_done.load(std::memory_order_relaxed)) return;
+            if (stall_seconds > 0)
+              ch_stall_check(options->at(Option::DATABASE)->getString());
           }
+          if (verify_interval <= 0) continue;
           /* An exception here would escape this thread and terminate the
              process, taking the workload down over a failed verification
              query. */

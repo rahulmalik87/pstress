@@ -1250,6 +1250,11 @@ const OptionSpec kOptionSpecs[] = {
       "ClickHouse: how long a clock-wise PARTITION BY table keeps "
       "inserting into one partition before moving to the next. Wraps "
       "around after the last partition."),
+
+  OPT(CH_STALL_SECONDS, "stall-seconds", INT, "180", required_argument, 0, "",
+      "ClickHouse: exit with failure when no worker thread has completed a "
+      "statement for this many seconds while at least one is waiting on the "
+      "server. Server-side triage is left to outside tools. 0 disables."),
 };
 
 void register_option(const OptionSpec &s) {
