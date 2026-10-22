@@ -513,6 +513,14 @@ int main(int argc, char *argv[]) {
        which takes g_ch_verify_mutex exclusively and blocks behind a wedged
        worker holding it shared, exactly the situation the watchdog is for. */
     int stall_seconds = options->at(Option::CH_STALL_SECONDS)->getInt();
+    const long total_threads =
+        options->at(Option::THREADS)->getInt() * long(ports.size());
+    if (stall_seconds > 0 && total_threads > ch_stall_capacity()) {
+      std::cerr << "WARNING: --stall-seconds disabled: " << total_threads
+                << " worker threads exceed the " << ch_stall_capacity()
+                << " the watchdog can track" << std::endl;
+      stall_seconds = 0;
+    }
     std::thread watchdog_thread;
     if (stall_seconds > 0) {
       watchdog_thread = std::thread([&]() {

@@ -18,6 +18,7 @@ extern std::shared_mutex g_ch_verify_mutex;
    for --stall-seconds while at least one is waiting on the server, it prints
    a two-line error and exits with EXIT_FAILURE. Triage is left to tools
    outside pstress. Never takes g_ch_verify_mutex: a stalled worker holds it. */
+int ch_stall_capacity(); /* threads the watchdog can track, all nodes */
 void ch_stall_begin();
 void ch_stall_end();
 void ch_stall_check(const std::string &db);

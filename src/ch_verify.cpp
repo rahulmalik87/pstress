@@ -185,6 +185,8 @@ int64_t stall_now_ms() {
 }
 } // namespace
 
+int ch_stall_capacity() { return kMaxStallSlots; }
+
 void ch_stall_begin() {
   if (t_stall_depth++ > 0) return; /* outer bracket owns the slot */
   if (t_stall_slot < 0)
@@ -213,17 +215,24 @@ void ch_stall_check(const std::string &db) {
      is on the newest completion, not on every thread. */
   const int64_t now = stall_now_ms();
   int64_t newest_done = 0;
+  int64_t earliest_wait = now;
   int waiting = 0;
   for (int i = 0; i < n; i++) {
     newest_done = std::max(newest_done, g_stall_slots[i].last_done_ms.load());
     int64_t since = g_stall_slots[i].waiting_since_ms.load();
-    if (since != 0 && now - since >= threshold_ms) waiting++;
+    if (since != 0) {
+      earliest_wait = std::min(earliest_wait, since);
+      if (now - since >= threshold_ms) waiting++;
+    }
   }
   if (waiting == 0 || now - newest_done < threshold_ms) return;
+  /* Nothing completed yet (stuck in the initial connect): measure from the
+     oldest wait, not from a zero last_done. */
+  const int64_t stalled_ms = newest_done > 0 ? now - newest_done : now - earliest_wait;
 
   std::cout << std::flush;
   std::cerr << "ERROR: run stalled: no statement completed for "
-            << (now - newest_done) / 1000 << "s, " << waiting << "/" << n
+            << stalled_ms / 1000 << "s, " << waiting << "/" << n
             << " threads waiting on the server\n       run aborted; inspect "
                "system.processes and system.mutations for database "
             << db << std::endl;
