@@ -1323,13 +1323,7 @@ bool execute_sql(const std::string &sql, Thd1 *thd, bool force_sql_log_query) {
     begin = std::chrono::system_clock::now();
   }
 
-#ifdef USE_CLICKHOUSE
-  ch_stall_begin();
-#endif
   auto res = thd->db->execute_query(sql);
-#ifdef USE_CLICKHOUSE
-  ch_stall_end();
-#endif
 
   if (log_query_duration) {
     end = std::chrono::system_clock::now();

@@ -185,10 +185,10 @@ int64_t stall_now_ms() {
 } // namespace
 
 void ch_stall_begin() {
-  if (t_stall_slot < 0) {
+  if (t_stall_slot < 0)
     t_stall_slot = g_stall_nslots.fetch_add(1);
-    if (t_stall_slot >= kMaxStallSlots) return;
-  }
+  /* Checked on every call: an overflow thread keeps its out-of-range index. */
+  if (t_stall_slot >= kMaxStallSlots) return;
   g_stall_slots[t_stall_slot].waiting_since_ms.store(stall_now_ms());
 }
 

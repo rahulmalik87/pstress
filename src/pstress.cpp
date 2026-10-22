@@ -507,25 +507,32 @@ int main(int argc, char *argv[]) {
       nodes.push_back(std::thread(create_worker, wParams));
     }
 #ifdef USE_CLICKHOUSE
-    /* Periodic replica verification thread: pauses workers, checksums, resumes */
     std::atomic<bool> nodes_done(false);
-    int verify_interval = options->at(Option::CH_VERIFY_INTERVAL)->getInt();
+    /* Stall watchdog in its own thread: two atomics per worker once a second,
+       no server traffic unless it fires. Kept apart from replica verification,
+       which takes g_ch_verify_mutex exclusively and blocks behind a wedged
+       worker holding it shared, exactly the situation the watchdog is for. */
     int stall_seconds = options->at(Option::CH_STALL_SECONDS)->getInt();
+    std::thread watchdog_thread;
+    if (stall_seconds > 0) {
+      watchdog_thread = std::thread([&]() {
+        while (!nodes_done.load(std::memory_order_relaxed)) {
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+          if (nodes_done.load(std::memory_order_relaxed)) return;
+          ch_stall_check(options->at(Option::DATABASE)->getString());
+        }
+      });
+    }
+    /* Periodic replica verification thread: pauses workers, checksums, resumes */
+    int verify_interval = options->at(Option::CH_VERIFY_INTERVAL)->getInt();
     std::thread verifier_thread;
-    if (verify_interval > 0 || stall_seconds > 0) {
+    if (verify_interval > 0) {
       verifier_thread = std::thread([&]() {
         while (!nodes_done.load(std::memory_order_relaxed)) {
-          /* The stall check runs every second (two atomics per worker, no
-             server traffic unless it fires); the replica check only on its
-             interval, and never when only the watchdog is enabled. */
-          int wait = verify_interval > 0 ? verify_interval : 1;
-          for (int s = 0; s < wait; s++) {
+          for (int s = 0; s < verify_interval; s++) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (nodes_done.load(std::memory_order_relaxed)) return;
-            if (stall_seconds > 0)
-              ch_stall_check(options->at(Option::DATABASE)->getString());
           }
-          if (verify_interval <= 0) continue;
           /* An exception here would escape this thread and terminate the
              process, taking the workload down over a failed verification
              query. */
@@ -548,6 +555,7 @@ int main(int argc, char *argv[]) {
       node->join();
 #ifdef USE_CLICKHOUSE
     nodes_done.store(true, std::memory_order_relaxed);
+    if (watchdog_thread.joinable()) watchdog_thread.join();
     if (verifier_thread.joinable()) verifier_thread.join();
 #endif
   } else {

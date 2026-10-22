@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "ch_verify.hpp"
 
 static std::string ch_col_to_string(const clickhouse::ColumnRef &col,
                                     size_t row) {
@@ -145,7 +146,17 @@ private:
      the recovery is counted and reported in the thread log. Only a reconnect
      that fails outright stays fatal (CR_SERVER_LOST), which is still what a
      server that has gone away looks like. */
+  /* Every server round trip of a worker comes through here, including
+     get_query_result()/get_single_value() (CHECK TABLE, metadata reads), so
+     the stall watchdog is bracketed here and not at the callers. */
   bool run_query(const std::string &query, size_t max_rows) {
+    ch_stall_begin();
+    const bool ok = run_query_tracked(query, max_rows);
+    ch_stall_end();
+    return ok;
+  }
+
+  bool run_query_tracked(const std::string &query, size_t max_rows) {
     const bool ok = run_query_once(query, max_rows);
     if (ok || !connection_broken)
       return ok;
