@@ -597,12 +597,13 @@ bool Thd1::run_some_query() {
       table->LoadSkipIndexesFromServer(this);
     if (options->at(Option::CH_SKIP_SCHEMA_VERIFY)->getBool())
       return;
-    ch_stall_begin(); /* a server round trip outside the driver */
+    /* Not bracketed for the stall watchdog on purpose: the pass is one query
+       per table, each completing, and a long healthy pass would otherwise
+       read as a stall. --ch-socket-timeout bounds a hang here. */
     bool ok = ch_verify_schema({myParam->address}, {myParam->port},
                                options->at(Option::DATABASE)->getString(),
                                options->at(Option::USER)->getString(),
                                options->at(Option::PASSWORD)->getString());
-    ch_stall_end();
     if (!ok) {
       std::cerr << "ERROR: Schema mismatch at startup — aborting.\n";
       startup_schema_ok.store(false);
