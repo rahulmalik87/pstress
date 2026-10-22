@@ -176,6 +176,7 @@ constexpr int kMaxStallSlots = 4096;
 StallSlot g_stall_slots[kMaxStallSlots];
 std::atomic<int> g_stall_nslots{0};
 thread_local int t_stall_slot = -1;
+thread_local int t_stall_depth = 0; /* begin/end nest: connect() inside run_query() */
 
 int64_t stall_now_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -185,6 +186,7 @@ int64_t stall_now_ms() {
 } // namespace
 
 void ch_stall_begin() {
+  if (t_stall_depth++ > 0) return; /* outer bracket owns the slot */
   if (t_stall_slot < 0)
     t_stall_slot = g_stall_nslots.fetch_add(1);
   /* Checked on every call: an overflow thread keeps its out-of-range index. */
@@ -193,6 +195,7 @@ void ch_stall_begin() {
 }
 
 void ch_stall_end() {
+  if (t_stall_depth <= 0 || --t_stall_depth > 0) return;
   if (t_stall_slot < 0 || t_stall_slot >= kMaxStallSlots) return;
   g_stall_slots[t_stall_slot].waiting_since_ms.store(0);
   g_stall_slots[t_stall_slot].last_done_ms.store(stall_now_ms());

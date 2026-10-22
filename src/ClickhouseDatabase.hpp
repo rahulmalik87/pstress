@@ -239,7 +239,17 @@ private:
 public:
   ClickHouseDatabase() = default;
 
+  /* connect() is a server round trip too (handshakes, CREATE DATABASE, the
+     session SETs), so it is bracketed for the stall watchdog; the bracket
+     nests when run_query() reconnects. */
   bool connect(const workerParams &myParams) override {
+    ch_stall_begin();
+    const bool ok = connect_untracked(myParams);
+    ch_stall_end();
+    return ok;
+  }
+
+  bool connect_untracked(const workerParams &myParams) {
     /* Outside the try so the catch below can name them in its hint. */
     const bool secure = options->at(Option::SECURE)->getBool();
     const int port =
