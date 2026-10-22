@@ -597,6 +597,9 @@ bool Thd1::run_some_query() {
       table->LoadSkipIndexesFromServer(this);
     if (options->at(Option::CH_SKIP_SCHEMA_VERIFY)->getBool())
       return;
+    /* Not bracketed for the stall watchdog on purpose: the pass is one query
+       per table, each completing, and a long healthy pass would otherwise
+       read as a stall. --ch-socket-timeout bounds a hang here. */
     bool ok = ch_verify_schema({myParam->address}, {myParam->port},
                                options->at(Option::DATABASE)->getString(),
                                options->at(Option::USER)->getString(),

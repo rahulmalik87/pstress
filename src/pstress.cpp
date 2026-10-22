@@ -486,29 +486,52 @@ int main(int argc, char *argv[]) {
 #elif USE_CLICKHOUSE
   std::string name = "clickhouse";
 #endif
-  if (confFile.empty() && ports.size() == 1) {
-    /*single node and command line */
-    workerParams *wParams = new workerParams(ports[0]);
-    wParams->myName = name;
-    create_worker(wParams);
-    delete wParams;
-  } else if (confFile.empty() && ports.size() > 1) {
+  if (confFile.empty()) {
+    /* One node per --port, each in its own thread. A single port keeps the
+       plain node name (it is part of the log and metadata file names) and
+       skips the startup replica check; it still gets the verifier thread so
+       the stall watchdog runs on single-endpoint services such as Cloud. */
 #ifdef USE_CLICKHOUSE
-    /* Verify replicas are consistent before starting workload */
-    ch_verify_startup(addrs, ports,
-                      options->at(Option::DATABASE)->getString(),
-                      options->at(Option::USER)->getString(),
-                      options->at(Option::PASSWORD)->getString());
+    if (ports.size() > 1)
+      ch_verify_startup(addrs, ports,
+                        options->at(Option::DATABASE)->getString(),
+                        options->at(Option::USER)->getString(),
+                        options->at(Option::PASSWORD)->getString());
 #endif
     for (size_t i = 0; i < ports.size(); i++) {
       workerParams *wParams = new workerParams(ports[i], i, ports.size());
       wParams->address = (addrs.size() == 1) ? addrs[0] : addrs[i];
-      wParams->myName = name + "." + wParams->address + "." + std::to_string(ports[i]);
+      wParams->myName = ports.size() == 1 ? name
+                        : name + "." + wParams->address + "." +
+                              std::to_string(ports[i]);
       nodes.push_back(std::thread(create_worker, wParams));
     }
 #ifdef USE_CLICKHOUSE
-    /* Periodic replica verification thread: pauses workers, checksums, resumes */
     std::atomic<bool> nodes_done(false);
+    /* Stall watchdog in its own thread: two atomics per worker once a second,
+       no server traffic unless it fires. Kept apart from replica verification,
+       which takes g_ch_verify_mutex exclusively and blocks behind a wedged
+       worker holding it shared, exactly the situation the watchdog is for. */
+    int stall_seconds = options->at(Option::CH_STALL_SECONDS)->getInt();
+    const long total_threads =
+        options->at(Option::THREADS)->getInt() * long(ports.size());
+    if (stall_seconds > 0 && total_threads > ch_stall_capacity()) {
+      std::cerr << "WARNING: --stall-seconds disabled: " << total_threads
+                << " worker threads exceed the " << ch_stall_capacity()
+                << " the watchdog can track" << std::endl;
+      stall_seconds = 0;
+    }
+    std::thread watchdog_thread;
+    if (stall_seconds > 0) {
+      watchdog_thread = std::thread([&]() {
+        while (!nodes_done.load(std::memory_order_relaxed)) {
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+          if (nodes_done.load(std::memory_order_relaxed)) return;
+          ch_stall_check(options->at(Option::DATABASE)->getString());
+        }
+      });
+    }
+    /* Periodic replica verification thread: pauses workers, checksums, resumes */
     int verify_interval = options->at(Option::CH_VERIFY_INTERVAL)->getInt();
     std::thread verifier_thread;
     if (verify_interval > 0) {
@@ -540,6 +563,7 @@ int main(int argc, char *argv[]) {
       node->join();
 #ifdef USE_CLICKHOUSE
     nodes_done.store(true, std::memory_order_relaxed);
+    if (watchdog_thread.joinable()) watchdog_thread.join();
     if (verifier_thread.joinable()) verifier_thread.join();
 #endif
   } else {

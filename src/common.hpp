@@ -312,6 +312,7 @@ struct Option {
     /* Appended for the same reason as CH_LIGHTWEIGHT_DELETE. */
     CH_PARTITION_CLOCK_PROB,
     CH_PARTITION_CLOCK_SECONDS,
+    CH_STALL_SECONDS,
     MAX
   } option;
 
